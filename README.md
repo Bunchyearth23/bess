@@ -1,10 +1,18 @@
-# BESS 0.8.4 — Stable Cerberus sound at 5,200 rpm
+# BESS — Bunchy's Engine Synthesis System
 
-BESS is a Windows application built with Rust, egui and BDSP. Its main sound source is the WAV bank exported by Automation.
+BESS is a Windows application that sits between **Automation** and **BeamNG.drive**. It takes the engine sounds in an Automation vehicle export, lets you shape and preview them, and creates a complete BeamNG vehicle copy with new engine sound loops.
 
-## Listen
+The main workflow is:
 
-1. Open `dist/BESS-0.8.4-public/START.html`, launch **BESS.exe**, and choose **Import Automation ZIP**. The standalone executable is also available as `dist/BESS-0.8.4-English.exe`.
+1. **Import from Automation:** Open a vehicle ZIP. BESS reads its engine WAV bank across RPM and load while keeping the original sounds available as a reference.
+2. **Synthesize in BESS:** Adjust pulses, dynamics, intake, exhaust acoustics and texture. Compare the original source with the BESS version in live playback, then save a project or render WAVs.
+3. **Export for BeamNG.drive:** Create a vehicle ZIP with the engine loops replaced. BESS preserves the other vehicle files and physics; listen in BeamNG to validate the result in game.
+
+BESS is built with Rust, egui and BDSP. The Automation WAV bank remains its primary sound source; the synthesis adds controllable character rather than inventing an unrelated engine.
+
+## Get started
+
+1. Download the [Windows release](https://github.com/Bunchyearth23/bess/releases/tag/v0.8.4), extract the portable ZIP, open `START.html`, launch **BESS.exe**, and choose **Import Automation ZIP**. A standalone executable is also available on the release page.
 2. Wait for both load banks to finish loading. Choose **Play** or press Space.
 3. Compare **A · Automation source** with **B · BESS enhanced**. Level compensation helps compare tone. A replays prepared WAV loops; it is not a capture of Automation's in-game sound engine.
 4. Use the **Driving** block at the upper right; its top button shows or hides it. In **Simulated driving**, apply throttle, select an automatic gearbox or manual gears N/1–6, and add braking or resistance at the wheels. **Reset to standstill** resets the vehicle; stopping playback pauses it.
@@ -27,7 +35,7 @@ In **Engine and combustion**, enable a configuration only when the engine data a
 
 ## Settings and comparisons
 
-`output/corpus-0.8.4-en/index.html` and the delivery home page offer twelve engines with A source, B 0.8.4 and C 0.8.3, all at **48 kHz / 24 bit**, on the same 16-second cycle and at equal RMS. Measurements describe signal differences; only listening can judge naturalness. B projects can be reopened in BESS.
+The portable package's `listening/index.html` and `START.html` offer twelve engines with A source, B 0.8.4 and C 0.8.3, all at **48 kHz / 24 bit**, on the same 16-second cycle and at equal RMS. Measurements describe signal differences; only listening can judge naturalness. B projects can be reopened in BESS.
 
 `output/corpus-0.8.0/index.html` compares twelve vehicles: A source and B with the automatic 0.8 preset. All twelve B tracks are identical to 0.7 because no engine configuration is assumed. Three dedicated clips demonstrate optional combustion. Hover over a slider and turn the **mouse wheel** to adjust it; **Shift + wheel** makes finer adjustments. Elsewhere, the wheel scrolls the panel.
 

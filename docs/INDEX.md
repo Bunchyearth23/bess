@@ -29,6 +29,7 @@ Identifiers are stable. W states change only on explicit user instruction; check
 | D-014 | accepted | From 0.8.2, B replaces part of measured pulses with a derived filtered front, varies cycles and couples texture with load; A stays intact. Read `.car` cylinder/layout data only when UIDs, `.pc` and JBeam agree; infer no firing order; explicit events remain optional. |
 | D-015 | accepted | At user request, direct playback prefers 48 kHz over the Sound BlasterX's 192 kHz default; device transport may be 32-bit float. All delivered WAVs remain mono 48 kHz / PCM24. Show actual format and fallback. |
 | D-016 | accepted | After the Cerberus 5,200 rpm report, B follows the prepared loop in order and uses a shared rpm-implied cycle duration for neighboring samples. Random anchor jumps and independently estimated periods caused pumping; A remains the unchanged reference. |
+| D-017 | accepted | BESS means Bunchy's Engine Synthesis System. Present its core purpose as the intermediary between Automation vehicle sound exports and BeamNG.drive vehicle copies: import, synthesize and preview, then export. |
 
 ## Work items
 
