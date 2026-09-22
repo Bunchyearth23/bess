@@ -902,14 +902,14 @@ impl eframe::App for App {
                 ui.painter().add(egui::Shape::line(points,egui::Stroke::new(1.5_f32,Color32::from_rgb(75,222,195))));
             }
             ui.separator();ui.heading("Export BeamNG");
-            ui.small("Complete vehicle copy with replaced loops. The original is preserved. Enable only one version in BeamNG.");
+            ui.small("Adds a BESS configuration to the original Automation vehicle. Keep the original mod enabled.");
             ui.small("Game afterfire, turbo, and startup sounds are preserved; BESS transient effects are not transferred.");
-            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none(),egui::Button::new("Create BeamNG vehicle…")).clicked()
+            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none(),egui::Button::new("Create BeamNG configuration…")).clicked()
                 &&let Some(dir)=rfd::FileDialog::new().pick_folder(){
                 let bank=self.bank.clone().unwrap();let p=self.params;let h=self.settings;
-                let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Creating and verifying BeamNG vehicle…".into();
+                let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Creating and verifying BeamNG configuration…".into();
                 std::thread::spawn(move||{let folder=dir.join(format!("BESS-BeamNG-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()));
-                    let _=tx.send(bess::export::package(&folder,p,h,bank));});
+                    let _=tx.send(bess::variant::package(&folder,p,h,bank));});
             }
             ui.separator();ui.heading("Listening exports");
             slider(ui,"WAV duration (seconds)",&mut self.seconds,1.0..=60.0);
@@ -985,7 +985,7 @@ fn main() -> eframe::Result {
     }
     if matches!(
         args.get(1).map(String::as_str),
-        Some("--compare" | "--characters" | "--drive-demo" | "--beamng")
+        Some("--compare" | "--characters" | "--drive-demo" | "--beamng" | "--beamng-replacement")
     ) {
         let result = (|| {
             let path = args.get(2).ok_or("ZIP file required")?;
@@ -1005,6 +1005,8 @@ fn main() -> eframe::Result {
                 ..Default::default()
             };
             if args[1] == "--beamng" {
+                bess::variant::package(Path::new(dir), params, Settings::calibrated(&bank), bank)
+            } else if args[1] == "--beamng-replacement" {
                 bess::export::package(Path::new(dir), params, Settings::calibrated(&bank), bank)
             } else if args[1] == "--drive-demo" {
                 render::drive_demo(Path::new(dir), params, bank)

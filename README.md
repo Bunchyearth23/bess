@@ -1,12 +1,12 @@
 # BESS — Bunchy's Engine Synthesis System
 
-BESS is a Windows application that sits between **Automation** and **BeamNG.drive**. It takes the engine sounds in an Automation vehicle export, lets you shape and preview them, and creates a complete BeamNG vehicle copy with new engine sound loops.
+BESS is a Windows application that sits between **Automation** and **BeamNG.drive**. It takes the engine sounds in an Automation vehicle export, lets you shape and preview them, and adds a selectable BESS sound configuration to the original vehicle in BeamNG.
 
 The main workflow is:
 
 1. **Import from Automation:** Open a vehicle ZIP. BESS reads its engine WAV bank across RPM and load while keeping the original sounds available as a reference.
 2. **Synthesize in BESS:** Adjust pulses, dynamics, intake, exhaust acoustics and texture. Compare the original source with the BESS version in live playback, then save a project or render WAVs.
-3. **Export for BeamNG.drive:** Create a vehicle ZIP with the engine loops replaced. BESS preserves the other vehicle files and physics; listen in BeamNG to validate the result in game.
+3. **Export for BeamNG.drive:** Create a small configuration add-on ZIP. Keep the original Automation vehicle mod enabled, then select its **(BESS)** configuration in BeamNG. The original configuration and vehicle physics remain available; listen in game to validate the result.
 
 BESS is built with Rust, egui and BDSP. The Automation WAV bank remains its primary sound source; the synthesis adds controllable character rather than inventing an unrelated engine.
 
@@ -27,11 +27,13 @@ BESS uses the default Windows audio device. It prefers a 48 kHz floating-point o
 
 ## 0.8.4 delivery
 
-The complete release asset contains all twelve Automation source ZIPs, comparisons, projects with relative paths and copied BeamNG vehicle mods. The roughly 650 MB of example source archives and BeamNG copies are in that asset, not in a source checkout. Keep the downloaded folder together when moving it. The [final test guide](docs/FINAL-TESTS.md) covers listening and BeamNG.
+The complete v0.8.4 release asset contains all twelve Automation source ZIPs, comparisons, projects with relative paths and copied BeamNG vehicle mods. Those BeamNG copies predate the configuration add-on workflow described below and replace the original mods when enabled. The roughly 650 MB of example source archives and BeamNG copies are in that asset, not in a source checkout. Keep the downloaded folder together when moving it. The [final test guide](docs/FINAL-TESTS.md) covers listening and BeamNG.
 
 In **Engine and combustion**, enable a configuration only when the engine data are known: cylinder count, angles over 720°, force, pressure duration and exhaust-opening delay. The initial evenly spaced angles are not a manufacturer's firing order. These additions are optional and also controlled by **Added color**. If an Automation `.car` sheet matches the audio blend, active engine and JBeam, BESS shows its declared cylinder count and layout. It does not infer firing order or bank phasing. Optional activation suggests the declared count when available.
 
-**Create BeamNG vehicle** makes a new folder with a full ZIP copy whose loops are replaced, plus a manifest and settings. Exports made from the current source gain **(BESS)** in the vehicle selector name, so Cerberus A appears as **Cerberus A (BESS)**. The v0.8.4 release downloads predate this display-name change. Disable the original mod before enabling its copy; the original and BESS copy share internal paths and cannot be active together. Each exported ZIP also has a distinct filename. Start, stop, pops and turbo references remain those of the vehicle. BESS driving transients are not exported as an in-game controller. Playback volume and A/B compensation are ignored; a common safety gain is applied. The two original load layers remain, so BeamNG's intermediate interpolation does not reproduce every internal BESS curve exactly. In-game validation is still required.
+The current GUI's BeamNG export creates a small add-on ZIP containing a new configuration for the imported Automation vehicle. Keep the original vehicle ZIP enabled and add the BESS ZIP alongside it. In the vehicle selector, choose the original vehicle and then its configuration named after the original trim with **(BESS)** appended, such as **A (BESS)** for Cerberus A. The add-on supplies a uniquely named engine part, sound blend and WAV paths, plus a configuration file and its display metadata. It does not overwrite the original vehicle's `info.json`, configuration or audio. The original trim stays selectable. The linked v0.8.4 release downloads were built before this add-on export became the GUI default.
+
+The add-on changes the selected engine sound, not vehicle physics. Start, stop, pops and turbo references remain those of the vehicle. BESS driving transients are not exported as an in-game controller. Playback volume and A/B compensation are ignored; a common safety gain is applied. The two original load layers remain, so BeamNG's intermediate interpolation does not reproduce every internal BESS curve exactly. In-game validation is still required. The older full-replacement export remains available through the legacy API; it requires disabling the original mod because its internal vehicle paths overlap.
 
 ## Settings and comparisons
 
@@ -79,7 +81,8 @@ Requested rpm is clamped to the minimum and maximum of the exported sounds, incl
 
 - `cargo run --release -- --open vehicle.zip`: open and import a vehicle.
 - `cargo run --release -- --compare vehicle.zip folder`: 16-second comparison.
-- `cargo run --release -- --beamng vehicle.zip new-folder`: full copy with calibrated loops; original preserved.
+- `cargo run --release -- --beamng vehicle.zip new-folder`: configuration add-on with calibrated BESS loops; keep the original mod enabled.
+- `cargo run --release -- --beamng-replacement vehicle.zip new-folder`: legacy full copy; disable the original mod while using it.
 - `cargo run --release --example delivery -- cars new-folder`: twelve exports and preservation audit.
 - `cargo run --release --example combustion_demo -- vehicle.zip new-folder`: three demos and explicitly configured combustion projects.
 - `cargo run --release -- --characters vehicle.zip folder`: source and three characters.
