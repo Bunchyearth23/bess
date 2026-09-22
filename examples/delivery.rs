@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut exported = zip::ZipArchive::new(fs::File::open(dir.join(zip_name))?)?;
         assert_eq!(original.len(), exported.len());
         let mut preserved = 0;
+        let mut labelled = 0;
         let mut seam_ratio = 0f32;
         for i in 0..original.len() {
             let entry = original.by_index(i)?;
@@ -73,12 +74,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     entry.name()
                 );
                 seam_ratio = seam_ratio.max(seam / delta_rms.max(1e-6));
+            } else if entry.name()
+                == manifest["display_name_path"]
+                    .as_str()
+                    .ok_or("Display name path")?
+            {
+                let mut source = Vec::new();
+                let mut actual = Vec::new();
+                entry.take(1_000_001).read_to_end(&mut source)?;
+                target.take(1_000_001).read_to_end(&mut actual)?;
+                let (expected, display_name) = bess::export::label_vehicle_info(&source)?;
+                assert_eq!(actual, expected, "Unexpected vehicle metadata change");
+                assert_eq!(manifest["display_name"], display_name);
+                assert!(display_name.ends_with(" (BESS)"));
+                labelled += 1;
             } else {
                 assert_eq!(digest(entry)?, digest(target)?);
                 preserved += 1;
             }
         }
-        reports.push(serde_json::json!({"archive":path,"loops":loops.len(),"unchanged_entries":preserved,"source_unchanged":true,"max_seam_over_delta_rms":seam_ratio}));
+        assert_eq!(labelled, 1, "Expected one labelled vehicle metadata file");
+        reports.push(serde_json::json!({"archive":path,"display_name":manifest["display_name"],"loops":loops.len(),"labelled_metadata_files":labelled,"unchanged_entries":preserved,"source_unchanged":true,"max_seam_over_delta_rms":seam_ratio}));
         fs::write(
             out.join("verification.json"),
             serde_json::to_vec_pretty(&reports)?,

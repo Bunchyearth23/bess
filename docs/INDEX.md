@@ -5,7 +5,7 @@ Identifiers are stable. W states change only on explicit user instruction; check
 ## Resume
 
 - User priority: replace the generic bench with hybrid synthesis based on Automation audio, then improve realism and dynamics; see [engine sound research](ENGINE-SOUND-RESEARCH.md).
-- Current technical delivery: `dist/BESS-0.8.4-public/START.html`, including fixed-rpm Cerberus listening at 5,200 rpm and mono 48 kHz / 24-bit WAVs. The English package passed 189 hashes and 93 links; 47 tests passed, twelve A tracks stayed unchanged, twelve B tracks were recalculated, and 688 BeamNG loops replaced 688 originals while 1,194 other entries were preserved. The final English G6 run opened 48 kHz with 2,999 callbacks and no overruns. See the [0.8.4 report](reports/CERBERUS-5200-0.8.4-2026-09-22.md). S-10 remains open.
+- Current technical delivery: `dist/BESS-0.8.4-public/START.html`, including fixed-rpm Cerberus listening at 5,200 rpm and mono 48 kHz / 24-bit WAVs. The English release package passed 189 hashes and 93 links; twelve A tracks stayed unchanged and twelve B tracks were recalculated. The final English G6 run opened 48 kHz with 2,999 callbacks and no overruns. See the [0.8.4 report](reports/CERBERUS-5200-0.8.4-2026-09-22.md). A later local export installed twelve `(BESS)`-labelled vehicle copies in BeamNG's mods folder, with 688 replaced loops and the originals backed up; see the [installation report](reports/BEAMNG-BESS-LABELS-2026-09-23.md). S-10 remains open.
 - Standing instruction: continue without waiting for intermediate listening; group user testing at the end. Follow the [work sequence](STEPLIST.md), keeping technical evidence separate from final sound acceptance.
 - Remaining validation: subjective preference, an extended audible session and in-game BeamNG operation.
 
@@ -59,6 +59,7 @@ Identifiers are stable. W states change only on explicit user instruction; check
 - [ ] W-002.2 Identify active parts, engine characteristics and load maps.
 - [x] W-002.3 Separate mod copy and prepared loop joins in 0.8: twelve archives reimported, 688 bounded WAVs, sources intact. Continuity measured; audible absence of clicks awaits W-002.4.
 - [x] W-002.5 Local 0.8.1 audit found the configured BeamNG mods folder; structure and 688 WAV references checked. Twelve ZIP names are unique; no copy installed or in-game test performed. See 0.8.1 QA report.
+- [x] W-002.6 Local `(BESS)` export and installation: twelve vehicle selector names edited, 688 mono 48 kHz / PCM24 loops regenerated, 1,182 other entries unchanged, twelve originals backed up outside active mods, twelve BESS ZIPs installed and SHA-256 verified. Full suite: 48 passed. The v0.8.4 release assets were not changed; see the [installation report](reports/BEAMNG-BESS-LABELS-2026-09-23.md).
 - [ ] W-002.4 Validate transitions and sound in BeamNG.
 
 ### W-003 — audio foundation

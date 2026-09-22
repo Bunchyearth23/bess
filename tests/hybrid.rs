@@ -79,6 +79,9 @@ fn fixture() -> Arc<Bank> {
                 .as_bytes(),
         )
         .unwrap();
+        zip.start_file("vehicles/test/info.json", options).unwrap();
+        zip.write_all(b"{\"Name\":\"Test Vehicle\",\"paints\":{\"Blue\":1,\"Blue\":2}}")
+            .unwrap();
         zip.finish().unwrap();
         let bank = Arc::new(Bank::load(&path, None).unwrap());
         // Keep the source for the replacement-mod roundtrip test.
@@ -703,7 +706,7 @@ fn sound_presets_keep_explicit_engine_timing() {
 }
 
 #[test]
-fn beamng_copy_preserves_source_and_all_non_audio_entries() {
+fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
     use std::io::Read;
     let bank = fixture();
     let original = std::fs::read(&bank.source.archive).unwrap();
@@ -743,6 +746,14 @@ fn beamng_copy_preserves_source_and_all_non_audio_entries() {
             let rms = (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt();
             assert!(rms > 0.0001);
             assert!((pcm[0] - pcm[pcm.len() - 1]).abs() < rms * 0.25);
+        } else if name == "vehicles/test/info.json" {
+            let (expected, display_name) = bess::export::label_vehicle_info(&a).unwrap();
+            assert_eq!(display_name, "Test Vehicle (BESS)");
+            assert_eq!(b, expected);
+            assert_eq!(
+                b,
+                b"{\"Name\":\"Test Vehicle (BESS)\",\"paints\":{\"Blue\":1,\"Blue\":2}}"
+            );
         } else {
             assert_eq!(a, b, "Changed {name}");
         }
@@ -752,4 +763,19 @@ fn beamng_copy_preserves_source_and_all_non_audio_entries() {
     assert_eq!(restored.max_rpm, bank.max_rpm);
     let project = project::load_project(&dir.join("settings.bess.json")).unwrap();
     assert_eq!(project.source.as_ref().unwrap(), &bank.source);
+}
+
+#[test]
+fn vehicle_label_preserves_nested_names_escapes_and_duplicate_paints() {
+    let source =
+        br#"{"paints":{"Name":"Blue","Blue":1,"Blue":2},"Name":"Cerberus \"A\"","notes":"Name"}"#;
+    let (labelled, name) = bess::export::label_vehicle_info(source).unwrap();
+    assert_eq!(name, "Cerberus \"A\" (BESS)");
+    assert_eq!(
+        labelled,
+        br#"{"paints":{"Name":"Blue","Blue":1,"Blue":2},"Name":"Cerberus \"A\" (BESS)","notes":"Name"}"#
+    );
+    let (again, _) = bess::export::label_vehicle_info(&labelled).unwrap();
+    assert_eq!(again, labelled);
+    assert!(bess::export::label_vehicle_info(br#"{"Name":"A","Name":"B"}"#).is_err());
 }
