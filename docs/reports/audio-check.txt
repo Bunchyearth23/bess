@@ -1,0 +1,2 @@
+Speakers (Sound BlasterX G6) · 192000 Hz · 2 channels
+Silent callbacks: 200

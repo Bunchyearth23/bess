@@ -1,0 +1,151 @@
+{
+  "method": "50 ms RMS windows from second 1 to 8 at a fixed 5200 rpm, 48 kHz mono PCM24; CV = standard deviation divided by mean.",
+  "comparison": [
+    {
+      "archive": "bunchyearth23_advent_tc.zip",
+      "source_sha256": "a01cd38c630efefbf65676ceb43a04fc8711f803b725ee2f8531c44a2ec13c3f",
+      "bess_083_sha256": "a7f1b2b59cf54b88d7d660b18593ffaa3c03b5cd41938462a8fce868992a6543",
+      "bess_084_sha256": "e2636cd6e0b7f23a438132b815ba2f21ae1a2e0e44dc4fbf5764270090ac5581",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_archo_coupe.zip",
+      "source_sha256": "44aea91cda6af4286e6051c7467edc35e1a96b98870a4f90d4e89870c3a53b6d",
+      "bess_083_sha256": "0a92e9a27e5d76c63fdc0b0efa7ccbae85ab9e06bead51330feee1757c6d99cd",
+      "bess_084_sha256": "4f3c27f34b0499651f5275a4b1e19c65678d133e7e969bd06b7f51bdebbb162f",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_b5_a.zip",
+      "source_sha256": "eb686da2c1a9db7461a86161a30d609afe006818fc36f6712af5e7d8d5024aa2",
+      "bess_083_sha256": "72ecf66d078cbd7e92d6b0054b0e2e84586c8104b170820ef1dcbf2e3c8f532a",
+      "bess_084_sha256": "372c4ef04970ec1acac1e9c4f0f35b4d6eabe37f54cc025868906b8e87d0b3f1",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_b5_c.zip",
+      "source_sha256": "ec6cf6db36638440de1fe0fc9a724b8a172a762b768951d226cb129b7c83f40a",
+      "bess_083_sha256": "18312afabd302df1e52d3248df72f726b2e5f35cf37cd57005507d9970405e6c",
+      "bess_084_sha256": "029f2908419acb18ce7734893ab722f05a14800f52d83cfda5275052d411663c",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_b5_gt.zip",
+      "source_sha256": "d02397712c37a89eda345bd5344bdd11a446bb0a8386d15ea3e66e1294e48744",
+      "bess_083_sha256": "23990055a574a3db0a765b60a80816b35b211e5b2d5605fd7191039559dc2c3f",
+      "bess_084_sha256": "a05ca3b7fd88e05db48cc23b6286dec42f58bdb41cf9eeb0325ea00d6fd7c579",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_berlingo_1000lingo.zip",
+      "source_sha256": "ea15dac9c3ce8aa222997eea274c17f8d41d7fc69382e041726001ea206c84b3",
+      "bess_083_sha256": "5d825f0113c891fb6977126dca04b8c553e4b66f04142172923557bda9067a6b",
+      "bess_084_sha256": "c0bd4ea82552e030a6fc955b69d6c9191eedd94faf4e3b6c7ac27fa07c49cbb9",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_cerberus_a.zip",
+      "source_sha256": "8f121d8ab20f6a49d0db8cd82a9dea7cc4a4e0a47608836a02b8137adc6ac704",
+      "bess_083_sha256": "1bfcdac317f9e2852fe6708feecfc871f3ab484ba0a48e313dad6357719bf61d",
+      "bess_084_sha256": "56d6f6a84afb57819ec609df8c9fc61176008f3d0f26f45031d28f08f3dd5e89",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_genesis_phantom.zip",
+      "source_sha256": "253030c2149411a94c96de85a27adf763bf39a3a1911d5bc5e23cc1aa38e059e",
+      "bess_083_sha256": "b0cceb5b0ad820cc994f4db047de053f2dda62ecc5a6becbc5739df0124e542a",
+      "bess_084_sha256": "05ee86904138d1771e778292b01521c9ef01947bcc9d52fdb40c077fd675f651",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_nord_optis.zip",
+      "source_sha256": "a62d60083d6d504619882a269d6f68babbbf4509b9bd8246e95e4416b100bd69",
+      "bess_083_sha256": "66fafaee84cc28145e0ee5841ac27f853a3e674bcf9fdec83b21aa64d40496ba",
+      "bess_084_sha256": "1e931a3409984144e2703fd97b1234bdb88eee0cb727c5d3d1c5c7fcc29d4d1c",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_thunderhawk_zero.zip",
+      "source_sha256": "efb989f3467b1bf764258a405fd1d8ff8ffc6101588c2181bf4b775937435eaf",
+      "bess_083_sha256": "83c22b1c368663cc84d5fe83a875db99b9b138f4b55ae7ddc4d111cb6e0fc27e",
+      "bess_084_sha256": "eaf27a6f5b82e541fed3910a5badc622b4968ecfc71c92836387fe253b8dc1be",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_volk_icarus.zip",
+      "source_sha256": "5c46f2ee10f2e0534e69b3a60571e9e4f230bfab61e4d1bd916e5efbc96b3a45",
+      "bess_083_sha256": "8af3dea1b1653e5b8549c2507dbe53c0d8e3bb7f2bb544f3ca3a467807481656",
+      "bess_084_sha256": "bbe2288edbd54f88182a16d7755def81e1a476350845fc360a44fd168ba28416",
+      "bess_changed": true
+    },
+    {
+      "archive": "bunchyearth23_volk_icarus_ii.zip",
+      "source_sha256": "a7921b3bd8263ec82f1e930b6211a6c0cfb6293fbcec7d226405ab557f34d426",
+      "bess_083_sha256": "29226577ce90045fd9106e0d9c4cb7d1d09f0bdebc52f03527f05fd6ea85c01c",
+      "bess_084_sha256": "6f1e2d6c505df9246c4dcc88bf8a378a497b90d6f2bc40ce7b984a0c0bf5abb1",
+      "bess_changed": true
+    }
+  ],
+  "unchanged_source_wavs": 12,
+  "changed_bess_wavs": 12,
+  "steady_5200": {
+    "full": {
+      "source": {
+        "mean": 0.03952703982726883,
+        "cv": 0.06404712126414303,
+        "min": 0.02470949428710018,
+        "p05": 0.03629674204243441,
+        "p95": 0.04349362612207031,
+        "max": 0.04484361966805108,
+        "max_adjacent_db": 4.3671641970279005
+      },
+      "bess_083": {
+        "mean": 0.038849437702325455,
+        "cv": 0.12058210210249795,
+        "min": 0.022255759882706682,
+        "p05": 0.03190661238011156,
+        "p95": 0.047679354476365225,
+        "max": 0.05143864971377787,
+        "max_adjacent_db": 3.979082368612757
+      },
+      "bess_084": {
+        "mean": 0.038995551279457814,
+        "cv": 0.07822685052763197,
+        "min": 0.024999395470292514,
+        "p05": 0.034228086835124266,
+        "p95": 0.04381269902766518,
+        "max": 0.04653854591975394,
+        "max_adjacent_db": 4.648540821519203
+      }
+    },
+    "light": {
+      "source": {
+        "mean": 0.01638460553402444,
+        "cv": 0.10879950350767686,
+        "min": 0.009885299410959355,
+        "p05": 0.014133040103969081,
+        "p95": 0.019920887852080058,
+        "max": 0.020440134380853413,
+        "max_adjacent_db": 4.738053916327879
+      },
+      "bess_083": {
+        "mean": 0.01549945182408103,
+        "cv": 0.2181404063707012,
+        "min": 0.008994383757873241,
+        "p05": 0.010173210529016848,
+        "p95": 0.02089628582017561,
+        "max": 0.022743081305650965,
+        "max_adjacent_db": 6.012716099010244
+      },
+      "bess_084": {
+        "mean": 0.016175693254596068,
+        "cv": 0.11224820588418284,
+        "min": 0.010238616059037786,
+        "p05": 0.013514751801607123,
+        "p95": 0.01939747526100279,
+        "max": 0.019951690110455125,
+        "max_adjacent_db": 4.8626408204042395
+      }
+    }
+  }
+}

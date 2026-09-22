@@ -1,0 +1,13 @@
+Vehicle {
+    name: "thunderhawk_zero",
+    audio_files: 56,
+    blend_files: 1,
+    idle_rpm: Some(
+        800.0,
+    ),
+    max_rpm: Some(
+        12000.0,
+    ),
+    cylinders: None,
+    engine_files: 1,
+}

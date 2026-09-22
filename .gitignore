@@ -1,0 +1,25 @@
+/target/
+/.inspect-bdsp/
+/output/
+/dist/
+/*.zip
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+/cars/
+/tools/__pycache__/
+*.pyc
+/docs/reports/*.png
+/docs/reports/acoustics-0.3-metrics.json
+/docs/reports/drive-metrics.json
+/docs/reports/hybrid-comparison-metrics.json
+/docs/reports/FORMAT-0.8.3-metrics.json
+/docs/reports/LIVE-48K-0.8.3-WAV-hashes.json
+
+# Pre-public-release packaging scripts refer to archived localized outputs.
+/tools/package_delivery.py
+/tools/package_082.py
+/tools/package_083.py
+/tools/verify_delivery_082.py
+/tools/verify_delivery_083.py
+/tools/rename_exports.py

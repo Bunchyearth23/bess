@@ -1,0 +1,6 @@
+Default output · 48000 Hz · 2 channels · 32-bit float
+Duration: 30 s
+Callbacks: 2999
+Maximum callback CPU time: 1.522 ms
+Budget overruns: 0
+Silent test: synthesis calculated, output volume set to zero.

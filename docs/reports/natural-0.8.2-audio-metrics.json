@@ -1,0 +1,240 @@
+{
+  "method": "Identical 16 s cycle; exact source file equality; B at matched integrated RMS; spectral energy over 4096-sample windows. Metrics do not establish subjective realism.",
+  "source_unchanged": 12,
+  "new_bess_renders": 12,
+  "engine_metadata_matches": 12,
+  "vehicles": [
+    {
+      "archive": "bunchyearth23_advent_tc.zip",
+      "engine": {
+        "cylinders": 8,
+        "displacement_l": 4.499622821807861,
+        "exhaust_count": 2,
+        "layout": {
+          "V": {
+            "bank_angle_degrees": 90
+          }
+        },
+        "turbocharged": false,
+        "uid": "8849B6214F4FE861B43EC399BC0E7D21"
+      },
+      "rms_difference": 0.034268473092370084,
+      "correlation": 0.7272772587887317,
+      "peak_bess": 0.35986781120300293,
+      "centroid_source_hz": 350.8176002147581,
+      "centroid_bess_hz": 435.26344020712963,
+      "high_over_low_source_db": -21.598925068937046,
+      "high_over_low_bess_db": -18.041615406350655
+    },
+    {
+      "archive": "bunchyearth23_archo_coupe.zip",
+      "engine": {
+        "cylinders": 8,
+        "displacement_l": 3.999521493911743,
+        "exhaust_count": 2,
+        "layout": {
+          "V": {
+            "bank_angle_degrees": 90
+          }
+        },
+        "turbocharged": false,
+        "uid": "3D507B694DDA20E687EB4B800806F470"
+      },
+      "rms_difference": 0.022458323220257245,
+      "correlation": 0.7150629272643827,
+      "peak_bess": 0.22072196006774902,
+      "centroid_source_hz": 256.8832265330738,
+      "centroid_bess_hz": 305.1302807705437,
+      "high_over_low_source_db": -28.246684280308678,
+      "high_over_low_bess_db": -25.654452867868116
+    },
+    {
+      "archive": "bunchyearth23_b5_a.zip",
+      "engine": {
+        "cylinders": 4,
+        "displacement_l": 0.999670147895813,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": false,
+        "uid": "87FB0E1942A7C67597882A964C93EF67"
+      },
+      "rms_difference": 0.07119395354712098,
+      "correlation": -0.5987062263544559,
+      "peak_bess": 0.21882712841033936,
+      "centroid_source_hz": 60.40445769600021,
+      "centroid_bess_hz": 82.01694551699616,
+      "high_over_low_source_db": -32.56949924340849,
+      "high_over_low_bess_db": -26.444415943282273
+    },
+    {
+      "archive": "bunchyearth23_b5_c.zip",
+      "engine": {
+        "cylinders": 4,
+        "displacement_l": 1.0626705884933472,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": true,
+        "uid": "2390468C47C13D68BECA819887382D3F"
+      },
+      "rms_difference": 0.0874884824835255,
+      "correlation": -0.6744917721472693,
+      "peak_bess": 0.20005619525909424,
+      "centroid_source_hz": 57.3320664079013,
+      "centroid_bess_hz": 66.97053610247032,
+      "high_over_low_source_db": -30.83006441696441,
+      "high_over_low_bess_db": -25.168157996787606
+    },
+    {
+      "archive": "bunchyearth23_b5_gt.zip",
+      "engine": {
+        "cylinders": 4,
+        "displacement_l": 1.0667340755462646,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": true,
+        "uid": "A711C25E4B3ADBA0588B978750369DB3"
+      },
+      "rms_difference": 0.074073857109782,
+      "correlation": -0.595732160901622,
+      "peak_bess": 0.22341084480285645,
+      "centroid_source_hz": 68.13220303561637,
+      "centroid_bess_hz": 86.52976767944311,
+      "high_over_low_source_db": -32.67557492360637,
+      "high_over_low_bess_db": -27.447268996627162
+    },
+    {
+      "archive": "bunchyearth23_berlingo_1000lingo.zip",
+      "engine": {
+        "cylinders": 4,
+        "displacement_l": 1.7253878116607666,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": true,
+        "uid": "A8521B70470987236F7F76ADB058356B"
+      },
+      "rms_difference": 0.03763376803573957,
+      "correlation": 0.7720757742345261,
+      "peak_bess": 0.3297182321548462,
+      "centroid_source_hz": 435.21062644718785,
+      "centroid_bess_hz": 568.9792268366779,
+      "high_over_low_source_db": -12.655539941689762,
+      "high_over_low_bess_db": -11.015612891312106
+    },
+    {
+      "archive": "bunchyearth23_cerberus_a.zip",
+      "engine": {
+        "cylinders": 6,
+        "displacement_l": 3.5852208137512207,
+        "exhaust_count": 2,
+        "layout": {
+          "V": {
+            "bank_angle_degrees": 90
+          }
+        },
+        "turbocharged": false,
+        "uid": "108340AD44A89DB928DDE5A379692A3B"
+      },
+      "rms_difference": 0.028810201576040834,
+      "correlation": 0.5705707602761121,
+      "peak_bess": 0.23089253902435303,
+      "centroid_source_hz": 593.2016798932041,
+      "centroid_bess_hz": 902.5704171354997,
+      "high_over_low_source_db": -12.400429207728493,
+      "high_over_low_bess_db": -9.300001753657991
+    },
+    {
+      "archive": "bunchyearth23_genesis_phantom.zip",
+      "engine": {
+        "cylinders": 6,
+        "displacement_l": 3.000485420227051,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": false,
+        "uid": "588815A048F3E0CBEFFE8B9F9BB4540D"
+      },
+      "rms_difference": 0.021634450415926872,
+      "correlation": 0.7793070582434862,
+      "peak_bess": 0.20837342739105225,
+      "centroid_source_hz": 321.997475849582,
+      "centroid_bess_hz": 448.2433944886137,
+      "high_over_low_source_db": -22.63314669178674,
+      "high_over_low_bess_db": -20.310667782168437
+    },
+    {
+      "archive": "bunchyearth23_nord_optis.zip",
+      "engine": {
+        "cylinders": 4,
+        "displacement_l": 1.2996240854263306,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": false,
+        "uid": "0A099A9346AEF0067E405E8A8EA4DD49"
+      },
+      "rms_difference": 0.07166851323889868,
+      "correlation": -0.5806946818736403,
+      "peak_bess": 0.21809422969818115,
+      "centroid_source_hz": 60.71293126597021,
+      "centroid_bess_hz": 83.12882654236171,
+      "high_over_low_source_db": -33.661059361069434,
+      "high_over_low_bess_db": -25.5114360848469
+    },
+    {
+      "archive": "bunchyearth23_thunderhawk_zero.zip",
+      "engine": {
+        "cylinders": 8,
+        "displacement_l": 2.7895102500915527,
+        "exhaust_count": 1,
+        "layout": {
+          "V": {
+            "bank_angle_degrees": 90
+          }
+        },
+        "turbocharged": false,
+        "uid": "694E80154252F6189DE80988120C7F13"
+      },
+      "rms_difference": 0.02192506053837641,
+      "correlation": 0.7401780343618032,
+      "peak_bess": 0.2157832384109497,
+      "centroid_source_hz": 245.524059505126,
+      "centroid_bess_hz": 292.7868179910484,
+      "high_over_low_source_db": -28.619147457990945,
+      "high_over_low_bess_db": -25.797939630354357
+    },
+    {
+      "archive": "bunchyearth23_volk_icarus.zip",
+      "engine": {
+        "cylinders": 4,
+        "displacement_l": 1.3997364044189453,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": false,
+        "uid": "1AFFF12746B3EE2410C388BB8398A655"
+      },
+      "rms_difference": 0.024734315847790952,
+      "correlation": 0.6066902061946224,
+      "peak_bess": 0.1965031623840332,
+      "centroid_source_hz": 140.0321832919112,
+      "centroid_bess_hz": 198.45449170685842,
+      "high_over_low_source_db": -20.302112675624585,
+      "high_over_low_bess_db": -17.421118296115733
+    },
+    {
+      "archive": "bunchyearth23_volk_icarus_ii.zip",
+      "engine": {
+        "cylinders": 4,
+        "displacement_l": 1.3997364044189453,
+        "exhaust_count": 1,
+        "layout": "Inline",
+        "turbocharged": false,
+        "uid": "B4A40EAB4B92EFF0F8FE76A556FA9348"
+      },
+      "rms_difference": 0.06123245398588722,
+      "correlation": -0.47534792315095853,
+      "peak_bess": 0.1865607500076294,
+      "centroid_source_hz": 64.23281069477751,
+      "centroid_bess_hz": 84.8162116178246,
+      "high_over_low_source_db": -30.279119876989554,
+      "high_over_low_bess_db": -25.61418708740574
+    }
+  ]
+}

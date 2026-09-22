@@ -1,0 +1,6 @@
+Speakers (Sound BlasterX G6) · 48000 Hz · 2 channels · 32-bit float
+Duration: 30 s
+Callbacks: 3000
+Max callback CPU: 1.482 ms
+Budget overruns: 0
+Silent test: synthesis computed with output volume at zero.
