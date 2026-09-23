@@ -4,6 +4,7 @@ use crate::{
     hybrid::{Hybrid, Settings},
     project::Parameters,
 };
+use bdsp::svf::{StateVariableFilter, SvfMode};
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -15,7 +16,7 @@ use std::{
 
 const MAX_SOURCE_WAV_BYTES: u64 = 16_000_000;
 
-fn source_wav(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<f32>, String> {
+fn source_wav(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<(u32, Vec<f32>), String> {
     let entry = zip.by_name(name).map_err(|e| format!("{name}: {e}"))?;
     if entry.size() > MAX_SOURCE_WAV_BYTES {
         return Err(format!("Source WAV is too large: {name}"));
@@ -28,7 +29,7 @@ fn source_wav(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<f32>, S
     if bytes.len() as u64 > MAX_SOURCE_WAV_BYTES {
         return Err(format!("Source WAV is too large: {name}"));
     }
-    bank::decode_wav(&bytes).map(|(_, mono)| mono)
+    bank::decode_wav(&bytes)
 }
 
 fn signal_stats(samples: &[f32]) -> Result<(f32, f32), String> {
@@ -54,6 +55,32 @@ fn signal_stats(samples: &[f32]) -> Result<(f32, f32), String> {
         return Err("Silent source or rendered exhaust WAV".into());
     }
     Ok((rms, peak))
+}
+
+/// A conservative estimate of level after the active Automation exhaust
+/// configuration's 80 Hz low cut. The exact BeamNG filter is not exposed, so
+/// this is used only to calibrate the experimental generated exhaust bank.
+pub(crate) fn low_cut_rms(samples: &[f32], rate: u32) -> Result<f32, String> {
+    if samples.is_empty() || rate < 8000 {
+        return Err("Invalid WAV for low-cut calibration".into());
+    }
+    let mut filter = StateVariableFilter::new(rate as f32, 80., 0.707, SvfMode::Highpass);
+    let mut mean = 0f64;
+    let mut centered_power = 0f64;
+    for (index, &sample) in samples.iter().enumerate() {
+        if !sample.is_finite() {
+            return Err("Non-finite WAV for low-cut calibration".into());
+        }
+        let filtered = filter.next_sample(sample) as f64;
+        let delta = filtered - mean;
+        mean += delta / (index + 1) as f64;
+        centered_power += delta * (filtered - mean);
+    }
+    let rms = (centered_power / samples.len() as f64).sqrt() as f32;
+    if !rms.is_finite() || rms < 1e-7 {
+        return Err("Silent WAV after low-cut calibration".into());
+    }
+    Ok(rms)
 }
 
 fn vehicle_info_path(name: &str) -> bool {
@@ -177,10 +204,35 @@ pub(crate) fn exhaust_safety_gain(peak: f32) -> f32 {
 /// Inputs must first pass `signal_stats`. Absolute peak safety takes precedence over
 /// the 0.5 gain floor when both limits cannot be satisfied together.
 pub(crate) fn exhaust_level_gain(source_rms: f32, exhaust_rms: f32, exhaust_peak: f32) -> f32 {
+    exhaust_level_gain_with_floor(source_rms, exhaust_rms, exhaust_peak, 0.5)
+}
+
+pub(crate) fn exhaust_level_gain_with_floor(
+    source_rms: f32,
+    exhaust_rms: f32,
+    exhaust_peak: f32,
+    floor: f32,
+) -> f32 {
     const MINUS_ONE_DB: f32 = 0.891_250_9;
     (MINUS_ONE_DB * source_rms / exhaust_rms)
-        .clamp(0.5, 2.5)
+        .clamp(floor, 2.5)
         .min(0.94 / exhaust_peak)
+}
+
+/// Uses an 80 Hz low-cut proxy matching the current Automation fleet JBeam
+/// setting. Peak headroom still uses the unfiltered rendered waveform.
+pub(crate) fn procedural_exhaust_level_gain(
+    source: &[f32],
+    source_rate: u32,
+    rendered: &[f32],
+    rendered_peak: f32,
+) -> Result<f32, String> {
+    Ok(exhaust_level_gain_with_floor(
+        low_cut_rms(source, source_rate)?,
+        low_cut_rms(rendered, 48_000)?,
+        rendered_peak,
+        0.25,
+    ))
 }
 
 pub(crate) fn loop_stems(
@@ -335,10 +387,17 @@ fn package_inner(
             let stems = render_stems(bank.clone(), p, h, rpm, layer as f32, 2.);
             let mut rendered = if exhaust_only { stems.0 } else { stems.2 };
             if exhaust_only {
-                let source = source_wav(&mut zip, name)?;
-                let (source_rms, _) = signal_stats(&source)?;
-                let (rendered_rms, rendered_peak) = signal_stats(&rendered)?;
-                let level_gain = exhaust_level_gain(source_rms, rendered_rms, rendered_peak);
+                let (source_rate, source) = source_wav(&mut zip, name)?;
+                let (source_rms_ac, _) = signal_stats(&source)?;
+                let (rendered_rms_ac, rendered_peak) = signal_stats(&rendered)?;
+                let level_gain = if h.procedural {
+                    // Every active Automation exhaust in the current fleet
+                    // declares lowCutFreq=80. Matching whole-file RMS can
+                    // over-amplify B when A contains a large sub-80 Hz tone.
+                    procedural_exhaust_level_gain(&source, source_rate, &rendered, rendered_peak)?
+                } else {
+                    exhaust_level_gain(source_rms_ac, rendered_rms_ac, rendered_peak)
+                };
                 if !level_gain.is_finite() || level_gain <= 0. {
                     return Err(format!("Invalid exhaust level gain: {name}"));
                 }
@@ -436,7 +495,7 @@ fn package_inner(
                 driving: Default::default(),
             },
         )?;
-        let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"render_channel":if exhaust_only {"exhaust"} else {"mixed"},"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});
+        let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"render_channel":if exhaust_only {"exhaust"} else {"mixed"},"exhaust_level_reference":if exhaust_only && h.procedural {"estimated post-80-Hz low-cut RMS; absolute PCM peak still bounds gain"} else {"unfiltered AC RMS"},"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});
         fs::write(
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
@@ -476,7 +535,7 @@ mod phase_tests {
 
 #[cfg(test)]
 mod level_tests {
-    use super::{exhaust_level_gain, signal_stats};
+    use super::{exhaust_level_gain, low_cut_rms, signal_stats};
 
     #[test]
     fn selectable_exhaust_gain_targets_one_db_below_source_with_bounds() {
@@ -512,5 +571,21 @@ mod level_tests {
             (exhaust_level_gain(source_rms, rendered_rms, rendered_peak) - 0.891_250_9).abs()
                 < 1e-6
         );
+    }
+
+    #[test]
+    fn procedural_level_reference_reduces_sub_bass_without_losing_engine_midrange() {
+        let rate = 48_000;
+        let sine = |hz: f32| {
+            (0..rate)
+                .map(|i| (i as f32 * hz * std::f32::consts::TAU / rate as f32).sin() * 0.1)
+                .collect::<Vec<_>>()
+        };
+        let low = sine(40.);
+        let mid = sine(400.);
+        let low_ratio = low_cut_rms(&low, rate).unwrap() / signal_stats(&low).unwrap().0;
+        let mid_ratio = low_cut_rms(&mid, rate).unwrap() / signal_stats(&mid).unwrap().0;
+        assert!(low_ratio < 0.5, "40 Hz ratio {low_ratio}");
+        assert!(mid_ratio > 0.9, "400 Hz ratio {mid_ratio}");
     }
 }

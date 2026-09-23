@@ -162,6 +162,45 @@ fn reconstructed_engine_stem_is_distinct_and_preserves_audition_mix() {
 }
 
 #[test]
+fn procedural_mode_preserves_source_a_and_generates_a_distinct_b() {
+    let bank = fixture();
+    let p = params();
+    let original_a = Settings {
+        enhanced: false,
+        procedural: false,
+        ..Settings::default()
+    };
+    let procedural_a = Settings {
+        procedural: true,
+        ..original_a
+    };
+    let procedural_b = Settings {
+        enhanced: true,
+        ..procedural_a
+    };
+    let mut original = Hybrid::new(48_000, p, original_a, Some(bank.clone()));
+    let mut source = Hybrid::new(48_000, p, procedural_a, Some(bank.clone()));
+    let mut generated = Hybrid::new(48_000, p, procedural_b, Some(bank));
+    let mut difference = 0.;
+    let mut source_energy = 0.;
+    let mut generated_energy = 0.;
+    for i in 0..48_000 {
+        let a = original.next(true);
+        let a_in_new_mode = source.next(true);
+        let b = generated.next(true);
+        assert_eq!(a.to_bits(), a_in_new_mode.to_bits());
+        assert!(b.is_finite());
+        if i >= 24_000 {
+            difference += (a - b).powi(2);
+            source_energy += a * a;
+            generated_energy += b * b;
+        }
+    }
+    assert!(source_energy > 1e-6 && generated_energy > 1e-6);
+    assert!(difference > source_energy * 0.25);
+}
+
+#[test]
 fn source_reference_retains_original_phase_across_listening_volumes() {
     let bank = fixture();
     let source_settings = Settings {

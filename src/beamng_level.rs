@@ -21,6 +21,9 @@ const PCM24_DECODE_SCALE: f32 = 8_388_608.;
 pub struct Report {
     /// Common linear gain applied to every exported exhaust WAV.
     pub safety_gain: f32,
+    /// The primary exhaust difference uses an 80 Hz high-pass proxy for the
+    /// procedural path. Detailed AC RMS and peaks always describe raw files.
+    pub post_low_cut_estimate: bool,
     /// One point per original Automation RPM knot and load row.
     pub points: Vec<Point>,
 }
@@ -36,8 +39,9 @@ pub struct Point {
     pub engine_rms_dbfs: f32,
     pub exhaust_peak_dbfs: f32,
     pub engine_peak_dbfs: f32,
-    /// Change in the exhaust WAV's AC RMS against Automation's original WAV.
-    /// Both use the same copied `soundConfigExhaust` when installed in BeamNG.
+    /// Exhaust difference against Automation at this knot. In procedural mode
+    /// this uses an 80 Hz low-cut proxy on exact exported PCM24; otherwise it
+    /// uses unfiltered AC RMS. See `Report::post_low_cut_estimate`.
     pub exhaust_vs_source_db: f32,
     /// Relative AC RMS of the two exported WAV files before BeamNG's JBeam gains.
     pub engine_vs_exhaust_db: f32,
@@ -105,6 +109,7 @@ struct PendingPoint {
     rpm: f32,
     load: f32,
     source: Stats,
+    source_post_low_cut_rms: Option<f32>,
     exhaust: Vec<f32>,
     engine: Vec<f32>,
 }
@@ -185,7 +190,7 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
                 return Err("Imported bank differs from the source blend".into());
             }
             let wav_bytes = read_limited(&mut zip, path, MAX_WAV_BYTES)?;
-            let (_, source_samples) = bank::decode_wav(&wav_bytes)?;
+            let (source_rate, source_samples) = bank::decode_wav(&wav_bytes)?;
             let source = Stats::from_samples(&source_samples)?;
             if source.rms < 1e-7 || source.peak < 1e-7 {
                 return Err(format!("Silent source WAV at {rpm:.0} rpm, load {layer}"));
@@ -202,8 +207,16 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
             if exhaust_stats.rms < 1e-7 || exhaust_stats.peak < 1e-7 {
                 return Err(format!("Silent exhaust stem at {rpm:.0} rpm, load {load}"));
             }
-            let level_gain =
-                export::exhaust_level_gain(source.rms, exhaust_stats.rms, exhaust_stats.peak);
+            let level_gain = if h.procedural {
+                export::procedural_exhaust_level_gain(
+                    &source_samples,
+                    source_rate,
+                    &exhaust,
+                    exhaust_stats.peak,
+                )?
+            } else {
+                export::exhaust_level_gain(source.rms, exhaust_stats.rms, exhaust_stats.peak)
+            };
             if !level_gain.is_finite() || level_gain <= 0. {
                 return Err(format!(
                     "Invalid exhaust level gain at {rpm:.0} rpm, load {load}"
@@ -219,6 +232,10 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
                 rpm,
                 load,
                 source,
+                source_post_low_cut_rms: h
+                    .procedural
+                    .then(|| export::low_cut_rms(&source_samples, source_rate))
+                    .transpose()?,
                 exhaust,
                 engine,
             });
@@ -231,14 +248,31 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
     let mut points = Vec::with_capacity(pending.len());
     pending.sort_by(|a, b| a.load.total_cmp(&b.load).then(a.rpm.total_cmp(&b.rpm)));
     for item in pending {
-        let exhaust = Stats::from_pcm24(&item.exhaust, safety_gain)?;
+        // The procedural comparison follows the same quantization and final
+        // bank-wide gain as the written WAV, then applies the 80 Hz proxy.
+        let exhaust_pcm = h.procedural.then(|| {
+            item.exhaust
+                .iter()
+                .map(|&sample| {
+                    ((sample * safety_gain * PCM24_SCALE) as i32) as f32 / PCM24_DECODE_SCALE
+                })
+                .collect::<Vec<_>>()
+        });
+        let exhaust = match &exhaust_pcm {
+            Some(samples) => Stats::from_samples(samples)?,
+            None => Stats::from_pcm24(&item.exhaust, safety_gain)?,
+        };
         let engine_raw = Stats::from_samples(&item.engine)?;
         let engine_gain = variant::engine_stem_gain(
             exhaust.raw_rms,
             engine_raw.raw_rms,
             engine_raw.peak,
             item.load,
-            bank.residual_reliability(item.rpm, item.load),
+            if h.procedural {
+                1.
+            } else {
+                bank.residual_reliability(item.rpm, item.load)
+            },
         );
         // Export refuses samples outside this ceiling before PCM encoding.
         if engine_raw.peak * engine_gain > 0.951 {
@@ -248,6 +282,14 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
         let source_rms_dbfs = dbfs(item.source.rms)?;
         let exhaust_rms_dbfs = dbfs(exhaust.rms)?;
         let engine_rms_dbfs = dbfs_allow_silence(engine.rms)?;
+        let exhaust_vs_source_db = if let Some(samples) = &exhaust_pcm {
+            let source_post_low_cut = item
+                .source_post_low_cut_rms
+                .ok_or("Missing procedural source low-cut level")?;
+            dbfs(export::low_cut_rms(samples, 48_000)?)? - dbfs(source_post_low_cut)?
+        } else {
+            exhaust_rms_dbfs - source_rms_dbfs
+        };
         points.push(Point {
             rpm: item.rpm,
             load: item.load,
@@ -256,12 +298,13 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
             engine_rms_dbfs,
             exhaust_peak_dbfs: dbfs(exhaust.peak)?,
             engine_peak_dbfs: dbfs_allow_silence(engine.peak)?,
-            exhaust_vs_source_db: exhaust_rms_dbfs - source_rms_dbfs,
+            exhaust_vs_source_db,
             engine_vs_exhaust_db: engine_rms_dbfs - exhaust_rms_dbfs,
         });
     }
     Ok(Report {
         safety_gain,
+        post_low_cut_estimate: h.procedural,
         points,
     })
 }
@@ -380,6 +423,7 @@ mod tests {
         let p = Parameters::default();
         let h = Settings::default();
         let report = analyze(bank.clone(), p, h).unwrap();
+        assert!(!report.post_low_cut_estimate);
         assert_eq!(report.points.len(), 2);
         let output = work.join("rendered");
         export::package_exhaust_stem(&output, p, h, bank.clone()).unwrap();
@@ -421,6 +465,63 @@ mod tests {
             assert!((actual.rms - raw_stats.rms * expected_gain * report.safety_gain).abs() < 1e-6);
         }
         drop(rendered);
+
+        // The procedural report uses the same per-knot low-cut calibration as
+        // export and measures the actual quantized PCM24 after safety gain.
+        let mut procedural = h;
+        procedural.procedural = true;
+        let procedural_report = analyze(bank.clone(), p, procedural).unwrap();
+        assert!(procedural_report.post_low_cut_estimate);
+        let procedural_output = work.join("procedural-rendered");
+        export::package_exhaust_stem(&procedural_output, p, procedural, bank.clone()).unwrap();
+        let procedural_manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(procedural_output.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            procedural_report.safety_gain,
+            procedural_manifest["gain"].as_f64().unwrap() as f32
+        );
+        let mut procedural_zip = zip::ZipArchive::new(
+            File::open(procedural_output.join(export::package_name(&bank))).unwrap(),
+        )
+        .unwrap();
+        for (layer, point) in procedural_report.points.iter().enumerate() {
+            let path = format!("art/sound/engine/test/{layer}.wav");
+            let source_wav = read_limited(&mut original, &path, MAX_WAV_BYTES).unwrap();
+            let (source_rate, source_samples) = bank::decode_wav(&source_wav).unwrap();
+            let exported_wav = read_limited(&mut procedural_zip, &path, MAX_WAV_BYTES).unwrap();
+            let (rate, exported_samples) = bank::decode_wav(&exported_wav).unwrap();
+            assert_eq!(rate, 48_000);
+            let actual = Stats::from_samples(&exported_samples).unwrap();
+            assert!((point.exhaust_rms_dbfs - dbfs(actual.rms).unwrap()).abs() < 0.00001);
+            assert!((point.exhaust_peak_dbfs - dbfs(actual.peak).unwrap()).abs() < 0.00001);
+            let expected_difference = dbfs(export::low_cut_rms(&exported_samples, rate).unwrap())
+                .unwrap()
+                - dbfs(export::low_cut_rms(&source_samples, source_rate).unwrap()).unwrap();
+            assert!((point.exhaust_vs_source_db - expected_difference).abs() < 0.00001);
+
+            let (raw_exhaust, _, _) =
+                export::loop_stems(bank.clone(), p, procedural, 800., layer as f32);
+            let raw_peak = Stats::from_samples(&raw_exhaust).unwrap().peak;
+            let expected_gain = export::procedural_exhaust_level_gain(
+                &source_samples,
+                source_rate,
+                &raw_exhaust,
+                raw_peak,
+            )
+            .unwrap();
+            let documented_gain = procedural_manifest["loops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|loop_info| loop_info["path"] == path)
+                .unwrap()["exhaust_level_gain"]
+                .as_f64()
+                .unwrap() as f32;
+            assert!((documented_gain - expected_gain).abs() < 1e-6);
+        }
+        drop(procedural_zip);
 
         // The legacy full-replacement route still writes its original mixed
         // channel with only the bank-wide safety gain.

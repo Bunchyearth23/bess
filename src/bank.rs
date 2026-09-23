@@ -6,6 +6,7 @@ use std::{
     fs::File,
     io::{Cursor, Read},
     path::Path,
+    sync::{Arc, OnceLock},
 };
 
 const PAD: usize = 128;
@@ -51,6 +52,7 @@ pub struct Bank {
     original_gain: f32,
     pub min_rpm: f32,
     pub max_rpm: f32,
+    procedural: OnceLock<Arc<crate::procedural::ProceduralBank>>,
 }
 fn read_entry(zip: &mut zip::ZipArchive<File>, name: &str, limit: u64) -> Result<Vec<u8>, String> {
     let entry = zip.by_name(name).map_err(|e| format!("{name} : {e}"))?;
@@ -101,6 +103,16 @@ pub fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
     Ok((spec.sample_rate, mono))
 }
 impl Sample {
+    /// Prepared recording for offline descriptor extraction. The audio thread
+    /// must not use this slice for procedural playback.
+    pub(crate) fn analysis_pcm(&self) -> &[f32] {
+        &self.pcm[PAD..PAD + self.frames]
+    }
+
+    pub(crate) fn analysis_cycles(&self) -> usize {
+        self.cycles
+    }
+
     fn prepare(rpm: f32, rate: u32, mut raw: Vec<f32>) -> Result<Self, String> {
         let mean = raw.iter().map(|x| *x as f64).sum::<f64>() / raw.len() as f64;
         for x in &mut raw {
@@ -224,6 +236,18 @@ impl Sample {
     }
 }
 impl Bank {
+    /// Prepare the generated sound model on the import worker before playback.
+    pub fn prepare_procedural(&self) {
+        let _ = self.procedural_model();
+    }
+
+    /// The descriptor analysis runs once per imported bank, before audio starts.
+    pub(crate) fn procedural_model(&self) -> Arc<crate::procedural::ProceduralBank> {
+        self.procedural
+            .get_or_init(|| Arc::new(crate::procedural::ProceduralBank::from_bank(self)))
+            .clone()
+    }
+
     /// Import-time descriptors, not an identification of physical engine parts.
     pub fn character(&self) -> Character {
         let mut confidence = 0.;
@@ -378,6 +402,7 @@ impl Bank {
             original_gain,
             min_rpm,
             max_rpm,
+            procedural: OnceLock::new(),
         })
     }
     pub fn read(&self, cycle: f64, rpm: f32, load: f32, rate: f32, sinc: &SincTable) -> f32 {
@@ -508,6 +533,7 @@ mod tests {
             original_gain: 1.,
             min_rpm: 1000.,
             max_rpm: 2000.,
+            procedural: OnceLock::new(),
         };
         assert_eq!(bank.residual_reliability(1000., 0.), 1.);
         assert_eq!(bank.residual_reliability(1000., 1.), 0.);

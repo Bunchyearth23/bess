@@ -142,6 +142,7 @@ impl App {
                             .into(),
                     );
                 }
+                bank.prepare_procedural();
                 let vehicle = beamng::inspect(&path).ok();
                 let driving = project.as_ref().map(|p| p.driving).unwrap_or(Controls {
                     mode: Mode::Simulated,
@@ -305,6 +306,16 @@ impl App {
             ui.selectable_value(&mut self.settings.enhanced, false, "A · Source Automation");
             ui.selectable_value(&mut self.settings.enhanced, true, "B · BESS resynthesis");
         });
+        if self.bank.is_some()
+            && ui
+                .checkbox(
+                    &mut self.settings.procedural,
+                    "Experimental: generate B from measured engine characteristics",
+                )
+                .changed()
+        {
+            self.reconnect();
+        }
         ui.add_enabled(
             self.audition_mix == AuditionMix::Live,
             egui::Checkbox::new(
@@ -315,7 +326,11 @@ impl App {
         ui.small(
             "A plays the imported WAV files with prepared transitions. It is not a game recording.",
         );
-        ui.small("B uses the Automation recording as a seed. Its additional engine-side layer is estimated from exhaust-only audio.");
+        if self.settings.procedural {
+            ui.small("Experimental B uses the ZIP to measure level and broad tonal character, then generates new pulses and flow. The engine-side sound remains an estimate from exhaust-only audio.");
+        } else {
+            ui.small("B uses the Automation recording as a seed. Its additional engine-side layer is estimated from exhaust-only audio.");
+        }
         if self.bank.is_some() {
             ui.horizontal(|ui| {
                 ui.label("Listening mix:");
@@ -636,6 +651,11 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
         "At {rpm:.0} rpm · off-load points: {:.0}–{:.0} rpm · full-load points: {:.0}–{:.0} rpm",
         off.0.rpm, off.1.rpm, on.0.rpm, on.1.rpm
     ));
+    let exhaust_difference_label = if report.post_low_cut_estimate {
+        "BESS exhaust vs original (80 Hz estimate)"
+    } else {
+        "BESS exhaust vs original · file AC RMS"
+    };
     egui::Grid::new("beamng-export-levels")
         .striped(true)
         .show(ui, |ui| {
@@ -645,12 +665,12 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
             ui.end_row();
             for (label, value) in [
                 (
-                    "BESS exhaust vs original",
+                    exhaust_difference_label,
                     (|point: &beamng_level::Point| point.exhaust_vs_source_db)
                         as fn(&beamng_level::Point) -> f32,
                 ),
                 (
-                    "Added engine vs BESS exhaust",
+                    "Added engine vs BESS exhaust · file AC RMS",
                     (|point: &beamng_level::Point| point.engine_vs_exhaust_db)
                         as fn(&beamng_level::Point) -> f32,
                 ),
@@ -661,7 +681,11 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
                 ui.end_row();
             }
         });
-    ui.small("Positive exhaust values have more audible AC energy than the original WAV at the same RPM and load. DC offset is excluded from RMS; engine and exhaust play from different locations in the vehicle.");
+    if report.post_low_cut_estimate {
+        ui.small("The exhaust comparison applies a modeled 80 Hz high-pass to the original WAV and to the final exported PCM24. The 80 Hz setting is verified for the current Automation fleet; the exact BeamNG filter and perceived loudness remain unknown. Detailed AC RMS and peaks below remain unfiltered file measurements.");
+    } else {
+        ui.small("Positive exhaust values have more AC energy than the original WAV at the same RPM and load. DC offset is excluded from RMS; engine and exhaust play from different locations in the vehicle.");
+    }
     ui.collapsing("WAV level details", |ui| {
         egui::Grid::new("beamng-export-level-details")
             .striped(true)
@@ -726,6 +750,7 @@ mod level_ui_tests {
         };
         let report = beamng_level::Report {
             safety_gain: 1.,
+            post_low_cut_estimate: false,
             points: vec![
                 point(4989., 0., -1.0),
                 point(5338., 0., 0.5),
@@ -939,6 +964,19 @@ impl eframe::App for App {
                     }
                     ui.separator();
                     ui.heading("02 / Character and dynamics");
+                    if self.settings.procedural {
+                        if let Some(cylinders) = self.bank.as_ref().and_then(|bank| bank.engine_meta.as_ref().map(|meta| meta.cylinders)) {
+                            ui.small(format!("Generated pulse timing uses {cylinders} cylinders verified in the vehicle ZIP. Firing order is not identified."));
+                        } else {
+                            ui.small("Cylinder metadata is unavailable. The generated pulse timing uses this configured approximation:");
+                            ui.add(egui::Slider::new(&mut self.params.cylinders, 1..=12).text("Cylinders"));
+                        }
+                        ui.small("The ZIP sets broad tone and level. These three controls balance the generated sources; the original waveform does not enter B.");
+                        slider(ui, "Generated exhaust", &mut self.params.exhaust, 0.0..=1.0);
+                        slider(ui, "Generated intake", &mut self.params.intake, 0.0..=1.0);
+                        slider(ui, "Generated mechanics", &mut self.params.mechanical, 0.0..=1.0);
+                        ui.small("This is an experimental exhaust-guided model. Its intake and mechanical sound are estimates, not separate recordings.");
+                    } else {
                     ui.collapsing("Engine and combustion (optional)", |ui| {
                         ui.small("Automation engine data may provide the layout, but not the firing order. Combustion events are optional: the WAV files already contain pulses.");
                         let mut enabled=self.settings.combustion.cylinders>0;
@@ -979,10 +1017,15 @@ impl eframe::App for App {
                     if ui.add_enabled(self.bank.is_some(),egui::Button::new("Fit vehicle / natural background")).clicked()
                         && let Some(bank)=&self.bank {
                             let enhanced=self.settings.enhanced;let level_match=self.settings.level_match;
+                            let procedural=self.settings.procedural;
                             let combustion=self.settings.combustion;
-                            self.settings=Settings{enhanced,level_match,combustion,..Settings::calibrated(bank)};
+                            self.settings=Settings{enhanced,procedural,level_match,combustion,..Settings::calibrated(bank)};
                     }
-                    ui.small("Pulses and texture separated from the imported WAV files.");
+                    if self.settings.procedural {
+                        ui.small("The source-pulse and source-texture controls below apply to the earlier source-guided mode only.");
+                    } else {
+                        ui.small("Pulses and texture separated from the imported WAV files.");
+                    }
                     slider(
                         ui,
                         "Source pulses",
@@ -1144,6 +1187,7 @@ impl eframe::App for App {
                     ui.small(
                         "Reconstructed layers are not isolated recordings from the vehicle.",
                     );
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save project").clicked()
@@ -1325,9 +1369,51 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    if args.get(1).map(String::as_str) == Some("--steady-procedural") {
+        let result = (|| {
+            let archive = args.get(2).ok_or("ZIP file required")?;
+            let dir = args.get(3).ok_or("Output folder required")?;
+            let bank = Arc::new(Bank::load(Path::new(archive), None)?);
+            let rpm = args
+                .get(4)
+                .ok_or("RPM required")?
+                .parse::<f32>()
+                .map_err(|_| "Invalid RPM")?
+                .clamp(bank.min_rpm, bank.max_rpm);
+            let load = args
+                .get(5)
+                .ok_or("Load required")?
+                .parse::<f32>()
+                .map_err(|_| "Invalid load")?;
+            let params = Parameters {
+                cylinders: bank.engine_meta.as_ref().map_or(4, |meta| meta.cylinders),
+                rpm,
+                load,
+                brightness: 10_000.,
+                exhaust: 1.,
+                intake: 0.25,
+                mechanical: 0.12,
+                ..Parameters::default()
+            };
+            render::steady_procedural_comparison(Path::new(dir), params, bank, 6.)
+        })();
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if matches!(
         args.get(1).map(String::as_str),
-        Some("--compare" | "--characters" | "--drive-demo" | "--beamng" | "--beamng-replacement")
+        Some(
+            "--compare"
+                | "--compare-procedural"
+                | "--characters"
+                | "--drive-demo"
+                | "--beamng"
+                | "--beamng-procedural"
+                | "--beamng-replacement"
+        )
     ) {
         let result = (|| {
             let path = args.get(2).ok_or("ZIP file required")?;
@@ -1347,16 +1433,21 @@ fn main() -> eframe::Result {
                 intake: 0.25,
                 ..Default::default()
             };
-            if args[1] == "--beamng" {
-                bess::variant::package(Path::new(dir), params, Settings::calibrated(&bank), bank)
+            let mut settings = Settings::calibrated(&bank);
+            settings.procedural = matches!(
+                args[1].as_str(),
+                "--compare-procedural" | "--beamng-procedural"
+            );
+            if matches!(args[1].as_str(), "--beamng" | "--beamng-procedural") {
+                bess::variant::package(Path::new(dir), params, settings, bank)
             } else if args[1] == "--beamng-replacement" {
-                bess::export::package(Path::new(dir), params, Settings::calibrated(&bank), bank)
+                bess::export::package(Path::new(dir), params, settings, bank)
             } else if args[1] == "--drive-demo" {
                 render::drive_demo(Path::new(dir), params, bank)
             } else if args[1] == "--characters" {
                 render::characters(Path::new(dir), params, bank)
             } else {
-                render::comparison(Path::new(dir), params, Settings::calibrated(&bank), bank)
+                render::comparison(Path::new(dir), params, settings, bank)
             }
         })();
         if let Err(e) = result {
@@ -1386,6 +1477,7 @@ fn main() -> eframe::Result {
             let a = if let Some(path) = args.get(3) {
                 let bank = Arc::new(Bank::load(Path::new(path), None)?);
                 let check_settings = Settings {
+                    procedural: args.get(5).is_some_and(|s| s == "procedural"),
                     combustion: if args.get(5).is_some_and(|s| s == "events") {
                         bess::combustion::Combustion::even(12)
                     } else {

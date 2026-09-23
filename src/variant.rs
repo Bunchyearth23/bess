@@ -551,11 +551,18 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         // fixed row-wide gain made some RPM knots dominate the sound. Balance
         // each knot, but never rescue a weak proxy with an enormous boost.
         let reliability = bank.residual_reliability(*rpm, *load);
-        let gain = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, *load, reliability);
+        let inference_weight = if h.procedural { 1. } else { reliability };
+        let gain = engine_stem_gain(
+            exhaust_rms,
+            engine_rms,
+            engine_peak,
+            *load,
+            inference_weight,
+        );
         let ratio = gain * engine_rms / exhaust_rms;
         engine_gains.push(gain);
         engine_ratios.push(ratio);
-        engine_points.push(json!({"rpm":rpm,"load":load,"gain":gain,"rms_ratio":ratio,"residual_reliability":reliability}));
+        engine_points.push(json!({"rpm":rpm,"load":load,"gain":gain,"rms_ratio":ratio,"residual_reliability":reliability,"engine_inference_weight":inference_weight}));
         exhaust_wavs.push(wav);
         engine_loops.push(engine);
     }
@@ -636,6 +643,7 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         "settings":previous["settings"],
         "parameters":previous["parameters"],
         "gain":previous["gain"],
+        "exhaust_level_reference":previous["exhaust_level_reference"],
         "validation":"Add-on paths are disjoint from the original; BeamNG driving and audible behavior still require in-game testing"
     });
     fs::write(

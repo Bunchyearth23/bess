@@ -2,6 +2,7 @@ use crate::{
     acoustics::{Exhaust, Geometry, Intake},
     bank::Bank,
     engine::Engine,
+    procedural::ProceduralVoice,
     project::Parameters,
 };
 use bdsp::{
@@ -16,6 +17,8 @@ use std::sync::Arc;
 #[serde(default)]
 pub struct Settings {
     pub enhanced: bool,
+    /// Use measured descriptors to generate B without replaying source PCM.
+    pub procedural: bool,
     pub level_match: bool,
     pub response: f32,
     pub attack: f32,
@@ -52,6 +55,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enhanced: true,
+            procedural: false,
             level_match: true,
             response: 0.14,
             attack: 0.4,
@@ -137,6 +141,7 @@ impl Settings {
         );
         Self {
             enhanced: self.enhanced,
+            procedural: self.procedural,
             level_match: self.level_match,
             response: self.response,
             combustion: self.combustion,
@@ -435,6 +440,7 @@ pub struct Hybrid {
     mechanical_source_energy: f32,
     inferred_weight: f32,
     phase_locked_texture: PhaseLockedTexture,
+    procedural_voice: Option<ProceduralVoice>,
     raw_energy: f32,
     wet_energy: f32,
     compensation: f32,
@@ -487,9 +493,16 @@ impl Hybrid {
             None
         };
         let mechanical_cylinders = mechanical_cylinders(bank.as_deref(), h);
+        let procedural_cylinders = bank
+            .as_ref()
+            .and_then(|bank| bank.engine_meta.as_ref().map(|meta| meta.cylinders))
+            .unwrap_or(p.cylinders);
         let inferred_weight = bank.as_ref().map_or(1., |bank| {
             inferred_layer_weight(bank.residual_reliability(p.rpm, p.load))
         });
+        let procedural_voice = bank
+            .as_ref()
+            .map(|bank| ProceduralVoice::new(rate, bank.procedural_model(), procedural_cylinders));
         Self {
             bank,
             fallback,
@@ -526,6 +539,7 @@ impl Hybrid {
             mechanical_source_energy: 0.,
             inferred_weight,
             phase_locked_texture: PhaseLockedTexture::new(),
+            procedural_voice,
             raw_energy: 0.001,
             wet_energy: 0.001,
             compensation: 1.,
@@ -564,6 +578,14 @@ impl Hybrid {
         self.h = h;
         let mechanical_cylinders = mechanical_cylinders(self.bank.as_deref(), h);
         self.mechanical_impacts.set_slots(mechanical_cylinders);
+        if let Some(voice) = &mut self.procedural_voice {
+            voice.set_cylinders(
+                self.bank
+                    .as_ref()
+                    .and_then(|bank| bank.engine_meta.as_ref().map(|meta| meta.cylinders))
+                    .unwrap_or(p.cylinders),
+            );
+        }
         if let Some(e) = &mut self.fallback {
             e.set_parameters(p);
         }
@@ -575,7 +597,11 @@ impl Hybrid {
         self.fast_load
     }
     pub fn inferred_layer_weight(&self) -> f32 {
-        self.inferred_weight
+        if self.h.procedural {
+            1.
+        } else {
+            self.inferred_weight
+        }
     }
     /// Divide a live engine stem by this factor to compare its peak with an
     /// exported stem, which removes playback level and the Bank gain.
@@ -589,6 +615,61 @@ impl Hybrid {
     }
     pub fn next(&mut self, playing: bool) -> f32 {
         self.next_stems(playing).mixed
+    }
+    fn next_procedural(&mut self, raw: f32, source_scale: f32) -> HybridStems {
+        let bank = self.bank.as_ref().expect("procedural voice has a bank");
+        let position = (self.p.rpm - bank.min_rpm) / (bank.max_rpm - bank.min_rpm).max(1.);
+        let (exhaust_source, intake_source, mechanical_source) = self
+            .procedural_voice
+            .as_mut()
+            .expect("procedural voice was prepared before playback")
+            .next(self.p.rpm, self.fast_load, self.wet_cycle);
+        let exhaust = self.dc.next_sample(
+            exhaust_source
+                * self.p.exhaust
+                * self.current.maps.exhaust.at(position, self.fast_load),
+        );
+        let engine = self.engine_stem_dc.next_sample(
+            intake_source * self.p.intake * self.current.maps.intake.at(position, self.fast_load)
+                + mechanical_source * self.p.mechanical,
+        );
+        let wet = exhaust + engine * 0.25;
+        let energy_smooth = 1. / (self.rate * 1.5);
+        // Keep the level reference in the descriptor domain. Following the
+        // source waveform here would imprint its slow amplitude motion onto B.
+        let measured_level = self
+            .procedural_voice
+            .as_ref()
+            .expect("procedural voice was prepared before playback")
+            .mean_source_rms(self.p.rpm, self.fast_load);
+        self.raw_energy += (measured_level * measured_level - self.raw_energy) * energy_smooth;
+        self.wet_energy += (wet * wet - self.wet_energy) * energy_smooth;
+        if self.tick.is_multiple_of(64) {
+            let target = if self.h.level_match {
+                (self.raw_energy / self.wet_energy.max(1e-9))
+                    .sqrt()
+                    .clamp(0.4, 2.)
+            } else {
+                1.
+            };
+            self.compensation += (target - self.compensation) * (64. / (self.rate * 0.2));
+        }
+        let out = self
+            .transition_level
+            .mix(raw, wet * self.compensation, self.blend, self.rate)
+            * self.gain;
+        let mixed = if out.abs() > 0.95 {
+            out.signum() * (0.95 + 0.049 * ((out.abs() - 0.95) / 0.049).tanh())
+        } else {
+            out
+        };
+        let engine_stem = engine * self.compensation * self.blend * self.gain;
+        HybridStems {
+            exhaust: mixed - engine_stem * 0.25,
+            engine: engine_stem,
+            source_reference: raw * source_scale * self.gain,
+            mixed,
+        }
     }
     pub fn next_stems(&mut self, playing: bool) -> HybridStems {
         if let Some(e) = &mut self.fallback {
@@ -690,6 +771,10 @@ impl Hybrid {
             self.rate,
             &self.sinc,
         );
+        if self.h.procedural {
+            let source_scale = bank.original_to_processed_gain();
+            return self.next_procedural(raw, source_scale);
+        }
         let (periodic, residual) = bank.read_components(
             self.wet_cycle,
             self.p.rpm,

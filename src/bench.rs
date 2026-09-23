@@ -2,10 +2,11 @@
 use crate::{
     bank::Bank,
     drive::{Controls, Mode, Simulator, State, TICK_RATE},
-    export::exhaust_level_gain,
+    export::{exhaust_level_gain, exhaust_level_gain_with_floor},
     hybrid::{Hybrid, HybridStems, Settings, audition},
     project::Parameters,
 };
+use bdsp::svf::{StateVariableFilter, SvfMode};
 use std::sync::Arc;
 
 /// Selects what the local listening bench plays. BeamNG applies additional
@@ -64,8 +65,13 @@ impl<const BLOCKS: usize> PeakWindow<BLOCKS> {
 /// changes while the user listens.
 struct TwoEmitterPreview {
     rate: f32,
+    procedural: bool,
     source_power: f32,
     exhaust_power: f32,
+    source_cut_power: f32,
+    exhaust_cut_power: f32,
+    source_cut: StateVariableFilter,
+    exhaust_cut: StateVariableFilter,
     exhaust_peak: PeakWindow<96>,
     exhaust_gain: f32,
     engine_power: f32,
@@ -77,11 +83,16 @@ struct TwoEmitterPreview {
 impl TwoEmitterPreview {
     const NOMINAL_ENGINE_GAIN: f32 = 0.398_107_17; // -8 dB vs exhaust in the current JBeam.
 
-    fn new(rate: u32) -> Self {
+    fn new(rate: u32, procedural: bool) -> Self {
         Self {
             rate: rate as f32,
+            procedural,
             source_power: 0.,
             exhaust_power: 0.,
+            source_cut_power: 0.,
+            exhaust_cut_power: 0.,
+            source_cut: StateVariableFilter::new(rate as f32, 80., 0.707, SvfMode::Highpass),
+            exhaust_cut: StateVariableFilter::new(rate as f32, 80., 0.707, SvfMode::Highpass),
             exhaust_peak: PeakWindow::new(rate),
             exhaust_gain: 1.,
             engine_power: 0.,
@@ -104,15 +115,35 @@ impl TwoEmitterPreview {
         self.source_power +=
             (stems.source_reference * stems.source_reference - self.source_power) * energy_step;
         self.exhaust_power += (stems.exhaust * stems.exhaust - self.exhaust_power) * energy_step;
+        let source_cut = self.source_cut.next_sample(stems.source_reference);
+        let exhaust_cut = self.exhaust_cut.next_sample(stems.exhaust);
+        self.source_cut_power += (source_cut * source_cut - self.source_cut_power) * energy_step;
+        self.exhaust_cut_power +=
+            (exhaust_cut * exhaust_cut - self.exhaust_cut_power) * energy_step;
         self.engine_power += (stems.engine * stems.engine - self.engine_power) * energy_step;
         let export_exhaust_peak = stems.exhaust.abs() / exhaust_export_normalizer.max(1e-6);
         let exhaust_peak = self.exhaust_peak.next(export_exhaust_peak);
-        let exhaust_target = if self.source_power > 1e-12 && self.exhaust_power > 1e-12 {
-            exhaust_level_gain(
-                self.source_power.sqrt(),
-                self.exhaust_power.sqrt(),
-                exhaust_peak,
-            )
+        let source_power = if self.procedural {
+            self.source_cut_power
+        } else {
+            self.source_power
+        };
+        let exhaust_power = if self.procedural {
+            self.exhaust_cut_power
+        } else {
+            self.exhaust_power
+        };
+        let exhaust_target = if source_power > 1e-12 && exhaust_power > 1e-12 {
+            if self.procedural {
+                exhaust_level_gain_with_floor(
+                    source_power.sqrt(),
+                    exhaust_power.sqrt(),
+                    exhaust_peak,
+                    0.25,
+                )
+            } else {
+                exhaust_level_gain(source_power.sqrt(), exhaust_power.sqrt(), exhaust_peak)
+            }
         } else {
             1.
         };
@@ -198,7 +229,7 @@ impl Bench {
             reset_token: 0,
             cycle_seconds: 16.,
             audition_mix: AuditionMix::Live,
-            two_emitter_preview: TwoEmitterPreview::new(rate),
+            two_emitter_preview: TwoEmitterPreview::new(rate, settings.procedural),
         }
     }
     pub fn set_cycle_seconds(&mut self, seconds: f32) {
@@ -218,6 +249,7 @@ impl Bench {
         }
         self.params = p;
         self.settings = h;
+        self.two_emitter_preview.procedural = h.procedural;
         self.controls = c;
         self.reset_token = reset_token;
         if c.mode == Mode::Direct {
@@ -278,7 +310,7 @@ mod preview_tests {
     #[test]
     fn two_emitter_preview_uses_export_load_targets_and_gain_cap() {
         let run = |load, engine, inferred_weight| {
-            let mut preview = TwoEmitterPreview::new(48_000);
+            let mut preview = TwoEmitterPreview::new(48_000, false);
             let stems = HybridStems {
                 source_reference: 0.1,
                 exhaust: 0.1,
@@ -305,7 +337,7 @@ mod preview_tests {
 
     #[test]
     fn preview_selection_fades_without_changing_default_live_mix() {
-        let mut preview = TwoEmitterPreview::new(48_000);
+        let mut preview = TwoEmitterPreview::new(48_000, false);
         let stems = HybridStems {
             source_reference: 0.2,
             exhaust: 0.2,
@@ -323,7 +355,7 @@ mod preview_tests {
 
     #[test]
     fn two_emitter_preview_has_a_mono_safety_ceiling() {
-        let mut preview = TwoEmitterPreview::new(48_000);
+        let mut preview = TwoEmitterPreview::new(48_000, false);
         let stems = HybridStems {
             source_reference: 0.95,
             exhaust: 0.95,
@@ -340,7 +372,7 @@ mod preview_tests {
     #[test]
     fn preview_engine_peak_cap_does_not_follow_listening_volume() {
         let run = |volume: f32| {
-            let mut preview = TwoEmitterPreview::new(48_000);
+            let mut preview = TwoEmitterPreview::new(48_000, false);
             for i in 0..96_000 {
                 let engine = if i % 10_000 == 0 { 0.5 } else { 0.0001 };
                 let stems = HybridStems {
@@ -362,7 +394,7 @@ mod preview_tests {
 
     #[test]
     fn preview_exhaust_calibration_tracks_original_level_with_a_peak_ceiling() {
-        let mut preview = TwoEmitterPreview::new(48_000);
+        let mut preview = TwoEmitterPreview::new(48_000, false);
         let stems = HybridStems {
             source_reference: 0.2,
             exhaust: 0.1,
@@ -374,7 +406,7 @@ mod preview_tests {
         }
         assert!((preview.exhaust_gain - 1.782_501_8).abs() < 0.01);
 
-        let mut capped = TwoEmitterPreview::new(48_000);
+        let mut capped = TwoEmitterPreview::new(48_000, false);
         let loud = HybridStems {
             source_reference: 1.2,
             exhaust: 0.8,
@@ -385,5 +417,35 @@ mod preview_tests {
             capped.next(loud, 0., 1., 1., 1., true);
         }
         assert!((capped.exhaust_gain - 1.175).abs() < 0.01);
+    }
+
+    #[test]
+    fn procedural_preview_uses_the_export_low_cut_basis() {
+        let run = |procedural| {
+            let mut preview = TwoEmitterPreview::new(48_000, procedural);
+            for frame in 0..144_000 {
+                let time = frame as f32 / 48_000.;
+                let source = 0.1 * (std::f32::consts::TAU * 40. * time).sin();
+                let exhaust = 0.1 * (std::f32::consts::TAU * 400. * time).sin();
+                preview.next(
+                    HybridStems {
+                        source_reference: source,
+                        exhaust,
+                        engine: 0.,
+                        mixed: exhaust,
+                    },
+                    1.,
+                    1.,
+                    1.,
+                    1.,
+                    true,
+                );
+            }
+            preview.exhaust_gain
+        };
+        let original_basis = run(false);
+        let low_cut_basis = run(true);
+        assert!((original_basis - 0.891_250_9).abs() < 0.02);
+        assert!((low_cut_basis - 0.25).abs() < 0.02);
     }
 }

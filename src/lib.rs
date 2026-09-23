@@ -11,6 +11,7 @@ pub mod export;
 pub mod hybrid;
 pub mod maps;
 mod period;
+pub mod procedural;
 pub mod project;
 pub mod render;
 pub mod variant;

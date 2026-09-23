@@ -134,11 +134,94 @@ pub fn comparison(
     }
     write_pcm(&dir.join("01-source-automation.wav"), &a)?;
     write_pcm(&dir.join("02-bess-enhanced.wav"), &b)?;
+    let mode = if settings.procedural {
+        "independent procedural synthesis guided by measured characteristics"
+    } else {
+        "source-guided resynthesis"
+    };
     let report = format!(
-        "Automation source playback and BESS source-guided resynthesis, using the same 16-second scenario.\nSource RMS: {:.6}\nBESS RMS: {:.6}\nBESS level adjustment: {:.3} dB\nRMS is not a LUFS measurement. The source is reconstructed from the bank, not recorded from Automation gameplay.\n",
+        "Automation source playback and BESS {mode}, using the same 16-second scenario.\nSource RMS: {:.6}\nBESS RMS: {:.6}\nBESS level adjustment: {:.3} dB\nRMS is not a LUFS measurement. The source is reconstructed from the bank, not recorded from Automation gameplay.\n",
         rms(&a),
         rms(&b),
         20. * gain.log10()
+    );
+    std::fs::write(dir.join("comparison.txt"), &report).map_err(|e| e.to_string())?;
+    Ok(report)
+}
+
+/// Three level-matched direct-mode clips at one operating point for source,
+/// source-guided and independent procedural listening.
+pub fn steady_procedural_comparison(
+    dir: &Path,
+    params: Parameters,
+    bank: Arc<Bank>,
+    seconds: f32,
+) -> Result<String, String> {
+    params.validate()?;
+    if !seconds.is_finite() || !(2.0..=20.0).contains(&seconds) {
+        return Err("Steady comparison duration must be 2–20 seconds".into());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let base = Settings {
+        level_match: false,
+        ..Settings::calibrated(&bank)
+    };
+    let variants = [
+        (
+            "01-source-automation.wav",
+            Settings {
+                enhanced: false,
+                ..base
+            },
+        ),
+        ("02-source-guided.wav", base),
+        (
+            "03-generated.wav",
+            Settings {
+                procedural: true,
+                ..base
+            },
+        ),
+    ];
+    let mut rendered = Vec::with_capacity(variants.len());
+    let mut target_rms = 0.;
+    for (name, settings) in variants {
+        let mut samples = hybrid_samples(params, settings, bank.clone(), seconds, false)?;
+        let settled = &samples[(samples.len() / 10).max(1)..];
+        let mean = settled.iter().map(|x| *x as f64).sum::<f64>() / settled.len() as f64;
+        let rms = (settled
+            .iter()
+            .map(|x| (*x as f64 - mean).powi(2))
+            .sum::<f64>()
+            / settled.len() as f64)
+            .sqrt() as f32;
+        if rendered.is_empty() {
+            target_rms = rms;
+        } else {
+            let gain = target_rms / rms.max(1e-9);
+            if gain > 8. {
+                return Err(format!("{name} is too quiet for a reliable level match"));
+            }
+            for sample in &mut samples {
+                *sample *= gain;
+            }
+        }
+        rendered.push((name, samples));
+    }
+    let peak = rendered
+        .iter()
+        .flat_map(|(_, samples)| samples)
+        .fold(0f32, |max, sample| max.max(sample.abs()));
+    let safety = (0.95 / peak.max(1e-9)).min(1.);
+    for (name, mut samples) in rendered {
+        for sample in &mut samples {
+            *sample *= safety;
+        }
+        write_pcm(&dir.join(name), &samples)?;
+    }
+    let report = format!(
+        "Steady comparison at {:.0} rpm and {:.2} load, {:.1} s, 48 kHz / PCM24. Clips were matched by settled AC RMS, then shared the same peak safety gain. Equal level does not establish naturalness. The generated clip uses measured descriptors, not Automation PCM playback.\n",
+        params.rpm, params.load, seconds
     );
     std::fs::write(dir.join("comparison.txt"), &report).map_err(|e| e.to_string())?;
     Ok(report)
