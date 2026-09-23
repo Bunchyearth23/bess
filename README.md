@@ -41,17 +41,13 @@ Before exporting, use **Calculate BeamNG level** in the BeamNG export panel. BES
 
 The 0.9.0 portable package contains no example vehicles or listening corpus. Use your own Automation exports for A/B listening and BeamNG configurations. Measurements describe signal differences; only listening can judge naturalness.
 
-`output/corpus-0.8.0/index.html` compares twelve vehicles: A source and B with the automatic 0.8 preset. All twelve B tracks are identical to 0.7 because no engine configuration is assumed. Three dedicated clips demonstrate optional combustion. Hover over a slider and turn the **mouse wheel** to adjust it; **Shift + wheel** makes finer adjustments. Elsewhere, the wheel scrolls the panel.
+Hover over a slider and turn the **mouse wheel** to adjust it; **Shift + wheel** makes finer adjustments. Elsewhere, the wheel scrolls the panel.
 
 **At high rpm** and **At full load** replace the editing grids. Negative values soften and positive values emphasize the sound. They affect pulses, texture, intake and exhaust differently. Old maps remain active until these controls are changed, and the replacement is indicated.
 
 **Added color** controls the acoustic treatment layered over the source. New imports start with coloration adapted to the WAV measurements, without assuming pops or turbo. This does not remove defects already present in the Automation files. For an existing project, **Adapt to vehicle / natural base** resets the hybrid settings to that basis while preserving A/B selection and level compensation; it replaces manual settings. Consolidated work is tracked in `docs/STEPLIST.md`.
 
-## Earlier references
-
-Open `output/corpus-0.5.0/index.html` in a browser for twelve A source / B 0.5 / C 0.4.1 comparisons at equal RMS. The associated projects load through **Open project**. B5 A, Genesis Phantom, Thunderhawk Zero and Volk Icarus II also have isolated pulse and texture clips. Those clips use a different scenario without enhancement and a common gain.
-
-Two controls adjust **Source pulses** and **Natural source texture**. Their separation is approximate; it identifies neither cylinders nor isolated intake or mechanical microphones. Uncertain periods keep nominal preparation and their full signal in the texture. A retains 0.4.1 playback; B renders of old projects change with the 0.5 model. See `docs/reports/REALISM-0.5-2026-09-22.md` for evidence and remaining work.
+**Source pulses** and **Natural source texture** are approximate components of the imported recording. They do not identify individual cylinders or isolate intake and mechanical microphones. Uncertain periods keep their full signal in the texture.
 
 ## Driving and export
 
@@ -85,7 +81,6 @@ Requested rpm is clamped to the minimum and maximum of the exported sounds, incl
 - `cargo run --release -- --compare vehicle.zip folder`: 16-second comparison.
 - `cargo run --release -- --beamng vehicle.zip new-folder`: configuration add-on with calibrated BESS loops; keep the original mod enabled.
 - `cargo run --release -- --beamng-replacement vehicle.zip new-folder`: legacy full copy; disable the original mod while using it.
-- `cargo run --release --example delivery -- cars new-folder`: twelve exports and preservation audit.
 - `cargo run --release --example combustion_demo -- vehicle.zip new-folder`: three demos and explicitly configured combustion projects.
 - `cargo run --release -- --characters vehicle.zip folder`: source and three characters.
 - `cargo run --release -- --drive-demo vehicle.zip folder`: open road, 900 Nm load and neutral; WAV, projects and telemetry CSV over 16 seconds.
