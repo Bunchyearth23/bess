@@ -3,6 +3,7 @@ mod audio;
 use bess::{
     bank::Bank,
     beamng, beamng_level,
+    bench::AuditionMix,
     drive::{Controls, Mode},
     hybrid::Settings,
     project::{self, Parameters, Project},
@@ -60,6 +61,7 @@ struct App {
     vehicle: Option<beamng::Vehicle>,
     audio: Option<audio::Audio>,
     playing: bool,
+    audition_mix: AuditionMix,
     driving: Controls,
     restart: u64,
     show_driving: bool,
@@ -93,6 +95,7 @@ impl App {
             vehicle: None,
             audio: None,
             playing: false,
+            audition_mix: AuditionMix::Live,
             driving: Controls {
                 mode: Mode::Simulated,
                 ..Default::default()
@@ -300,15 +303,33 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.settings.enhanced, false, "A · Source Automation");
-            ui.selectable_value(&mut self.settings.enhanced, true, "B · BESS enhanced");
+            ui.selectable_value(&mut self.settings.enhanced, true, "B · BESS resynthesis");
         });
-        ui.checkbox(
-            &mut self.settings.level_match,
-            "Match levels to compare tone",
+        ui.add_enabled(
+            self.audition_mix == AuditionMix::Live,
+            egui::Checkbox::new(
+                &mut self.settings.level_match,
+                "Match levels to compare tone",
+            ),
         );
         ui.small(
             "A plays the imported WAV files with prepared transitions. It is not a game recording.",
         );
+        ui.small("B uses the Automation recording as a seed. Its additional engine-side layer is estimated from exhaust-only audio.");
+        if self.bank.is_some() {
+            ui.horizontal(|ui| {
+                ui.label("Listening mix:");
+                ui.selectable_value(&mut self.audition_mix, AuditionMix::Live, "BESS live mix");
+                ui.selectable_value(
+                    &mut self.audition_mix,
+                    AuditionMix::BeamNgTwoEmitter,
+                    "BeamNG two-emitter preview",
+                );
+            });
+            if self.audition_mix == AuditionMix::BeamNgTwoEmitter {
+                ui.small("Approximate mono balance of the separate exhaust and engine emitters. The preview follows export level calibration with smoothed live estimates and assumes -8 dB engine gain relative to exhaust. The live A/B level match is ignored. BeamNG camera, cabin and spatial filtering can change what you hear. A remains the source reference.");
+            }
+        }
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -333,7 +354,7 @@ impl App {
         });
         slider(
             ui,
-            "Listening / WAV volume",
+            "Listening / comparison WAV volume",
             &mut self.params.volume,
             0.0..=0.8,
         );
@@ -590,6 +611,13 @@ fn level_span(
 ) -> String {
     let a = value(pair.0);
     let b = value(pair.1);
+    if a == f32::NEG_INFINITY && b == f32::NEG_INFINITY {
+        return "silent".to_owned();
+    }
+    if a == f32::NEG_INFINITY || b == f32::NEG_INFINITY {
+        let audible = if a.is_finite() { a } else { b };
+        return format!("silent to {audible:+.1} {unit}");
+    }
     if (a - b).abs() < 0.05 {
         format!("{a:+.1} {unit}")
     } else {
@@ -605,8 +633,8 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
         return;
     };
     ui.small(format!(
-        "At {rpm:.0} rpm · surrounding export points: {:.0}–{:.0} rpm",
-        off.0.rpm, off.1.rpm
+        "At {rpm:.0} rpm · off-load points: {:.0}–{:.0} rpm · full-load points: {:.0}–{:.0} rpm",
+        off.0.rpm, off.1.rpm, on.0.rpm, on.1.rpm
     ));
     egui::Grid::new("beamng-export-levels")
         .striped(true)
@@ -633,28 +661,28 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
                 ui.end_row();
             }
         });
-    ui.small("Positive exhaust values are louder than the original WAV at the same RPM and load. Engine and exhaust play from different locations in the vehicle.");
+    ui.small("Positive exhaust values have more audible AC energy than the original WAV at the same RPM and load. DC offset is excluded from RMS; engine and exhaust play from different locations in the vehicle.");
     ui.collapsing("WAV level details", |ui| {
         egui::Grid::new("beamng-export-level-details")
             .striped(true)
             .show(ui, |ui| {
-                ui.strong("48 kHz / 24-bit WAV");
+                ui.strong("AC RMS / peak (dBFS)");
                 ui.strong("Off load");
                 ui.strong("Full load");
                 ui.end_row();
                 for (label, value) in [
                     (
-                        "Original exhaust RMS",
+                        "Original exhaust AC RMS",
                         (|point: &beamng_level::Point| point.source_rms_dbfs)
                             as fn(&beamng_level::Point) -> f32,
                     ),
                     (
-                        "BESS exhaust RMS",
+                        "BESS exhaust AC RMS",
                         (|point: &beamng_level::Point| point.exhaust_rms_dbfs)
                             as fn(&beamng_level::Point) -> f32,
                     ),
                     (
-                        "BESS engine RMS",
+                        "BESS engine AC RMS",
                         (|point: &beamng_level::Point| point.engine_rms_dbfs)
                             as fn(&beamng_level::Point) -> f32,
                     ),
@@ -675,6 +703,7 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
                     ui.end_row();
                 }
             });
+        ui.small("BESS export files are mono 48 kHz / 24-bit PCM; the imported Automation WAV may use another format.");
     });
     ui.small("The added engine emitter uses a -2 dB base gain; the exhaust keeps the original vehicle's gain. BeamNG also applies cabin filtering, exhaust parts, camera distance, and its own mixer, so file levels are not guaranteed in-game loudness.");
 }
@@ -786,7 +815,8 @@ impl eframe::App for App {
                     self.bank = Some(v.bank);
                     self.vehicle = v.vehicle;
                     self.status =
-                        "Sound bank ready. Compare Automation Source and BESS enhanced.".into();
+                        "Sound bank ready. Compare the Automation source and BESS resynthesis."
+                            .into();
                     self.reconnect();
                     if self.capture_level {
                         self.start_level_analysis();
@@ -931,7 +961,7 @@ impl eframe::App for App {
                             slider(ui,"Event strength",&mut self.settings.combustion.amount,0.0..=1.0);
                             slider(ui,"Pressure duration (ms)",&mut self.settings.combustion.width_ms,0.5..=8.0);
                             slider(ui,"Exhaust opening (° after ignition)",&mut self.settings.combustion.exhaust_delay,60.0..=240.0);
-                            ui.small("Even spacing is suggested, not a manufacturer firing order. Added coloration also scales these events.");
+                            ui.small("Even spacing is suggested, not a manufacturer firing order. Resynthesis amount also scales these events.");
                             ui.collapsing("Ignition angles over 720°", |ui| {
                                 for i in 0..self.settings.combustion.cylinders as usize {slider(ui,&format!("Cylinder {} (°)",i+1),&mut self.settings.combustion.angles[i],0.0..=719.9);}
                             });
@@ -945,7 +975,7 @@ impl eframe::App for App {
                     if self.settings.maps != { let mut h=self.settings;h.rebuild_character_maps();h.maps } {
                         ui.small("The project's detailed curves are preserved. Changing either setting above replaces them.");
                     }
-                    slider(ui,"Added coloration",&mut self.settings.coloration,0.0..=1.0);
+                    slider(ui,"Resynthesis amount",&mut self.settings.coloration,0.0..=1.0);
                     if ui.add_enabled(self.bank.is_some(),egui::Button::new("Fit vehicle / natural background")).clicked()
                         && let Some(bank)=&self.bank {
                             let enhanced=self.settings.enhanced;let level_match=self.settings.level_match;
@@ -1101,7 +1131,7 @@ impl eframe::App for App {
                     );
                     slider(
                         ui,
-                        "Reconstructed intake",
+                        "Inferred intake detail",
                         &mut self.params.intake,
                         0.0..=1.0,
                     );
@@ -1261,6 +1291,7 @@ impl eframe::App for App {
             playing: self.playing,
             driving: self.driving,
             restart: self.restart,
+            audition_mix: self.audition_mix,
         };
         if self.sent != Some(command)
             && let Some(audio) = &self.audio
@@ -1382,6 +1413,7 @@ fn main() -> eframe::Result {
                         ..Default::default()
                     },
                     restart: 0,
+                    audition_mix: AuditionMix::Live,
                 })
                 .map_err(|e| e.to_string())?;
                 a

@@ -135,7 +135,7 @@ pub fn comparison(
     write_pcm(&dir.join("01-source-automation.wav"), &a)?;
     write_pcm(&dir.join("02-bess-enhanced.wav"), &b)?;
     let report = format!(
-        "Automation source playback and BESS enhancement, using the same 16-second scenario.\nSource RMS: {:.6}\nEnhanced RMS: {:.6}\nEnhanced gain adjustment: {:.3} dB\nRMS is not a LUFS measurement. The source is reconstructed from the bank, not recorded from Automation gameplay.\n",
+        "Automation source playback and BESS source-guided resynthesis, using the same 16-second scenario.\nSource RMS: {:.6}\nBESS RMS: {:.6}\nBESS level adjustment: {:.3} dB\nRMS is not a LUFS measurement. The source is reconstructed from the bank, not recorded from Automation gameplay.\n",
         rms(&a),
         rms(&b),
         20. * gain.log10()

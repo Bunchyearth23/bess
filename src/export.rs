@@ -1,6 +1,6 @@
 //! Standalone replacement mod: preserve every entry except referenced engine WAVs.
 use crate::{
-    bank::Bank,
+    bank::{self, Bank},
     hybrid::{Hybrid, Settings},
     project::Parameters,
 };
@@ -12,6 +12,49 @@ use std::{
     path::Path,
     sync::Arc,
 };
+
+const MAX_SOURCE_WAV_BYTES: u64 = 16_000_000;
+
+fn source_wav(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<f32>, String> {
+    let entry = zip.by_name(name).map_err(|e| format!("{name}: {e}"))?;
+    if entry.size() > MAX_SOURCE_WAV_BYTES {
+        return Err(format!("Source WAV is too large: {name}"));
+    }
+    let mut bytes = Vec::new();
+    entry
+        .take(MAX_SOURCE_WAV_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_SOURCE_WAV_BYTES {
+        return Err(format!("Source WAV is too large: {name}"));
+    }
+    bank::decode_wav(&bytes).map(|(_, mono)| mono)
+}
+
+fn signal_stats(samples: &[f32]) -> Result<(f32, f32), String> {
+    if samples.is_empty() {
+        return Err("Silent source or rendered exhaust WAV".into());
+    }
+    // Automation WAVs can contain a large DC offset. Calibrate audible AC
+    // energy, while retaining the absolute sample peak for PCM headroom.
+    let mut mean = 0f64;
+    let mut centered_power = 0f64;
+    let mut peak = 0f32;
+    for (index, &sample) in samples.iter().enumerate() {
+        if !sample.is_finite() {
+            return Err("Non-finite source or rendered exhaust WAV".into());
+        }
+        let delta = sample as f64 - mean;
+        mean += delta / (index + 1) as f64;
+        centered_power += delta * (sample as f64 - mean);
+        peak = peak.max(sample.abs());
+    }
+    let rms = (centered_power / samples.len() as f64).sqrt() as f32;
+    if !rms.is_finite() || rms < 1e-7 || peak < 1e-7 {
+        return Err("Silent source or rendered exhaust WAV".into());
+    }
+    Ok((rms, peak))
+}
 
 fn vehicle_info_path(name: &str) -> bool {
     let parts: Vec<_> = name.split('/').collect();
@@ -127,6 +170,17 @@ fn aligned_warmup_frames(rpm: f32) -> usize {
 
 pub(crate) fn exhaust_safety_gain(peak: f32) -> f32 {
     (0.95 / peak).min(1.)
+}
+
+/// Per-knot level calibration for the selectable two-emitter export only.
+/// RMS inputs are AC levels measured after subtracting each signal's mean.
+/// Inputs must first pass `signal_stats`. Absolute peak safety takes precedence over
+/// the 0.5 gain floor when both limits cannot be satisfied together.
+pub(crate) fn exhaust_level_gain(source_rms: f32, exhaust_rms: f32, exhaust_peak: f32) -> f32 {
+    const MINUS_ONE_DB: f32 = 0.891_250_9;
+    (MINUS_ONE_DB * source_rms / exhaust_rms)
+        .clamp(0.5, 2.5)
+        .min(0.94 / exhaust_peak)
 }
 
 pub(crate) fn loop_stems(
@@ -260,6 +314,7 @@ fn package_inner(
         .map_err(|e| e.to_string())?;
     let blend: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let mut replacements = BTreeMap::new();
+    let mut exhaust_level_gains = BTreeMap::new();
     for (layer, rows) in blend["samples"]
         .as_array()
         .ok_or("Missing blend")?
@@ -278,10 +333,21 @@ fn package_inner(
             // two-second channels; variant conversion renders the four-second
             // engine stem separately with `loop_stems`.
             let stems = render_stems(bank.clone(), p, h, rpm, layer as f32, 2.);
-            replacements.insert(
-                name.to_owned(),
-                if exhaust_only { stems.0 } else { stems.2 },
-            );
+            let mut rendered = if exhaust_only { stems.0 } else { stems.2 };
+            if exhaust_only {
+                let source = source_wav(&mut zip, name)?;
+                let (source_rms, _) = signal_stats(&source)?;
+                let (rendered_rms, rendered_peak) = signal_stats(&rendered)?;
+                let level_gain = exhaust_level_gain(source_rms, rendered_rms, rendered_peak);
+                if !level_gain.is_finite() || level_gain <= 0. {
+                    return Err(format!("Invalid exhaust level gain: {name}"));
+                }
+                for sample in &mut rendered {
+                    *sample *= level_gain;
+                }
+                exhaust_level_gains.insert(name.to_owned(), level_gain);
+            }
+            replacements.insert(name.to_owned(), rendered);
         }
     }
     let peak = replacements
@@ -326,7 +392,11 @@ fn package_inner(
                     .start_file(entry.name(), options)
                     .map_err(|e| e.to_string())?;
                 output.write_all(wav.get_ref()).map_err(|e| e.to_string())?;
-                measurements.push(json!({"path":entry.name(),"frames":samples.len(),"seam":(samples[0]-samples[samples.len()-1]).abs()*gain}));
+                let mut measurement = json!({"path":entry.name(),"frames":samples.len(),"seam":(samples[0]-samples[samples.len()-1]).abs()*gain});
+                if let Some(level_gain) = exhaust_level_gains.get(entry.name()) {
+                    measurement["exhaust_level_gain"] = json!(level_gain);
+                }
+                measurements.push(measurement);
             } else if entry.name() == info_path {
                 output
                     .start_file(entry.name(), options)
@@ -401,5 +471,46 @@ mod phase_tests {
             let sample_tolerance = rpm as f64 / (2. * 48_000. * 120.);
             assert!((cycles - cycles.round()).abs() <= sample_tolerance + 1e-9);
         }
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::{exhaust_level_gain, signal_stats};
+
+    #[test]
+    fn selectable_exhaust_gain_targets_one_db_below_source_with_bounds() {
+        let target = exhaust_level_gain(0.1, 0.05, 0.1);
+        assert!((target - 1.782_501_8).abs() < 1e-6);
+        assert_eq!(exhaust_level_gain(0.1, 0.2, 0.5), 0.5);
+        assert_eq!(exhaust_level_gain(0.1, 0.01, 0.1), 2.5);
+        assert!((exhaust_level_gain(0.1, 0.05, 0.8) - 1.175).abs() < 1e-6);
+        // If a render is already very hot, the peak ceiling wins over the
+        // nominal minimum gain rather than allowing a clipped WAV.
+        assert!((exhaust_level_gain(0.1, 0.05, 2.) - 0.47).abs() < 1e-6);
+    }
+
+    #[test]
+    fn source_and_render_stats_reject_silent_or_non_finite_audio() {
+        assert!(signal_stats(&[]).is_err());
+        assert!(signal_stats(&[0.; 512]).is_err());
+        assert!(signal_stats(&[0.15; 512]).is_err());
+        assert!(signal_stats(&[f32::NAN, 0.1]).is_err());
+        assert!(signal_stats(&[f32::INFINITY, 0.1]).is_err());
+        assert!(signal_stats(&[0.2, -0.2]).is_ok());
+    }
+
+    #[test]
+    fn calibration_uses_ac_rms_but_absolute_pcm_peak() {
+        let (source_rms, source_peak) = signal_stats(&[0.15, 0.05]).unwrap();
+        let (rendered_rms, rendered_peak) = signal_stats(&[0.06, -0.04]).unwrap();
+        assert!((source_rms - 0.05).abs() < 1e-7);
+        assert!((source_peak - 0.15).abs() < 1e-7);
+        assert!((rendered_rms - 0.05).abs() < 1e-7);
+        assert!((rendered_peak - 0.06).abs() < 1e-7);
+        assert!(
+            (exhaust_level_gain(source_rms, rendered_rms, rendered_peak) - 0.891_250_9).abs()
+                < 1e-6
+        );
     }
 }

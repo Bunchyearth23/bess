@@ -30,21 +30,27 @@ pub struct Point {
     pub rpm: f32,
     /// Original blend row: 0 = off load, 1 = on load.
     pub load: f32,
+    /// AC RMS, with each WAV's mean removed before measuring its energy.
     pub source_rms_dbfs: f32,
     pub exhaust_rms_dbfs: f32,
     pub engine_rms_dbfs: f32,
     pub exhaust_peak_dbfs: f32,
     pub engine_peak_dbfs: f32,
-    /// Change in the exhaust WAV's RMS against Automation's original WAV.
+    /// Change in the exhaust WAV's AC RMS against Automation's original WAV.
     /// Both use the same copied `soundConfigExhaust` when installed in BeamNG.
     pub exhaust_vs_source_db: f32,
-    /// Relative RMS of the two exported WAV files before BeamNG's JBeam gains.
+    /// Relative AC RMS of the two exported WAV files before BeamNG's JBeam gains.
     pub engine_vs_exhaust_db: f32,
 }
 
 #[derive(Clone, Copy)]
 struct Stats {
+    /// Energy after removing the sample mean, used for level reporting and
+    /// exhaust calibration.
     rms: f32,
+    /// Full waveform energy, retained to mirror variant::build's engine gain.
+    raw_rms: f32,
+    /// Absolute PCM peak, including any DC offset.
     peak: f32,
 }
 
@@ -68,21 +74,28 @@ impl Stats {
 
     fn measure(samples: impl Iterator<Item = f32>) -> Result<Self, String> {
         let mut count = 0usize;
-        let mut power = 0f64;
+        let mut raw_power = 0f64;
+        let mut mean = 0f64;
+        let mut centered_power = 0f64;
         let mut peak = 0f32;
         for sample in samples {
             if !sample.is_finite() {
                 return Err("Non-finite WAV sample in BeamNG level analysis".into());
             }
             count += 1;
-            power += (sample as f64).powi(2);
+            let sample64 = sample as f64;
+            raw_power += sample64 * sample64;
+            let delta = sample64 - mean;
+            mean += delta / count as f64;
+            centered_power += delta * (sample64 - mean);
             peak = peak.max(sample.abs());
         }
-        if count == 0 || !power.is_finite() {
+        if count == 0 || !raw_power.is_finite() || !centered_power.is_finite() {
             return Err("Empty or invalid WAV in BeamNG level analysis".into());
         }
         Ok(Self {
-            rms: (power / count as f64).sqrt() as f32,
+            rms: (centered_power / count as f64).sqrt() as f32,
+            raw_rms: (raw_power / count as f64).sqrt() as f32,
             peak,
         })
     }
@@ -121,6 +134,14 @@ fn dbfs(value: f32) -> Result<f32, String> {
         return Err("Silent WAV in BeamNG level analysis".into());
     }
     Ok(20. * value.log10())
+}
+
+fn dbfs_allow_silence(value: f32) -> Result<f32, String> {
+    if value == 0. {
+        Ok(f32::NEG_INFINITY)
+    } else {
+        dbfs(value)
+    }
 }
 
 /// Render every original blend point using the variant export's audio path.
@@ -166,19 +187,34 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
             let wav_bytes = read_limited(&mut zip, path, MAX_WAV_BYTES)?;
             let (_, source_samples) = bank::decode_wav(&wav_bytes)?;
             let source = Stats::from_samples(&source_samples)?;
+            if source.rms < 1e-7 || source.peak < 1e-7 {
+                return Err(format!("Silent source WAV at {rpm:.0} rpm, load {layer}"));
+            }
             dbfs(source.rms)?;
 
             // The four-second engine render contains the same first two-second
-            // exhaust stem as export::package_exhaust_stem. Export uses those
-            // first two seconds and a bank-wide safety gain.
+            // exhaust stem as export::package_exhaust_stem. Apply its per-knot
+            // source-level calibration before the bank-wide safety gain.
             let load = layer as f32;
-            let (exhaust, engine, _) = export::loop_stems(bank.clone(), p, h, rpm, load);
+            let (mut exhaust, engine, _) = export::loop_stems(bank.clone(), p, h, rpm, load);
             let exhaust_stats = Stats::from_samples(&exhaust)?;
-            let engine_stats = Stats::from_samples(&engine)?;
-            if exhaust_stats.rms < 1e-7 || engine_stats.rms < 1e-7 {
-                return Err(format!("Silent export stem at {rpm:.0} rpm, load {load}"));
+            Stats::from_samples(&engine)?;
+            if exhaust_stats.rms < 1e-7 || exhaust_stats.peak < 1e-7 {
+                return Err(format!("Silent exhaust stem at {rpm:.0} rpm, load {load}"));
             }
-            max_exhaust_peak = max_exhaust_peak.max(exhaust_stats.peak);
+            let level_gain =
+                export::exhaust_level_gain(source.rms, exhaust_stats.rms, exhaust_stats.peak);
+            if !level_gain.is_finite() || level_gain <= 0. {
+                return Err(format!(
+                    "Invalid exhaust level gain at {rpm:.0} rpm, load {load}"
+                ));
+            }
+            for sample in &mut exhaust {
+                *sample *= level_gain;
+            }
+            // An untrusted period can intentionally yield a silent inferred
+            // engine stem; this remains a valid PCM24 file in the add-on.
+            max_exhaust_peak = max_exhaust_peak.max(exhaust_stats.peak * level_gain);
             pending.push(PendingPoint {
                 rpm,
                 load,
@@ -197,8 +233,13 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
     for item in pending {
         let exhaust = Stats::from_pcm24(&item.exhaust, safety_gain)?;
         let engine_raw = Stats::from_samples(&item.engine)?;
-        let engine_gain =
-            variant::engine_stem_gain(exhaust.rms, engine_raw.rms, engine_raw.peak, item.load);
+        let engine_gain = variant::engine_stem_gain(
+            exhaust.raw_rms,
+            engine_raw.raw_rms,
+            engine_raw.peak,
+            item.load,
+            bank.residual_reliability(item.rpm, item.load),
+        );
         // Export refuses samples outside this ceiling before PCM encoding.
         if engine_raw.peak * engine_gain > 0.951 {
             return Err("Engine stem would clip PCM24".into());
@@ -206,7 +247,7 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
         let engine = Stats::from_pcm24(&item.engine, engine_gain)?;
         let source_rms_dbfs = dbfs(item.source.rms)?;
         let exhaust_rms_dbfs = dbfs(exhaust.rms)?;
-        let engine_rms_dbfs = dbfs(engine.rms)?;
+        let engine_rms_dbfs = dbfs_allow_silence(engine.rms)?;
         points.push(Point {
             rpm: item.rpm,
             load: item.load,
@@ -214,7 +255,7 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
             exhaust_rms_dbfs,
             engine_rms_dbfs,
             exhaust_peak_dbfs: dbfs(exhaust.peak)?,
-            engine_peak_dbfs: dbfs(engine.peak)?,
+            engine_peak_dbfs: dbfs_allow_silence(engine.peak)?,
             exhaust_vs_source_db: exhaust_rms_dbfs - source_rms_dbfs,
             engine_vs_exhaust_db: engine_rms_dbfs - exhaust_rms_dbfs,
         });
@@ -261,6 +302,14 @@ mod tests {
     }
 
     #[test]
+    fn ac_level_excludes_dc_while_peak_keeps_it() {
+        let stats = Stats::from_samples(&[0.15, 0.05]).unwrap();
+        assert!((stats.rms - 0.05).abs() < 1e-7);
+        assert!((stats.raw_rms - 0.111_803_4).abs() < 1e-7);
+        assert!((stats.peak - 0.15).abs() < 1e-7);
+    }
+
+    #[test]
     fn db_differences_match_linear_ratios() {
         let source = dbfs(0.1).unwrap();
         let exhaust = dbfs(0.2).unwrap();
@@ -303,7 +352,9 @@ mod tests {
                         / 997.
                         - 0.5;
                     wav.write_sample(
-                        (0.06 * (phase * 4.).sin() + 0.01 * grain) * (1. + layer as f32 * 0.3),
+                        0.08 + 0.04 * layer as f32
+                            + (0.06 * (phase * 4.).sin() + 0.01 * grain)
+                                * (1. + layer as f32 * 0.3),
                     )
                     .unwrap();
                 }
@@ -340,19 +391,64 @@ mod tests {
         );
         let archive = output.join(export::package_name(&bank));
         let mut rendered = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+        let mut original = zip::ZipArchive::new(File::open(&source).unwrap()).unwrap();
         for (layer, point) in report.points.iter().enumerate() {
-            let wav = read_limited(
-                &mut rendered,
-                &format!("art/sound/engine/test/{layer}.wav"),
-                MAX_WAV_BYTES,
-            )
-            .unwrap();
+            let path = format!("art/sound/engine/test/{layer}.wav");
+            let wav = read_limited(&mut rendered, &path, MAX_WAV_BYTES).unwrap();
             let (_, samples) = bank::decode_wav(&wav).unwrap();
             let actual = Stats::from_samples(&samples).unwrap();
             assert!((point.exhaust_rms_dbfs - dbfs(actual.rms).unwrap()).abs() < 0.00001);
             assert!((point.exhaust_peak_dbfs - dbfs(actual.peak).unwrap()).abs() < 0.00001);
+
+            let source_wav = read_limited(&mut original, &path, MAX_WAV_BYTES).unwrap();
+            let (_, source_samples) = bank::decode_wav(&source_wav).unwrap();
+            let source_stats = Stats::from_samples(&source_samples).unwrap();
+            assert!(source_stats.raw_rms > source_stats.rms * 1.5);
+            assert!((point.source_rms_dbfs - dbfs(source_stats.rms).unwrap()).abs() < 0.00001);
+            let (raw_exhaust, _, _) = export::loop_stems(bank.clone(), p, h, 800., layer as f32);
+            let raw_stats = Stats::from_samples(&raw_exhaust).unwrap();
+            let expected_gain =
+                export::exhaust_level_gain(source_stats.rms, raw_stats.rms, raw_stats.peak);
+            let documented_gain = manifest["loops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|loop_info| loop_info["path"] == path)
+                .unwrap()["exhaust_level_gain"]
+                .as_f64()
+                .unwrap() as f32;
+            assert!((documented_gain - expected_gain).abs() < 1e-6);
+            assert!((actual.rms - raw_stats.rms * expected_gain * report.safety_gain).abs() < 1e-6);
         }
         drop(rendered);
+
+        // The legacy full-replacement route still writes its original mixed
+        // channel with only the bank-wide safety gain.
+        let legacy_output = work.join("legacy");
+        export::package(&legacy_output, p, h, bank.clone()).unwrap();
+        let legacy_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(legacy_output.join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(
+            legacy_manifest["loops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|loop_info| loop_info.get("exhaust_level_gain").is_none())
+        );
+        let mut legacy = zip::ZipArchive::new(
+            File::open(legacy_output.join(export::package_name(&bank))).unwrap(),
+        )
+        .unwrap();
+        let legacy_wav =
+            read_limited(&mut legacy, "art/sound/engine/test/0.wav", MAX_WAV_BYTES).unwrap();
+        let (_, legacy_samples) = bank::decode_wav(&legacy_wav).unwrap();
+        let legacy_stats = Stats::from_samples(&legacy_samples).unwrap();
+        let (_, _, raw_mixed) = export::loop_stems(bank.clone(), p, h, 800., 0.);
+        let mixed_stats = Stats::from_samples(&raw_mixed).unwrap();
+        let legacy_safety = legacy_manifest["gain"].as_f64().unwrap() as f32;
+        assert!((legacy_stats.rms - mixed_stats.rms * legacy_safety).abs() < 1e-6);
+        drop(legacy);
         std::fs::remove_dir_all(&work).unwrap();
     }
 }

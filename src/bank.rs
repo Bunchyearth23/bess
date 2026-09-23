@@ -396,6 +396,25 @@ impl Bank {
         let periodic = self.read_mode(cycle, rpm, load, rate, sinc, ReadMode::Periodic);
         (periodic, source - periodic)
     }
+    /// Interpolated share of source knots with a usable cycle template.
+    /// A rejected knot has no template, so its residual is the entire source
+    /// recording and should not drive a separate inferred engine emitter.
+    pub fn residual_reliability(&self, rpm: f32, load: f32) -> f32 {
+        let read_layer = |layer: &Vec<Sample>| {
+            let accepted = |i: usize| f32::from(layer[i].period.accepted);
+            let upper = layer.partition_point(|s| s.rpm < rpm).min(layer.len() - 1);
+            let lower = upper.saturating_sub(1);
+            if upper == lower {
+                return accepted(upper);
+            }
+            let t =
+                ((rpm - layer[lower].rpm) / (layer[upper].rpm - layer[lower].rpm)).clamp(0., 1.);
+            let t = t * t * (3. - 2. * t);
+            accepted(lower) * (1. - t) + accepted(upper) * t
+        };
+        let load = load.clamp(0., 1.);
+        read_layer(&self.layers[0]) * (1. - load) + read_layer(&self.layers[1]) * load
+    }
     pub fn read_original(
         &self,
         cycle: f64,
@@ -405,6 +424,11 @@ impl Bank {
         sinc: &SincTable,
     ) -> f32 {
         self.read_mode(cycle, rpm, load, rate, sinc, ReadMode::Original)
+    }
+    /// Rescale the unchanged A reference to the processed bank's gain for a
+    /// live comparison against the exhaust stem before export normalization.
+    pub(crate) fn original_to_processed_gain(&self) -> f32 {
+        self.gain / self.original_gain
     }
     fn read_mode(
         &self,
@@ -448,6 +472,50 @@ impl Bank {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residual_reliability_follows_rpm_and_load_interpolation() {
+        let sample = |rpm: f32, accepted: bool| Sample {
+            rpm,
+            rate: 48_000,
+            pcm: Vec::new(),
+            frames: 0,
+            cycles: 0,
+            offset: 0.,
+            rms: 0.,
+            peak: 0.,
+            period: crate::period::Period {
+                nominal: 1.,
+                measured: 1.,
+                confidence: f64::from(accepted),
+                accepted,
+            },
+            legacy: None,
+            periodic: Vec::new(),
+        };
+        let bank = Bank {
+            source: SourceRef {
+                archive: String::new(),
+                blend: String::new(),
+                fingerprint: String::new(),
+            },
+            engine_meta: None,
+            layers: [
+                vec![sample(1000., true), sample(2000., false)],
+                vec![sample(1000., false), sample(2000., true)],
+            ],
+            gain: 1.,
+            original_gain: 1.,
+            min_rpm: 1000.,
+            max_rpm: 2000.,
+        };
+        assert_eq!(bank.residual_reliability(1000., 0.), 1.);
+        assert_eq!(bank.residual_reliability(1000., 1.), 0.);
+        assert_eq!(bank.residual_reliability(2000., 0.), 0.);
+        assert_eq!(bank.residual_reliability(2000., 1.), 1.);
+        assert!((bank.residual_reliability(1250., 0.25) - 0.671_875).abs() < 1e-6);
+        assert!((bank.residual_reliability(1500., 0.5) - 0.5).abs() < 1e-6);
+    }
 
     #[test]
     fn steady_source_envelope_does_not_jump_between_distant_excerpts() {

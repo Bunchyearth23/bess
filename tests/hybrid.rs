@@ -34,60 +34,74 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn fixture() -> Arc<Bank> {
     static BANK: OnceLock<Arc<Bank>> = OnceLock::new();
-    BANK.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!("bess-fixture-{}.zip", std::process::id()));
-        let file = std::fs::File::create(&path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        let mut layers = [Vec::new(), Vec::new()];
-        for (layer, list) in layers.iter_mut().enumerate() {
-            for rpm in [800, 1600, 4000] {
-                let name = format!("art/sound/{layer}-{rpm}.wav");
-                let mut cursor = Cursor::new(Vec::new());
-                {
-                    let mut wav = hound::WavWriter::new(
-                        &mut cursor,
-                        hound::WavSpec {
-                            channels: 1,
-                            sample_rate: 32000,
-                            bits_per_sample: 32,
-                            sample_format: hound::SampleFormat::Float,
-                        },
-                    )
-                    .unwrap();
-                    for i in 0..64000 {
-                        let phase = std::f32::consts::TAU * i as f32 / 32000. * rpm as f32 / 120.;
-                        let sample = 0.08 * (phase * 4. + 0.2 * layer as f32).sin()
-                            + 0.03 * (phase * 12.).sin()
-                            + 0.012 * (phase * 33.).sin();
-                        wav.write_sample(sample * (0.6 + 0.4 * layer as f32))
-                            .unwrap();
+    BANK.get_or_init(|| build_fixture(false)).clone()
+}
+fn textured_fixture() -> Arc<Bank> {
+    static BANK: OnceLock<Arc<Bank>> = OnceLock::new();
+    BANK.get_or_init(|| build_fixture(true)).clone()
+}
+fn build_fixture(textured: bool) -> Arc<Bank> {
+    let path = std::env::temp_dir().join(format!(
+        "bess-fixture-{textured}-{}.zip",
+        std::process::id()
+    ));
+    let file = std::fs::File::create(&path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut layers = [Vec::new(), Vec::new()];
+    for (layer, list) in layers.iter_mut().enumerate() {
+        for rpm in [800, 1600, 4000] {
+            let name = format!("art/sound/{layer}-{rpm}.wav");
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let mut wav = hound::WavWriter::new(
+                    &mut cursor,
+                    hound::WavSpec {
+                        channels: 1,
+                        sample_rate: 32000,
+                        bits_per_sample: 32,
+                        sample_format: hound::SampleFormat::Float,
+                    },
+                )
+                .unwrap();
+                let mut seed = 0xB355_7200_u32;
+                for i in 0..64000 {
+                    let phase = std::f32::consts::TAU * i as f32 / 32000. * rpm as f32 / 120.;
+                    let mut sample = 0.08 * (phase * 4. + 0.2 * layer as f32).sin()
+                        + 0.03 * (phase * 12.).sin()
+                        + 0.012 * (phase * 33.).sin();
+                    if textured {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        sample += (seed as f32 / u32::MAX as f32 * 2. - 1.) * 0.012;
                     }
-                    wav.finalize().unwrap();
+                    wav.write_sample(sample * (0.6 + 0.4 * layer as f32))
+                        .unwrap();
                 }
-                zip.start_file(&name, options).unwrap();
-                zip.write_all(&cursor.into_inner()).unwrap();
-                list.push(serde_json::json!([name, rpm]));
+                wav.finalize().unwrap();
             }
+            zip.start_file(&name, options).unwrap();
+            zip.write_all(&cursor.into_inner()).unwrap();
+            list.push(serde_json::json!([name, rpm]));
         }
-        zip.start_file("art/sound/blends/test.sfxBlend2D.json", options)
-            .unwrap();
-        zip.write_all(
-            serde_json::to_string(&serde_json::json!({"samples":layers}))
-                .unwrap()
-                .as_bytes(),
-        )
+    }
+    zip.start_file("art/sound/blends/test.sfxBlend2D.json", options)
         .unwrap();
-        zip.start_file("vehicles/test/info.json", options).unwrap();
-        zip.write_all(b"{\"Name\":\"Test Vehicle\",\"paints\":{\"Blue\":1,\"Blue\":2}}")
-            .unwrap();
-        zip.finish().unwrap();
-        let bank = Arc::new(Bank::load(&path, None).unwrap());
-        // Keep the source for the replacement-mod roundtrip test.
-        bank
-    })
-    .clone()
+    zip.write_all(
+        serde_json::to_string(&serde_json::json!({"samples":layers}))
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    zip.start_file("vehicles/test/info.json", options).unwrap();
+    zip.write_all(b"{\"Name\":\"Test Vehicle\",\"paints\":{\"Blue\":1,\"Blue\":2}}")
+        .unwrap();
+    zip.finish().unwrap();
+    let bank = Arc::new(Bank::load(&path, None).unwrap());
+    // Keep the source for the replacement-mod roundtrip test.
+    bank
 }
 fn params() -> Parameters {
     Parameters {
@@ -127,9 +141,11 @@ fn reconstructed_engine_stem_is_distinct_and_preserves_audition_mix() {
             exhaust_energy += stems.exhaust * stems.exhaust;
         }
     }
+    // A strictly periodic recording has no independent intake or mechanical
+    // detail to reconstruct. BESS should not invent a broadband layer for it.
     assert!(
-        engine_energy > 1e-6,
-        "The reconstructed engine stem is silent"
+        engine_energy < 1e-6,
+        "Periodic exhaust copied into the engine stem: {engine_energy}"
     );
     assert!(
         engine_energy < exhaust_energy,
@@ -143,6 +159,109 @@ fn reconstructed_engine_stem_is_distinct_and_preserves_audition_mix() {
     for _ in 0..48000 {
         assert_eq!(split.next_stems(true).engine, 0.);
     }
+}
+
+#[test]
+fn source_reference_retains_original_phase_across_listening_volumes() {
+    let bank = fixture();
+    let source_settings = Settings {
+        enhanced: false,
+        ..Settings::default()
+    };
+    let mut source = Hybrid::new(
+        48_000,
+        Parameters {
+            volume: 0.25,
+            ..params()
+        },
+        source_settings,
+        Some(bank.clone()),
+    );
+    let mut enhanced = Hybrid::new(
+        48_000,
+        Parameters {
+            volume: 0.8,
+            ..params()
+        },
+        Settings::default(),
+        Some(bank),
+    );
+    for _ in 0..48_000 {
+        source.next_stems(true);
+        enhanced.next_stems(true);
+    }
+    let mut reference_energy = 0.;
+    let mut source_ratio: Option<f32> = None;
+    for _ in 0..12_000 {
+        let a = source.next_stems(true);
+        let b = enhanced.next_stems(true);
+        assert_eq!(a.mixed, a.exhaust);
+        assert!(
+            (a.source_reference / 0.25 - b.source_reference / 0.8).abs() < 2e-5,
+            "The source reference followed listening volume or B sound controls"
+        );
+        reference_energy += a.source_reference * a.source_reference;
+        if a.exhaust.abs() > 1e-4 {
+            let ratio = a.source_reference / a.exhaust;
+            if let Some(expected) = source_ratio {
+                assert!((ratio - expected).abs() < 1e-4, "A reference changed phase");
+            } else {
+                source_ratio = Some(ratio);
+            }
+        }
+    }
+    assert!(reference_energy > 1e-5);
+}
+
+#[test]
+fn recorded_irregular_texture_drives_engine_without_copying_exhaust_orders() {
+    let bank = textured_fixture();
+    let p = Parameters {
+        rpm: 1600.,
+        load: 1.,
+        intake: 0.6,
+        mechanical: 0.,
+        exhaust: 1.,
+        ..params()
+    };
+    let mut synth = Hybrid::new(48000, p, Settings::default(), Some(bank));
+    for _ in 0..48000 {
+        synth.next_stems(true);
+    }
+    let period = 48000 * 120 / 1600;
+    let cycles = 12;
+    let mut exhaust = Vec::with_capacity(period * cycles);
+    let mut engine = Vec::with_capacity(period * cycles);
+    for _ in 0..period * cycles {
+        let stems = synth.next_stems(true);
+        exhaust.push(stems.exhaust);
+        engine.push(stems.engine);
+    }
+    let power = |audio: &[f32]| -> f64 {
+        audio.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / audio.len() as f64
+    };
+    let coherent_share = |audio: &[f32]| -> f64 {
+        let template: Vec<_> = (0..period)
+            .map(|phase| {
+                (0..cycles)
+                    .map(|cycle| audio[cycle * period + phase] as f64)
+                    .sum::<f64>()
+                    / cycles as f64
+            })
+            .collect();
+        template.iter().map(|x| x * x).sum::<f64>() / period as f64 / power(audio)
+    };
+    assert!(
+        power(&engine) > 1e-8,
+        "Source texture produced no engine stem"
+    );
+    assert!(power(&engine) < power(&exhaust));
+    let engine_orders = coherent_share(&engine);
+    let exhaust_orders = coherent_share(&exhaust);
+    assert!(
+        engine_orders < exhaust_orders * 0.5,
+        "Engine copied exhaust orders: {engine_orders:.3} vs {exhaust_orders:.3}"
+    );
 }
 
 #[test]

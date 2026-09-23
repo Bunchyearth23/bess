@@ -5,7 +5,6 @@ use crate::{
     project::Parameters,
 };
 use bdsp::{
-    delay::DelayLine,
     noise::{Noise, NoiseColor},
     resample::{SincQuality, SincTable},
     svf::{StateVariableFilter, SvfMode},
@@ -264,6 +263,37 @@ fn mechanical_cylinders(bank: Option<&Bank>, h: Settings) -> u32 {
         .unwrap_or(0)
 }
 
+pub(crate) fn inferred_layer_weight(reliability: f32) -> f32 {
+    0.15 + 0.85 * reliability.clamp(0., 1.)
+}
+
+/// Learns only the source texture that persists at the same crank phase.
+/// Unlike a one-cycle delay subtraction, it does not boost alternating cycles.
+struct PhaseLockedTexture {
+    bins: [f32; 1024],
+}
+
+impl PhaseLockedTexture {
+    fn new() -> Self {
+        Self { bins: [0.; 1024] }
+    }
+
+    fn next(&mut self, phase: f32, sample: f32, rpm: f32, rate: f32) -> f32 {
+        let position = phase * self.bins.len() as f32;
+        let first = (position as usize).min(self.bins.len() - 1);
+        let second = (first + 1) % self.bins.len();
+        let t = position - first as f32;
+        let estimate = self.bins[first] * (1. - t) + self.bins[second] * t;
+        let detail = sample - estimate;
+        // Each bin receives approximately 0.5 of a cycle's observations,
+        // independent of RPM. The cap avoids overfitting a single high-RPM hit.
+        let per_sample = (0.5 * self.bins.len() as f32 * rpm / (120. * rate)).min(0.65);
+        self.bins[first] += detail * per_sample * (1. - t);
+        self.bins[second] += detail * per_sample * t;
+        detail
+    }
+}
+
 /// Short-time level and covariance for a phase-safe A/B audition transition.
 /// This only changes the intermediate blend: pure A and pure B are untouched.
 struct TransitionLevel {
@@ -294,8 +324,8 @@ impl MechanicalImpacts {
             seed: 0x4D45_4348_414E_4943,
             delay: 0,
             pending: 0.,
-            cover: StateVariableFilter::new(rate, 3300., 1.3, SvfMode::Bandpass),
-            block: StateVariableFilter::new(rate, 950., 0.85, SvfMode::Bandpass),
+            cover: StateVariableFilter::new(rate, 2200., 0.65, SvfMode::Bandpass),
+            block: StateVariableFilter::new(rate, 850., 0.65, SvfMode::Bandpass),
         }
     }
 
@@ -318,9 +348,9 @@ impl MechanicalImpacts {
             self.seed ^= self.seed << 13;
             self.seed ^= self.seed >> 7;
             self.seed ^= self.seed << 17;
-            // At 48 kHz the maximum offset is 0.21 ms. Strength changes remain
+            // At 48 kHz the maximum offset is 0.33 ms. Strength changes remain
             // small enough to preserve the engine's steady operating level.
-            self.delay = ((self.seed >> 32) % 11) as u32;
+            self.delay = ((self.seed >> 32) % 17) as u32;
             let strength = 0.78 + ((self.seed >> 48) as u16 as f32 / 65535.) * 0.44;
             self.pending = source_level * (0.8 + 0.2 * load) * strength;
         }
@@ -399,10 +429,12 @@ pub struct Hybrid {
     dc: StateVariableFilter,
     engine_dc: StateVariableFilter,
     engine_texture: StateVariableFilter,
-    engine_cycle_delay: DelayLine,
+    engine_air_band: StateVariableFilter,
     engine_stem_dc: StateVariableFilter,
     mechanical_impacts: MechanicalImpacts,
     mechanical_source_energy: f32,
+    inferred_weight: f32,
+    phase_locked_texture: PhaseLockedTexture,
     raw_energy: f32,
     wet_energy: f32,
     compensation: f32,
@@ -436,6 +468,9 @@ pub struct Hybrid {
 pub struct HybridStems {
     pub exhaust: f32,
     pub engine: f32,
+    /// Original Automation exhaust at the processed Bank gain, before export
+    /// normalization. It does not enter either audible B stem.
+    pub source_reference: f32,
     pub mixed: f32,
 }
 
@@ -452,7 +487,9 @@ impl Hybrid {
             None
         };
         let mechanical_cylinders = mechanical_cylinders(bank.as_deref(), h);
-        let max_cycle_seconds = bank.as_ref().map_or(0.3, |bank| 120. / bank.min_rpm) * 1.05;
+        let inferred_weight = bank.as_ref().map_or(1., |bank| {
+            inferred_layer_weight(bank.residual_reliability(p.rpm, p.load))
+        });
         Self {
             bank,
             fallback,
@@ -482,11 +519,13 @@ impl Hybrid {
             cut: 0.,
             dc: filter(18., 0.707, SvfMode::Highpass),
             engine_dc: filter(18., 0.707, SvfMode::Highpass),
-            engine_texture: filter(350., 0.707, SvfMode::Highpass),
-            engine_cycle_delay: DelayLine::new(rate, max_cycle_seconds),
+            engine_texture: filter(200., 0.707, SvfMode::Highpass),
+            engine_air_band: filter(3600., 0.707, SvfMode::Lowpass),
             engine_stem_dc: filter(18., 0.707, SvfMode::Highpass),
             mechanical_impacts: MechanicalImpacts::new(rate, mechanical_cylinders),
             mechanical_source_energy: 0.,
+            inferred_weight,
+            phase_locked_texture: PhaseLockedTexture::new(),
             raw_energy: 0.001,
             wet_energy: 0.001,
             compensation: 1.,
@@ -535,6 +574,19 @@ impl Hybrid {
     pub fn load(&self) -> f32 {
         self.fast_load
     }
+    pub fn inferred_layer_weight(&self) -> f32 {
+        self.inferred_weight
+    }
+    /// Divide a live engine stem by this factor to compare its peak with an
+    /// exported stem, which removes playback level and the Bank gain.
+    pub(crate) fn export_stem_normalizer(&self) -> f32 {
+        self.gain * self.compensation * self.blend * self.bank.as_ref().map_or(1., |bank| bank.gain)
+    }
+    /// Divide the live B exhaust and source reference by this factor to
+    /// compare their levels at the same scale as the exported WAVs.
+    pub(crate) fn exhaust_export_normalizer(&self) -> f32 {
+        self.gain * self.bank.as_ref().map_or(1., |bank| bank.gain)
+    }
     pub fn next(&mut self, playing: bool) -> f32 {
         self.next_stems(playing).mixed
     }
@@ -544,6 +596,7 @@ impl Hybrid {
             return HybridStems {
                 exhaust: sample,
                 engine: 0.,
+                source_reference: 0.,
                 mixed: sample,
             };
         }
@@ -606,9 +659,10 @@ impl Hybrid {
                 uneven
             );
             self.low.set_cutoff(110. + self.p.rpm * 0.025);
-            self.engine_texture.set_cutoff(280. + self.p.rpm * 0.06);
+            self.engine_texture.set_cutoff(140. + self.p.rpm * 0.025);
+            self.engine_air_band.set_cutoff(3200. + self.p.rpm * 0.18);
             self.intake
-                .set_cutoff(600. + self.fast_load * 1800. + self.p.rpm * 0.15);
+                .set_cutoff(500. + self.fast_load * 900. + self.p.rpm * 0.1);
             self.muffler
                 .set_cutoff(self.p.brightness * (0.55 + 0.45 * self.fast_load));
             self.exhaust_line
@@ -618,6 +672,11 @@ impl Hybrid {
                 self.fast_load,
                 self.current.airbox,
             );
+            if let Some(bank) = &self.bank {
+                let target =
+                    inferred_layer_weight(bank.residual_reliability(self.p.rpm, self.fast_load));
+                self.inferred_weight += (target - self.inferred_weight) * s;
+            }
         }
         self.tick = self.tick.wrapping_add(1);
         let bank = self
@@ -638,6 +697,24 @@ impl Hybrid {
             self.rate,
             &self.sinc,
         );
+        let phase = self.wet_cycle.fract() as f32;
+        // Reuse the measured recording at a different complete 720-degree
+        // cycle for the engine-side texture. Its pressure phase still aligns
+        // with the current exhaust, but irregular detail is not copied at the
+        // same instant into both spatial emitters.
+        let inferred_source = bank.read(
+            self.wet_cycle + 7.,
+            self.p.rpm,
+            self.fast_load,
+            self.rate,
+            &self.sinc,
+        );
+        let inferred_residual = self.phase_locked_texture.next(
+            phase,
+            inferred_source - periodic,
+            self.p.rpm,
+            self.rate,
+        ) * self.inferred_weight;
         let position = (self.p.rpm - bank.min_rpm) / (bank.max_rpm - bank.min_rpm).max(1.);
         let pulse_gain =
             self.current.pulse_gain * self.current.maps.pulse.at(position, self.fast_load);
@@ -656,7 +733,6 @@ impl Hybrid {
             let random = (self.cycle_seed >> 40) as f32 / 16_777_215. * 2. - 1.;
             self.cycle_to = (self.cycle_to * 0.55 + random * 0.45).clamp(-1., 1.);
         }
-        let phase = self.wet_cycle.fract() as f32;
         let fade = phase * phase * (3. - 2. * phase);
         let variation = self.cycle_from + (self.cycle_to - self.cycle_from) * fade;
         let idle_factor = (1700. / self.p.rpm).clamp(0.35, 1.);
@@ -675,7 +751,9 @@ impl Hybrid {
             .sqrt()
             .min(350.);
         self.pressure_ready += (1. - self.pressure_ready) / (self.rate * 0.12);
-        let shape = self.current.pressure_shape * self.pressure_ready;
+        // Give a middle setting a meaningful pressure-front contribution while
+        // preserving the zero and full-scale endpoints of the control.
+        let shape = self.current.pressure_shape.sqrt() * self.pressure_ready;
         let modeled_pulse = periodic * (1. - shape) + edge * edge_scale * shape;
         let living_pulse = modeled_pulse
             * pulse_gain
@@ -712,9 +790,13 @@ impl Hybrid {
         let burst = self.transient * self.current.attack;
         let body = low * self.current.body * (0.18 + self.fast_load * 0.75 + burst * 1.2);
         let rasp = high * self.current.rasp * (0.12 + self.fast_load * 0.65 + burst * 2.);
-        // Induction texture comes from the WAV residual, not a generic noise bed.
-        let air_excitation = source * 0.3
-            + residual * texture_gain * self.current.texture * (0.08 + self.fast_load * 0.75);
+        // The intake duct receives only the source's irregular texture. Feeding
+        // the periodic exhaust waveform into it recreates an exhaust note at the
+        // engine emitter, rather than an independently responding intake.
+        let air_excitation = inferred_residual
+            * texture_gain
+            * (0.4 + self.fast_load * 0.35 + self.current.texture * 0.3)
+            * (0.7 + activity * 0.15);
         let runner = self.intake_runner.next(air_excitation);
         let air = self
             .intake
@@ -759,9 +841,14 @@ impl Hybrid {
             * (1. - self.cut);
         let excitation = (source + body + rasp) * (1. + burst * 0.5) + overrun + events;
         let propagated = self.exhaust_line.next(excitation);
-        let exhaust = self.muffler.next_sample(
-            excitation * (1. - self.current.pipe * 0.65) + propagated * self.current.pipe * 1.3,
-        );
+        // Even a restrained Pipe setting must let the modeled outlet matter.
+        // Previously a calibrated value near 0.04 sent about 97% of the
+        // excitation straight to the output, leaving the acoustic network
+        // almost inaudible.
+        let acoustic_mix = 0.5 + self.current.pipe * 0.4;
+        let exhaust = self
+            .muffler
+            .next_sample(excitation * (1. - acoustic_mix * 0.65) + propagated * acoustic_mix * 1.3);
         self.boost +=
             (self.fast_load * (self.p.rpm / 5000.).min(1.) - self.boost) / (self.rate * 0.4);
         self.turbo_phase = (self.turbo_phase + (1700. + self.boost * 4300.) / self.rate).fract();
@@ -773,40 +860,34 @@ impl Hybrid {
                 + intake
                 + mechanical
                 + turbo;
-        // Automation supplies an exhaust recording only. Keep its periodic
-        // exhaust orders out of the companion emitter: emphasize the
-        // non-periodic, upper-band source residual. A small, source-level
-        // driven mechanical texture replaces the continuous synthetic airflow
-        // bed. It is only emitted when the vehicle's cylinder count is known.
-        let upper_residual = self.engine_texture.next_sample(residual);
-        // A one-cycle difference suppresses the exhaust orders still leaking
-        // through the source residual. Its remaining grain is recorded, not a
-        // second independent noise bed, and follows live RPM continuously.
-        let previous_cycle = self
-            .engine_cycle_delay
-            .read_at(self.rate * 120. / self.p.rpm);
-        self.engine_cycle_delay.write(upper_residual);
-        let irregular_residual = upper_residual - previous_cycle * 0.75;
+        // This emitter has no independent intake microphone. Use a warm,
+        // bounded band of the source residual. The old one-cycle subtraction
+        // made regularly spaced comb notches and a hollow artificial timbre.
+        let upper_residual = self.engine_texture.next_sample(inferred_residual);
+        let engine_texture = self.engine_air_band.next_sample(upper_residual);
         self.mechanical_source_energy +=
-            (upper_residual * upper_residual - self.mechanical_source_energy) / (self.rate * 0.15);
-        let engine_air = irregular_residual * self.p.intake * (0.55 + 0.25 * self.fast_load);
+            (engine_texture * engine_texture - self.mechanical_source_energy) / (self.rate * 0.06);
+        let engine_air = engine_texture * self.p.intake * (0.7 + 0.3 * self.fast_load);
         let impacts = self.mechanical_impacts.next(
             self.wet_cycle,
-            self.mechanical_source_energy.max(0.).sqrt() * self.p.mechanical * 12.,
+            self.mechanical_source_energy.max(0.).sqrt() * self.p.mechanical * 4.,
             self.fast_load,
         );
-        let engine_channel = self.engine_stem_dc.next_sample(
-            (engine_air + mechanical * 0.5 + impacts + (intake + turbo) * 0.1)
-                * self.current.coloration,
-        );
+        let engine_channel = self
+            .engine_stem_dc
+            .next_sample((engine_air + impacts + (intake + turbo) * 0.1) * self.current.coloration);
+        // Added coloration remains exactly off at zero, but a calibrated middle
+        // value now favors the reconstructed path over the source reference.
+        let path_gain = 1. - (1. - self.current.coloration).powi(3);
         let mixed_engine = self
             .engine_dc
-            .next_sample((intake + mechanical + turbo) * self.current.coloration);
-        let direct =
-            source * self.p.exhaust * self.current.maps.exhaust.at(position, self.fast_load);
-        let wet = self.dc.next_sample(
-            shaped * self.current.coloration + direct * (1. - self.current.coloration),
-        );
+            .next_sample((intake + mechanical + turbo) * path_gain);
+        // The original recording is the A reference and a small B anchor at
+        // middle settings. A calibrated coloration near 0.6 leaves only about
+        // six percent of that dry waveform in B.
+        let wet = self
+            .dc
+            .next_sample(shaped * path_gain + raw * (1. - path_gain));
         let energy_smooth = 1. / (self.rate * 1.5);
         self.raw_energy += (raw * raw - self.raw_energy) * energy_smooth;
         self.wet_energy += (wet * wet - self.wet_energy) * energy_smooth;
@@ -834,6 +915,7 @@ impl Hybrid {
         HybridStems {
             exhaust: mixed - mixed_engine * self.compensation * self.blend * self.gain,
             engine,
+            source_reference: raw * bank.original_to_processed_gain() * self.gain,
             mixed,
         }
     }

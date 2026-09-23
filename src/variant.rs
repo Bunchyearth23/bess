@@ -2,7 +2,7 @@
 use crate::{
     bank::{self, Bank},
     export,
-    hybrid::Settings,
+    hybrid::{Settings, inferred_layer_weight},
     project::Parameters,
 };
 use serde_json::{Value, json};
@@ -293,10 +293,23 @@ pub(crate) fn engine_stem_gain(
     engine_rms: f32,
     engine_peak: f32,
     load: f32,
+    residual_reliability: f32,
 ) -> f32 {
-    let target_ratio = if load == 0. { 0.35 } else { 0.55 };
+    if engine_rms < 1e-7 || engine_peak < 1e-7 {
+        // A rejected source period has no trustworthy inferred texture. A
+        // silent engine-side WAV is valid and preferable to an exhaust copy.
+        return 1.;
+    }
+    // If period analysis could not isolate the exhaust orders at this knot,
+    // its "residual" may contain the entire exhaust waveform. Keep that
+    // inferred engine layer subordinate instead of normalizing it to the same
+    // loudness as a trustworthy residual.
+    let target_ratio =
+        (if load == 0. { 0.35 } else { 0.55 }) * inferred_layer_weight(residual_reliability);
+    // Rejected period templates can leave a very loud exhaust copy in the
+    // inferred stem. A fixed minimum gain would defeat this suppression.
     (target_ratio * exhaust_rms / engine_rms)
-        .clamp(0.25, 12.)
+        .min(12.)
         .min(0.94 / engine_peak)
 }
 
@@ -529,20 +542,20 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
             || !engine_rms.is_finite()
             || !engine_peak.is_finite()
             || exhaust_rms < 1e-7
-            || engine_rms < 1e-7
         {
             return Err(format!(
-                "Exhaust or engine stem is silent or non-finite: {old_path}"
+                "Exhaust stem is silent or a rendered stem is non-finite: {old_path}"
             ));
         }
         // The engine-side signal is inferred from an exhaust recording. A
         // fixed row-wide gain made some RPM knots dominate the sound. Balance
         // each knot, but never rescue a weak proxy with an enormous boost.
-        let gain = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, *load);
+        let reliability = bank.residual_reliability(*rpm, *load);
+        let gain = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, *load, reliability);
         let ratio = gain * engine_rms / exhaust_rms;
         engine_gains.push(gain);
         engine_ratios.push(ratio);
-        engine_points.push(json!({"rpm":rpm,"load":load,"gain":gain,"rms_ratio":ratio}));
+        engine_points.push(json!({"rpm":rpm,"load":load,"gain":gain,"rms_ratio":ratio,"residual_reliability":reliability}));
         exhaust_wavs.push(wav);
         engine_loops.push(engine);
     }
@@ -695,6 +708,21 @@ pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_period_cannot_receive_a_normal_engine_stem_balance() {
+        let exhaust_rms = 0.05;
+        let engine_rms = 0.01;
+        let engine_peak = 0.1;
+        let trusted = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, 1., 1.);
+        let rejected = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, 1., 0.);
+        assert!(trusted * engine_rms / exhaust_rms > 0.5);
+        assert!(rejected * engine_rms / exhaust_rms < 0.1);
+        assert!(rejected < trusted);
+        let loud_proxy = engine_stem_gain(0.05, 0.05, 0.1, 1., 0.);
+        assert!(loud_proxy * 0.05 / 0.05 <= 0.55 * 0.15 + 1e-6);
+        assert_eq!(engine_stem_gain(0.05, 0., 0., 1., 0.), 1.);
+    }
 
     #[test]
     fn clone_only_primary_part_skips_comments_strings_and_siblings() {

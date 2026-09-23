@@ -1,4 +1,10 @@
-use bess::{bank::Bank, bench::Bench, drive::Controls, hybrid::Settings, project::Parameters};
+use bess::{
+    bank::Bank,
+    bench::{AuditionMix, Bench},
+    drive::Controls,
+    hybrid::Settings,
+    project::Parameters,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Sender, bounded};
 use std::sync::{
@@ -124,6 +130,7 @@ impl Audio {
                         let started = std::time::Instant::now();
                         if let Ok(next) = rx.try_recv() {
                             let command: Command = next;
+                            engine.set_audition_mix(command.audition_mix);
                             engine.set(
                                 command.params,
                                 command.settings,
@@ -248,4 +255,5 @@ pub struct Command {
     pub playing: bool,
     pub driving: Controls,
     pub restart: u64,
+    pub audition_mix: AuditionMix,
 }
