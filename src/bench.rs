@@ -195,6 +195,7 @@ impl Bench {
     fn effective_settings(&self) -> Settings {
         let mut settings = self.settings;
         if self.audition_mix == AuditionMix::BeamNgTwoEmitter {
+            settings = settings.for_beamng_export();
             settings.level_match = false;
         }
         settings
@@ -249,7 +250,8 @@ impl Bench {
         }
         self.params = p;
         self.settings = h;
-        self.two_emitter_preview.procedural = h.procedural;
+        self.two_emitter_preview.procedural =
+            h.procedural && self.audition_mix != AuditionMix::BeamNgTwoEmitter;
         self.controls = c;
         self.reset_token = reset_token;
         if c.mode == Mode::Direct {

@@ -97,12 +97,25 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    /// BeamNG receives the source-guided sound, even when the live bench is
+    /// auditioning the experimental generator.
+    pub fn for_beamng_export(self) -> Self {
+        Self {
+            procedural: false,
+            generated_body: 1.,
+            generated_edge: 1.,
+            generated_flow: 1.,
+            generated_mechanics: 1.,
+            ..self
+        }
+    }
+
     pub fn calibrated(bank: &Bank) -> Self {
         let c = bank.character();
         let bright = (c.edge_ratio * 4.).clamp(0., 1.);
         let periodic = c.cycle_similarity.clamp(0., 1.);
         Self {
-            procedural: true,
+            procedural: false,
             body: 0.08 + 0.12 * (1. - bright),
             rasp: 0.03 + 0.05 * (1. - bright),
             pipe: 0.03 + 0.08 * (1. - periodic),

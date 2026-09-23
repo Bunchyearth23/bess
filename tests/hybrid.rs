@@ -904,6 +904,23 @@ fn sound_presets_keep_explicit_engine_timing() {
 #[test]
 fn generated_character_presets_change_the_waveform() {
     let bank = fixture();
+    let generated = |index| Settings {
+        procedural: true,
+        ..Settings::character_for_bank(index, &bank)
+    };
+    let baseline = render::hybrid_samples(params(), generated(0), bank.clone(), 1., false).unwrap();
+    for preset in 1..6 {
+        let settings = generated(preset);
+        assert!(settings.procedural);
+        let candidate =
+            render::hybrid_samples(params(), settings, bank.clone(), 1., false).unwrap();
+        assert!(rms_diff(&baseline, &candidate) > 0.00005, "preset {preset}");
+    }
+}
+
+#[test]
+fn standard_character_presets_change_the_waveform() {
+    let bank = fixture();
     let baseline = render::hybrid_samples(
         params(),
         Settings::character_for_bank(0, &bank),
@@ -914,11 +931,42 @@ fn generated_character_presets_change_the_waveform() {
     .unwrap();
     for preset in 1..6 {
         let settings = Settings::character_for_bank(preset, &bank);
-        assert!(settings.procedural);
+        assert!(!settings.procedural);
         let candidate =
             render::hybrid_samples(params(), settings, bank.clone(), 1., false).unwrap();
         assert!(rms_diff(&baseline, &candidate) > 0.00005, "preset {preset}");
     }
+}
+
+#[test]
+fn selectable_beamng_export_ignores_experimental_live_mode() {
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cars/bunchyearth23_cerberus_a.zip");
+    if !source.is_file() {
+        return;
+    }
+    let bank = std::sync::Arc::new(bess::bank::Bank::load(&source, None).unwrap());
+    let settings = Settings {
+        procedural: true,
+        generated_body: 1.5,
+        ..Settings::calibrated(&bank)
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "bess-standard-variant-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    bess::variant::package(&dir, params(), settings, bank).unwrap();
+    let project: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("settings.bess.json")).unwrap()).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(project["hybrid"]["procedural"], false);
+    assert_eq!(manifest["settings"]["procedural"], false);
+    assert_eq!(project["hybrid"]["generated_body"], 1.0);
 }
 
 #[test]
@@ -934,7 +982,16 @@ fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
             .unwrap()
             .as_nanos()
     ));
-    bess::export::package(&dir, params(), Settings::calibrated(&bank), bank.clone()).unwrap();
+    bess::export::package(
+        &dir,
+        params(),
+        Settings {
+            procedural: true,
+            ..Settings::calibrated(&bank)
+        },
+        bank.clone(),
+    )
+    .unwrap();
     assert_eq!(original, std::fs::read(&bank.source.archive).unwrap());
     let mut old = zip::ZipArchive::new(Cursor::new(&original)).unwrap();
     let package_name = bess::export::package_name(&bank);
@@ -979,6 +1036,7 @@ fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
     assert_eq!(restored.max_rpm, bank.max_rpm);
     let project = project::load_project(&dir.join("settings.bess.json")).unwrap();
     assert_eq!(project.source.as_ref().unwrap(), &bank.source);
+    assert!(!project.hybrid.procedural);
 }
 
 #[test]

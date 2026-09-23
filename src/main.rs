@@ -36,6 +36,7 @@ impl LevelKey {
         params.rpm = bank.min_rpm;
         params.load = 0.;
         params.volume = 0.8;
+        settings = settings.for_beamng_export();
         settings.enhanced = true;
         settings.level_match = false;
         settings.overrun = 0.;
@@ -207,7 +208,7 @@ impl App {
         self.level_worker = Some(rx);
         self.level_error = None;
         let params = self.params;
-        let settings = self.settings;
+        let settings = self.settings.for_beamng_export();
         std::thread::spawn(move || {
             let _ = tx.send(beamng_level::analyze(bank, params, settings));
         });
@@ -322,7 +323,7 @@ impl App {
             && ui
                 .checkbox(
                     &mut self.settings.procedural,
-                    "Experimental: generate B from measured engine characteristics",
+                    "Experimental live sound (not used for BeamNG export)",
                 )
                 .changed()
         {
@@ -354,7 +355,7 @@ impl App {
                 );
             });
             if self.audition_mix == AuditionMix::BeamNgTwoEmitter {
-                ui.small("Approximate mono balance of the separate exhaust and engine emitters. The preview follows export level calibration with smoothed live estimates and assumes -8 dB engine gain relative to exhaust. The live A/B level match is ignored. BeamNG camera, cabin and spatial filtering can change what you hear. A remains the source reference.");
+                ui.small("Preview of the standard source-guided BeamNG export, even if experimental live sound is enabled. This approximates the two emitters in mono and assumes -8 dB engine gain relative to exhaust. BeamNG camera, cabin and spatial filtering can change what you hear. A remains the source reference.");
             }
         }
         ui.horizontal(|ui| {
@@ -1039,7 +1040,7 @@ impl eframe::App for App {
                             self.settings=Settings{enhanced,procedural,level_match,combustion,..Settings::calibrated(bank)};
                     }
                     if self.settings.procedural {
-                        ui.small("The source-pulse and source-texture controls below apply to the earlier source-guided mode only.");
+                        ui.small("The source-pulse and source-texture controls below apply to the standard source-guided mode only.");
                     } else {
                         ui.small("Pulses and texture separated from the imported WAV files.");
                     }
@@ -1258,6 +1259,7 @@ impl eframe::App for App {
             }
             ui.separator();ui.heading("Export BeamNG");
             ui.small("Adds a BESS configuration to the original Automation vehicle. Keep the original mod enabled.");
+            ui.small("BeamNG always receives the standard source-guided sound. Experimental synthesis stays in the listening interface.");
             ui.small("Game afterfire, turbo, and startup sounds are preserved; BESS transient effects are not transferred.");
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong("BeamNG volume estimate");
@@ -1308,7 +1310,7 @@ impl eframe::App for App {
             });
             if ui.add_enabled(self.bank.is_some()&&self.worker.is_none()&&self.level_worker.is_none(),egui::Button::new("Create BeamNG configuration…")).clicked()
                 &&let Some(dir)=rfd::FileDialog::new().pick_folder(){
-                let bank=self.bank.clone().unwrap();let p=self.params;let h=self.settings;
+                let bank=self.bank.clone().unwrap();let p=self.params;let h=self.settings.for_beamng_export();
                 let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Creating and verifying BeamNG configuration…".into();
                 std::thread::spawn(move||{let folder=dir.join(format!("BESS-BeamNG-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()));
                     let _=tx.send(bess::variant::package(&folder,p,h,bank));});
@@ -1428,7 +1430,6 @@ fn main() -> eframe::Result {
                 | "--characters"
                 | "--drive-demo"
                 | "--beamng"
-                | "--beamng-procedural"
                 | "--beamng-replacement"
         )
     ) {
@@ -1451,8 +1452,8 @@ fn main() -> eframe::Result {
                 ..Default::default()
             };
             let mut settings = Settings::calibrated(&bank);
-            settings.procedural = !matches!(args[1].as_str(), "--beamng-replacement");
-            if matches!(args[1].as_str(), "--beamng" | "--beamng-procedural") {
+            settings.procedural = args[1] == "--compare-procedural";
+            if args[1] == "--beamng" {
                 bess::variant::package(Path::new(dir), params, settings, bank)
             } else if args[1] == "--beamng-replacement" {
                 bess::export::package(Path::new(dir), params, settings, bank)

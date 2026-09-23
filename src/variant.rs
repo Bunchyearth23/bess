@@ -336,6 +336,11 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
     if previous["render_channel"] != "exhaust" {
         return Err("Variant requires a BESS exhaust-stem render, not a mixed replacement".into());
     }
+    if previous["settings"]["procedural"] == true {
+        return Err(
+            "Experimental synthesis is for the listening interface, not BeamNG export".into(),
+        );
+    }
     let mut original = ZipArchive::new(File::open(source).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let mut rendered = ZipArchive::new(File::open(processed).map_err(|e| e.to_string())?)
@@ -679,6 +684,7 @@ pub fn convert(source: &Path, processed: &Path, dir: &Path) -> Result<String, St
 /// Render and export the default GUI format: one additive BESS configuration.
 pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Result<String, String> {
     fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
+    let h = h.for_beamng_export();
     let staging = dir.join(".bess-render");
     let result = (|| {
         export::package_exhaust_stem(&staging, p, h, bank.clone())?;

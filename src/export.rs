@@ -302,7 +302,7 @@ fn render_stems(
 
 /// Keep the previous full-replacement sound as a single mixed exhaust bank.
 pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Result<String, String> {
-    package_inner(dir, p, h, bank, false)
+    package_inner(dir, p, h.for_beamng_export(), bank, false)
 }
 
 /// Produce the exhaust stem used by selectable variants with a second emitter.
