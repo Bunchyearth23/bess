@@ -858,6 +858,7 @@ fn configured_combustion_is_audible_bounded_and_allocation_free() {
     let bank = fixture();
     let h = Settings {
         level_match: false,
+        procedural: false,
         ..Settings::calibrated(&bank)
     };
     let configured = Settings {
@@ -891,12 +892,32 @@ fn sound_presets_keep_explicit_engine_timing() {
         response: 0.7,
         ..Settings::calibrated(&bank)
     };
-    for preset in 0..3 {
+    for preset in 0..6 {
         let next = starting.character_preserving_engine(preset, Some(&bank));
         assert_eq!(next.combustion, custom);
         assert!(!next.enhanced && !next.level_match);
         assert_eq!(next.response, 0.7);
         assert_ne!(next.pipe, 0.28);
+    }
+}
+
+#[test]
+fn generated_character_presets_change_the_waveform() {
+    let bank = fixture();
+    let baseline = render::hybrid_samples(
+        params(),
+        Settings::character_for_bank(0, &bank),
+        bank.clone(),
+        1.,
+        false,
+    )
+    .unwrap();
+    for preset in 1..6 {
+        let settings = Settings::character_for_bank(preset, &bank);
+        assert!(settings.procedural);
+        let candidate =
+            render::hybrid_samples(params(), settings, bank.clone(), 1., false).unwrap();
+        assert!(rms_diff(&baseline, &candidate) > 0.00005, "preset {preset}");
     }
 }
 

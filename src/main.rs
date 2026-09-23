@@ -242,16 +242,28 @@ impl App {
 impl App {
     fn listen_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Sound comparison bench");
-        ui.horizontal(|ui| {
-                ui.label("Character:");
-                for (i,name) in ["Balanced", "Muted", "Open"].iter().enumerate() {
-                    if ui.button(*name).on_hover_text("Apply a starting point for the sound settings while keeping the vehicle and driving setup.").clicked() {
-                        self.settings=self.settings.character_preserving_engine(i,self.bank.as_deref());
-                    }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Character:");
+            for (i, (name, description)) in [
+                ("Balanced", "Neutral generated exhaust and engine balance."),
+                ("Muted", "Softer top end and reduced flow texture."),
+                ("Open", "Brighter and more exposed exhaust."),
+                ("Warm", "More low-frequency body with a softer edge."),
+                ("Mechanical", "More engine-side mechanical detail."),
+                ("Grit", "More exhaust texture and upper detail."),
+            ]
+            .iter()
+            .enumerate()
+            {
+                if ui.button(*name).on_hover_text(*description).clicked() {
+                    self.settings = self
+                        .settings
+                        .character_preserving_engine(i, self.bank.as_deref());
                 }
-            });
+            }
+        });
         ui.small(
-            "Three interpretations of the same imported engine, adjustable in the sound settings.",
+            "Six adjustable characters for the same imported engine. Presets keep engine timing and driving response.",
         );
         let rpm = self
             .audio
@@ -971,10 +983,15 @@ impl eframe::App for App {
                             ui.small("Cylinder metadata is unavailable. The generated pulse timing uses this configured approximation:");
                             ui.add(egui::Slider::new(&mut self.params.cylinders, 1..=12).text("Cylinders"));
                         }
-                        ui.small("The ZIP sets broad tone and level. These three controls balance the generated sources; the original waveform does not enter B.");
+                        ui.small("The ZIP sets broad tone and level. The original waveform does not enter B.");
                         slider(ui, "Generated exhaust", &mut self.params.exhaust, 0.0..=1.0);
                         slider(ui, "Generated intake", &mut self.params.intake, 0.0..=1.0);
                         slider(ui, "Generated mechanics", &mut self.params.mechanical, 0.0..=1.0);
+                        ui.small("Generated sound character");
+                        slider(ui, "Exhaust body", &mut self.settings.generated_body, 0.0..=2.0);
+                        slider(ui, "Exhaust edge", &mut self.settings.generated_edge, 0.0..=2.0);
+                        slider(ui, "Flow texture", &mut self.settings.generated_flow, 0.0..=2.0);
+                        slider(ui, "Mechanical detail", &mut self.settings.generated_mechanics, 0.0..=2.0);
                         ui.small("This is an experimental exhaust-guided model. Its intake and mechanical sound are estimates, not separate recordings.");
                     } else {
                     ui.collapsing("Engine and combustion (optional)", |ui| {
@@ -1319,7 +1336,7 @@ impl eframe::App for App {
             }
             if self.worker.is_some()||self.importer.is_some(){ui.spinner();}
             ui.small("A/B and character exports always use the comparison cycle.");
-            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none(),egui::Button::new("Export three characters + source…")).clicked()
+            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none(),egui::Button::new("Export six characters + source…")).clicked()
                 &&let Some(dir)=rfd::FileDialog::new().pick_folder(){
                 let bank=self.bank.clone().unwrap();let p=self.params;
                 let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Rendering level-matched characters…".into();
@@ -1434,10 +1451,7 @@ fn main() -> eframe::Result {
                 ..Default::default()
             };
             let mut settings = Settings::calibrated(&bank);
-            settings.procedural = matches!(
-                args[1].as_str(),
-                "--compare-procedural" | "--beamng-procedural"
-            );
+            settings.procedural = !matches!(args[1].as_str(), "--beamng-replacement");
             if matches!(args[1].as_str(), "--beamng" | "--beamng-procedural") {
                 bess::variant::package(Path::new(dir), params, settings, bank)
             } else if args[1] == "--beamng-replacement" {

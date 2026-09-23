@@ -241,6 +241,9 @@ pub fn characters(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
         ("01-balanced", Settings::character_for_bank(0, &bank)),
         ("02-muted", Settings::character_for_bank(1, &bank)),
         ("03-open", Settings::character_for_bank(2, &bank)),
+        ("04-warm", Settings::character_for_bank(3, &bank)),
+        ("05-mechanical", Settings::character_for_bank(4, &bank)),
+        ("06-grit", Settings::character_for_bank(5, &bank)),
     ];
     let mut rendered = Vec::new();
     let mut reference = 0.;
@@ -282,7 +285,7 @@ pub fn characters(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
         )?;
     }
     let report = format!(
-        "BESS {} — the same vehicle and 16-second cycle, with four characters matched by RMS.\nCommon RMS: {:.6}. Common safety gain: {:.6}.\nThe associated projects retain their settings before final WAV RMS matching.\nA is reconstructed from the source bank, not recorded from gameplay. RMS matching is not LUFS matching.\n",
+        "BESS {} — the same vehicle and 16-second cycle, with six generated characters matched to the source by RMS.\nCommon RMS: {:.6}. Common safety gain: {:.6}.\nThe associated projects retain their settings before final WAV RMS matching.\nA is reconstructed from the source bank, not recorded from gameplay. RMS matching is not LUFS matching.\n",
         env!("CARGO_PKG_VERSION"),
         reference * safety as f64,
         safety

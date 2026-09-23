@@ -532,10 +532,17 @@ fn white_band_reference(rate: f32) -> [f32; BANDS] {
     energy.map(|x| (x / (frames - frames / 10) as f32).sqrt().max(1e-5))
 }
 
-/// Runs only on measured descriptors. `exhaust` is a synthesized tailpipe
-/// proxy at approximately the imported processed-bank level. `intake` and
-/// `mechanical` are separate, independently excited proxies; the imported
-/// exhaust does not identify their authentic timbres.
+/// Runs only on measured descriptors. The two exhaust components can be
+/// balanced independently without recovering the imported PCM waveform.
+/// Intake and mechanical detail remain estimated, independently excited paths.
+#[derive(Clone, Copy, Debug)]
+pub struct ProceduralStems {
+    pub exhaust_tone: f32,
+    pub exhaust_texture: f32,
+    pub intake: f32,
+    pub mechanical: f32,
+}
+
 pub struct ProceduralVoice {
     descriptors: Arc<ProceduralBank>,
     white_band_rms: [f32; BANDS],
@@ -606,7 +613,7 @@ impl ProceduralVoice {
         self.descriptors.mean_source_rms(rpm, load)
     }
 
-    pub fn next(&mut self, rpm: f32, load: f32, cycle: f64) -> (f32, f32, f32) {
+    pub fn next(&mut self, rpm: f32, load: f32, cycle: f64) -> ProceduralStems {
         let rpm = rpm.clamp(200., 20_000.);
         let load = load.clamp(0., 1.);
         let descriptor = self.descriptors.at(rpm, load);
@@ -668,8 +675,7 @@ impl ProceduralVoice {
             * descriptor.transient_level
             * burst_gate
             * (0.55 + 0.45 * load);
-        let exhaust =
-            resonant + colored_flow * descriptor.flow_level * flow_gate + combustion_texture;
+        let exhaust_texture = colored_flow * descriptor.flow_level * flow_gate + combustion_texture;
 
         let engine_noise = self.engine_bands.next(xorshift(&mut self.engine_seed));
         let air = engine_noise[2] / self.white_band_rms[2] * 0.6
@@ -696,7 +702,12 @@ impl ProceduralVoice {
             * (mechanical_noise[3] / self.white_band_rms[3] * 0.5
                 + mechanical_noise[4] / self.white_band_rms[4] * 0.08)
             * self.mechanical_envelope;
-        (exhaust, intake, mechanical)
+        ProceduralStems {
+            exhaust_tone: resonant,
+            exhaust_texture,
+            intake,
+            mechanical,
+        }
     }
 }
 
@@ -740,9 +751,14 @@ mod tests {
         let mut total = 0.;
         for i in 0..48_000 {
             let cycle = i as f64 * 4000. / (120. * 48_000.);
-            let (exhaust, intake, mechanical) = voice.next(4000., 0.8, cycle);
-            assert!(exhaust.is_finite() && intake.is_finite() && mechanical.is_finite());
-            total += exhaust * exhaust;
+            let stems = voice.next(4000., 0.8, cycle);
+            assert!(
+                stems.exhaust_tone.is_finite()
+                    && stems.exhaust_texture.is_finite()
+                    && stems.intake.is_finite()
+                    && stems.mechanical.is_finite()
+            );
+            total += (stems.exhaust_tone + stems.exhaust_texture).powi(2);
         }
         assert!(total > 0.);
         assert!(rms > 0.);
@@ -756,9 +772,14 @@ mod tests {
             voice.set_cylinders(cylinders);
             for _ in 0..1000 {
                 cycle += 5200. / (120. * 48_000.);
-                let (exhaust, intake, mechanical) = voice.next(5200., 1., cycle);
-                assert!(exhaust.is_finite() && intake.is_finite() && mechanical.is_finite());
-                assert!(exhaust.abs() < 10. && intake.abs() < 10. && mechanical.abs() < 10.);
+                let stems = voice.next(5200., 1., cycle);
+                let exhaust = stems.exhaust_tone + stems.exhaust_texture;
+                assert!(
+                    exhaust.is_finite() && stems.intake.is_finite() && stems.mechanical.is_finite()
+                );
+                assert!(
+                    exhaust.abs() < 10. && stems.intake.abs() < 10. && stems.mechanical.abs() < 10.
+                );
             }
         }
     }
@@ -795,7 +816,9 @@ mod tests {
             let mut energy = [0.; 3];
             for i in 0..frames {
                 let cycle = i as f64 * 4000. / (120. * rate as f64);
-                let (exhaust, intake, mechanical) = voice.next(4000., 1., cycle);
+                let stems = voice.next(4000., 1., cycle);
+                let exhaust = stems.exhaust_tone + stems.exhaust_texture;
+                let (intake, mechanical) = (stems.intake, stems.mechanical);
                 for (sum, sample) in energy.iter_mut().zip([exhaust, intake, mechanical]) {
                     assert!(sample.is_finite());
                     *sum += sample * sample;

@@ -19,6 +19,11 @@ pub struct Settings {
     pub enhanced: bool,
     /// Use measured descriptors to generate B without replaying source PCM.
     pub procedural: bool,
+    /// Neutral-at-one controls for the descriptor-driven B sound.
+    pub generated_body: f32,
+    pub generated_edge: f32,
+    pub generated_flow: f32,
+    pub generated_mechanics: f32,
     pub level_match: bool,
     pub response: f32,
     pub attack: f32,
@@ -56,6 +61,10 @@ impl Default for Settings {
         Self {
             enhanced: true,
             procedural: false,
+            generated_body: 1.,
+            generated_edge: 1.,
+            generated_flow: 1.,
+            generated_mechanics: 1.,
             level_match: true,
             response: 0.14,
             attack: 0.4,
@@ -93,6 +102,7 @@ impl Settings {
         let bright = (c.edge_ratio * 4.).clamp(0., 1.);
         let periodic = c.cycle_similarity.clamp(0., 1.);
         Self {
+            procedural: true,
             body: 0.08 + 0.12 * (1. - bright),
             rasp: 0.03 + 0.05 * (1. - bright),
             pipe: 0.03 + 0.08 * (1. - periodic),
@@ -119,6 +129,10 @@ impl Settings {
                 pipe: 0.18,
                 rasp: 0.02,
                 body: 0.18,
+                generated_body: 0.9,
+                generated_edge: 0.72,
+                generated_flow: 0.7,
+                generated_mechanics: 0.75,
                 ..base
             },
             2 => Self {
@@ -128,6 +142,43 @@ impl Settings {
                 rasp: 0.25,
                 attack: 0.5,
                 coloration: 0.5,
+                generated_body: 1.05,
+                generated_edge: 1.2,
+                generated_flow: 1.15,
+                generated_mechanics: 1.05,
+                ..base
+            },
+            3 => Self {
+                chamber: 6.,
+                absorption: 0.6,
+                pipe: 0.1,
+                body: 0.25,
+                rasp: 0.04,
+                generated_body: 1.3,
+                generated_edge: 0.78,
+                generated_flow: 0.8,
+                generated_mechanics: 0.85,
+                ..base
+            },
+            4 => Self {
+                chamber: 2.5,
+                absorption: 0.42,
+                texture: 0.08,
+                generated_body: 1.0,
+                generated_edge: 0.9,
+                generated_flow: 0.75,
+                generated_mechanics: 1.5,
+                ..base
+            },
+            5 => Self {
+                chamber: 1.7,
+                absorption: 0.3,
+                rasp: 0.2,
+                texture: 0.14,
+                generated_body: 0.95,
+                generated_edge: 1.15,
+                generated_flow: 1.35,
+                generated_mechanics: 1.05,
                 ..base
             },
             _ => base,
@@ -194,6 +245,16 @@ impl Settings {
                 return Err("Hybrid setting out of range".into());
             }
         }
+        for value in [
+            self.generated_body,
+            self.generated_edge,
+            self.generated_flow,
+            self.generated_mechanics,
+        ] {
+            if !value.is_finite() || !(0.0..=2.0).contains(&value) {
+                return Err("Generated sound setting out of range".into());
+            }
+        }
         for (v, min, max) in [
             (self.rpm_character, -1., 1.),
             (self.load_character, -1., 1.),
@@ -227,6 +288,10 @@ impl Settings {
                 airbox: 0.65,
                 texture: 0.1,
                 fuel_cut: 0.7,
+                generated_body: 0.9,
+                generated_edge: 0.72,
+                generated_flow: 0.7,
+                generated_mechanics: 0.75,
                 ..Self::default()
             },
             2 => Self {
@@ -243,6 +308,43 @@ impl Settings {
                 airbox: 0.65,
                 texture: 0.5,
                 fuel_cut: 0.15,
+                generated_body: 1.05,
+                generated_edge: 1.2,
+                generated_flow: 1.15,
+                generated_mechanics: 1.05,
+                ..Self::default()
+            },
+            3 => Self {
+                body: 0.55,
+                rasp: 0.12,
+                chamber: 8.,
+                absorption: 0.65,
+                generated_body: 1.3,
+                generated_edge: 0.78,
+                generated_flow: 0.8,
+                generated_mechanics: 0.85,
+                ..Self::default()
+            },
+            4 => Self {
+                body: 0.3,
+                rasp: 0.2,
+                chamber: 2.5,
+                texture: 0.18,
+                generated_body: 1.,
+                generated_edge: 0.9,
+                generated_flow: 0.75,
+                generated_mechanics: 1.5,
+                ..Self::default()
+            },
+            5 => Self {
+                body: 0.3,
+                rasp: 0.55,
+                chamber: 1.5,
+                texture: 0.4,
+                generated_body: 0.95,
+                generated_edge: 1.15,
+                generated_flow: 1.35,
+                generated_mechanics: 1.05,
                 ..Self::default()
             },
             _ => Self::default(),
@@ -619,19 +721,29 @@ impl Hybrid {
     fn next_procedural(&mut self, raw: f32, source_scale: f32) -> HybridStems {
         let bank = self.bank.as_ref().expect("procedural voice has a bank");
         let position = (self.p.rpm - bank.min_rpm) / (bank.max_rpm - bank.min_rpm).max(1.);
-        let (exhaust_source, intake_source, mechanical_source) = self
+        let generated = self
             .procedural_voice
             .as_mut()
             .expect("procedural voice was prepared before playback")
             .next(self.p.rpm, self.fast_load, self.wet_cycle);
+        // The neutral preset leaves the R8 generator unchanged. Other presets
+        // adjust broad components, not the measured firing-order phases.
+        let low_tone = self.low.next_sample(generated.exhaust_tone);
+        let base_exhaust = generated.exhaust_tone
+            + (self.current.generated_body - 1.) * low_tone
+            + generated.exhaust_texture * self.current.generated_flow;
+        let upper = self.high.next_sample(base_exhaust);
+        let exhaust_source = base_exhaust + (self.current.generated_edge - 1.) * upper;
         let exhaust = self.dc.next_sample(
             exhaust_source
                 * self.p.exhaust
                 * self.current.maps.exhaust.at(position, self.fast_load),
         );
         let engine = self.engine_stem_dc.next_sample(
-            intake_source * self.p.intake * self.current.maps.intake.at(position, self.fast_load)
-                + mechanical_source * self.p.mechanical,
+            generated.intake
+                * self.p.intake
+                * self.current.maps.intake.at(position, self.fast_load)
+                + generated.mechanical * self.p.mechanical * self.current.generated_mechanics,
         );
         let wet = exhaust + engine * 0.25;
         let energy_smooth = 1. / (self.rate * 1.5);
@@ -727,7 +839,11 @@ impl Hybrid {
                 cycle_life,
                 pulse_texture,
                 pressure_shape,
-                coloration
+                coloration,
+                generated_body,
+                generated_edge,
+                generated_flow,
+                generated_mechanics
             );
             macro_rules! follow_p {($($field:ident),*)=>{$(self.p.$field+=(self.target.$field-self.p.$field)*s;)*};}
             follow_p!(
