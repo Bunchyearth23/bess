@@ -1,6 +1,7 @@
 mod acoustics;
 pub mod bank;
 pub mod beamng;
+pub mod beamng_level;
 pub mod bench;
 pub mod combustion;
 pub mod drive;

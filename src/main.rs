@@ -2,7 +2,7 @@
 mod audio;
 use bess::{
     bank::Bank,
-    beamng,
+    beamng, beamng_level,
     drive::{Controls, Mode},
     hybrid::Settings,
     project::{self, Parameters, Project},
@@ -22,8 +22,36 @@ struct Loaded {
     settings: Settings,
     driving: Controls,
 }
+#[derive(Clone, PartialEq)]
+struct LevelKey {
+    source_fingerprint: String,
+    params: Parameters,
+    settings: Settings,
+}
+impl LevelKey {
+    fn new(bank: &Bank, mut params: Parameters, mut settings: Settings) -> Self {
+        // The exporter replaces these controls. Selecting another RPM/load or
+        // changing listening volume should not invalidate a completed scan.
+        params.rpm = bank.min_rpm;
+        params.load = 0.;
+        params.volume = 0.8;
+        settings.enhanced = true;
+        settings.level_match = false;
+        settings.overrun = 0.;
+        settings.turbo = 0.;
+        settings.attack = 0.;
+        settings.roughness = 0.;
+        settings.fuel_cut = 0.;
+        Self {
+            source_fingerprint: bank.source.fingerprint.clone(),
+            params,
+            settings,
+        }
+    }
+}
 struct App {
     capture: Option<PathBuf>,
+    capture_level: bool,
     capture_requested: bool,
     frames: u32,
     params: Parameters,
@@ -40,6 +68,11 @@ struct App {
     seconds: f32,
     worker: Option<mpsc::Receiver<Result<String, String>>>,
     importer: Option<mpsc::Receiver<Result<Loaded, String>>>,
+    level_worker: Option<mpsc::Receiver<Result<beamng_level::Report, String>>>,
+    level_pending: Option<LevelKey>,
+    level_report: Option<(LevelKey, beamng_level::Report)>,
+    level_error: Option<String>,
+    level_rpm: f32,
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
@@ -51,6 +84,7 @@ impl App {
         cc.egui_ctx.set_style(style);
         let mut app = Self {
             capture: None,
+            capture_level: false,
             capture_requested: false,
             frames: 0,
             params: Parameters::default(),
@@ -70,6 +104,11 @@ impl App {
             seconds: 16.,
             worker: None,
             importer: None,
+            level_worker: None,
+            level_pending: None,
+            level_report: None,
+            level_error: None,
+            level_rpm: 900.,
         };
         if let Some(path) = initial {
             app.import(path, None);
@@ -148,6 +187,26 @@ impl App {
             source: self.bank.as_ref().map(|b| b.source.clone()),
             driving: self.driving,
         }
+    }
+    fn level_key(&self) -> Option<LevelKey> {
+        self.bank
+            .as_deref()
+            .map(|bank| LevelKey::new(bank, self.params, self.settings))
+    }
+    fn start_level_analysis(&mut self) {
+        let Some(bank) = self.bank.clone() else {
+            return;
+        };
+        let key = LevelKey::new(&bank, self.params, self.settings);
+        let (tx, rx) = mpsc::channel();
+        self.level_pending = Some(key);
+        self.level_worker = Some(rx);
+        self.level_error = None;
+        let params = self.params;
+        let settings = self.settings;
+        std::thread::spawn(move || {
+            let _ = tx.send(beamng_level::analyze(bank, params, settings));
+        });
     }
     fn open_project(&mut self, path: &Path) {
         match project::load_project(path) {
@@ -253,7 +312,7 @@ impl App {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    self.audio.is_some(),
+                    self.audio.is_some() && self.level_worker.is_none(),
                     egui::Button::new(if self.playing {
                         "■ Stop"
                     } else {
@@ -274,7 +333,7 @@ impl App {
         });
         slider(
             ui,
-            "Listening / export volume",
+            "Listening / WAV volume",
             &mut self.params.volume,
             0.0..=0.8,
         );
@@ -284,7 +343,7 @@ impl App {
         ui.small("Control listening tests and WAV renders.");
         if ui
             .add_enabled(
-                self.audio.is_some(),
+                self.audio.is_some() && self.level_worker.is_none(),
                 egui::Button::new(if self.playing {
                     "Pause listening"
                 } else {
@@ -503,12 +562,180 @@ fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInc
     wheel_adjust(ui, &mut response, v, min, max);
     response.on_hover_text("Mouse wheel: adjust · Shift + wheel: fine adjustment");
 }
+fn adjacent_level_points(
+    report: &beamng_level::Report,
+    load: f32,
+    rpm: f32,
+) -> Option<(&beamng_level::Point, &beamng_level::Point)> {
+    let row = || {
+        report
+            .points
+            .iter()
+            .filter(|point| (point.load - load).abs() < 0.01)
+    };
+    let lower = row()
+        .filter(|point| point.rpm <= rpm)
+        .max_by(|a, b| a.rpm.total_cmp(&b.rpm))
+        .or_else(|| row().min_by(|a, b| a.rpm.total_cmp(&b.rpm)))?;
+    let upper = row()
+        .filter(|point| point.rpm >= rpm)
+        .min_by(|a, b| a.rpm.total_cmp(&b.rpm))
+        .or_else(|| row().max_by(|a, b| a.rpm.total_cmp(&b.rpm)))?;
+    Some((lower, upper))
+}
+fn level_span(
+    pair: (&beamng_level::Point, &beamng_level::Point),
+    value: fn(&beamng_level::Point) -> f32,
+    unit: &str,
+) -> String {
+    let a = value(pair.0);
+    let b = value(pair.1);
+    if (a - b).abs() < 0.05 {
+        format!("{a:+.1} {unit}")
+    } else {
+        format!("{:+.1} to {:+.1} {unit}", a.min(b), a.max(b))
+    }
+}
+fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32) {
+    let (Some(off), Some(on)) = (
+        adjacent_level_points(report, 0., rpm),
+        adjacent_level_points(report, 1., rpm),
+    ) else {
+        ui.small("The sound bank has no usable off-load and on-load sample rows.");
+        return;
+    };
+    ui.small(format!(
+        "At {rpm:.0} rpm · surrounding export points: {:.0}–{:.0} rpm",
+        off.0.rpm, off.1.rpm
+    ));
+    egui::Grid::new("beamng-export-levels")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("WAV level");
+            ui.strong("Off load");
+            ui.strong("Full load");
+            ui.end_row();
+            for (label, value) in [
+                (
+                    "BESS exhaust vs original",
+                    (|point: &beamng_level::Point| point.exhaust_vs_source_db)
+                        as fn(&beamng_level::Point) -> f32,
+                ),
+                (
+                    "Added engine vs BESS exhaust",
+                    (|point: &beamng_level::Point| point.engine_vs_exhaust_db)
+                        as fn(&beamng_level::Point) -> f32,
+                ),
+            ] {
+                ui.label(label);
+                ui.label(level_span(off, value, "dB"));
+                ui.label(level_span(on, value, "dB"));
+                ui.end_row();
+            }
+        });
+    ui.small("Positive exhaust values are louder than the original WAV at the same RPM and load. Engine and exhaust play from different locations in the vehicle.");
+    ui.collapsing("WAV level details", |ui| {
+        egui::Grid::new("beamng-export-level-details")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("48 kHz / 24-bit WAV");
+                ui.strong("Off load");
+                ui.strong("Full load");
+                ui.end_row();
+                for (label, value) in [
+                    (
+                        "Original exhaust RMS",
+                        (|point: &beamng_level::Point| point.source_rms_dbfs)
+                            as fn(&beamng_level::Point) -> f32,
+                    ),
+                    (
+                        "BESS exhaust RMS",
+                        (|point: &beamng_level::Point| point.exhaust_rms_dbfs)
+                            as fn(&beamng_level::Point) -> f32,
+                    ),
+                    (
+                        "BESS engine RMS",
+                        (|point: &beamng_level::Point| point.engine_rms_dbfs)
+                            as fn(&beamng_level::Point) -> f32,
+                    ),
+                    (
+                        "BESS exhaust peak",
+                        (|point: &beamng_level::Point| point.exhaust_peak_dbfs)
+                            as fn(&beamng_level::Point) -> f32,
+                    ),
+                    (
+                        "BESS engine peak",
+                        (|point: &beamng_level::Point| point.engine_peak_dbfs)
+                            as fn(&beamng_level::Point) -> f32,
+                    ),
+                ] {
+                    ui.label(label);
+                    ui.label(level_span(off, value, "dBFS"));
+                    ui.label(level_span(on, value, "dBFS"));
+                    ui.end_row();
+                }
+            });
+    });
+    ui.small("The added engine emitter uses a -2 dB base gain; the exhaust keeps the original vehicle's gain. BeamNG also applies cabin filtering, exhaust parts, camera distance, and its own mixer, so file levels are not guaranteed in-game loudness.");
+}
+#[cfg(test)]
+mod level_ui_tests {
+    use super::*;
+
+    #[test]
+    fn inspection_rpm_uses_neighboring_export_points_without_interpolating_a_claimed_level() {
+        let point = |rpm, load, delta| beamng_level::Point {
+            rpm,
+            load,
+            source_rms_dbfs: -30.,
+            exhaust_rms_dbfs: -30. + delta,
+            engine_rms_dbfs: -40.,
+            exhaust_peak_dbfs: -5.,
+            engine_peak_dbfs: -8.,
+            exhaust_vs_source_db: delta,
+            engine_vs_exhaust_db: -10.,
+        };
+        let report = beamng_level::Report {
+            safety_gain: 1.,
+            points: vec![
+                point(4989., 0., -1.0),
+                point(5338., 0., 0.5),
+                point(4989., 1., -2.0),
+                point(5338., 1., -0.5),
+            ],
+        };
+        let off = adjacent_level_points(&report, 0., 5200.).unwrap();
+        let on = adjacent_level_points(&report, 1., 5200.).unwrap();
+        assert_eq!((off.0.rpm, off.1.rpm), (4989., 5338.));
+        assert_eq!((on.0.rpm, on.1.rpm), (4989., 5338.));
+        assert_eq!(
+            level_span(off, |point| point.exhaust_vs_source_db, "dB"),
+            "-1.0 to +0.5 dB"
+        );
+        assert_eq!(
+            adjacent_level_points(&report, 0., 700.).unwrap().0.rpm,
+            4989.
+        );
+        assert_eq!(
+            adjacent_level_points(&report, 0., 9000.).unwrap().1.rpm,
+            5338.
+        );
+    }
+}
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(33));
         self.frames += 1;
         if let Some(path) = &self.capture {
-            if self.bank.is_some() && self.frames > 20 && !self.capture_requested {
+            let level_ready = self
+                .level_report
+                .as_ref()
+                .is_some_and(|(key, _)| self.level_key().as_ref() == Some(key));
+            if self.bank.is_some()
+                && self.frames > 20
+                && !self.capture_requested
+                && (!self.capture_level || level_ready)
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
                 self.capture_requested = true;
             }
@@ -541,6 +768,7 @@ impl eframe::App for App {
             }
         }
         if self.audio.is_some()
+            && self.level_worker.is_none()
             && !ctx.wants_keyboard_input()
             && ctx.input(|i| i.key_pressed(egui::Key::Space))
         {
@@ -552,6 +780,7 @@ impl eframe::App for App {
             match result {
                 Ok(v) => {
                     self.params = v.params;
+                    self.level_rpm = v.params.rpm;
                     self.settings = v.settings;
                     self.driving = v.driving;
                     self.bank = Some(v.bank);
@@ -559,6 +788,9 @@ impl eframe::App for App {
                     self.status =
                         "Sound bank ready. Compare Automation Source and BESS enhanced.".into();
                     self.reconnect();
+                    if self.capture_level {
+                        self.start_level_analysis();
+                    }
                 }
                 Err(e) => self.status = format!("Import failed: {e}"),
             }
@@ -569,6 +801,37 @@ impl eframe::App for App {
         {
             self.status = result.unwrap_or_else(|e| format!("Error: {e}"));
             self.worker = None;
+        }
+        if let Some(rx) = &self.level_worker {
+            match rx.try_recv() {
+                Ok(result) => {
+                    let requested = self.level_pending.take();
+                    let still_current = requested.as_ref() == self.level_key().as_ref();
+                    match (requested, result) {
+                        (Some(key), Ok(report)) => {
+                            self.level_report = Some((key, report));
+                            self.level_error = None;
+                            self.status = if still_current {
+                                "BeamNG file level analysis ready.".into()
+                            } else {
+                                "BeamNG level analysis finished for earlier settings. Analyze again."
+                                    .into()
+                            };
+                        }
+                        (_, Err(error)) => {
+                            self.level_error = Some(error);
+                        }
+                        _ => {}
+                    }
+                    self.level_worker = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.level_error = Some("The level analysis stopped unexpectedly.".into());
+                    self.level_pending = None;
+                    self.level_worker = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
         }
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(10.);
@@ -905,7 +1168,54 @@ impl eframe::App for App {
             ui.separator();ui.heading("Export BeamNG");
             ui.small("Adds a BESS configuration to the original Automation vehicle. Keep the original mod enabled.");
             ui.small("Game afterfire, turbo, and startup sounds are preserved; BESS transient effects are not transferred.");
-            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none(),egui::Button::new("Create BeamNG configuration…")).clicked()
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("BeamNG volume estimate");
+                ui.small("Compare the WAV levels BESS will export with the original Automation samples. Listening volume does not change these files.");
+                if ui
+                    .add_enabled(
+                        self.bank.is_some()
+                            && !self.playing
+                            && self.level_worker.is_none()
+                            && self.worker.is_none()
+                            && self.importer.is_none(),
+                        egui::Button::new("Calculate BeamNG level"),
+                    )
+                    .clicked()
+                {
+                    self.start_level_analysis();
+                }
+                if self.level_worker.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Analyzing every RPM and load sample…");
+                    });
+                }
+                if self.playing && self.level_worker.is_none() {
+                    ui.small("Stop listening to calculate; an existing analysis can still follow live RPM.");
+                }
+                if let Some(error) = &self.level_error {
+                    ui.colored_label(Color32::LIGHT_RED, format!("Level analysis: {error}"));
+                }
+                if let Some((measured_key, report)) = &self.level_report {
+                    if self.level_key().as_ref() == Some(measured_key) {
+                        if let Some(bank) = &self.bank {
+                            self.level_rpm = self.level_rpm.clamp(bank.min_rpm, bank.max_rpm);
+                            slider(
+                                ui,
+                                "Inspect at RPM",
+                                &mut self.level_rpm,
+                                bank.min_rpm..=bank.max_rpm,
+                            );
+                            show_level_report(ui, report, self.level_rpm);
+                        }
+                    } else if self.level_worker.is_none() {
+                        ui.small("Sound settings changed. Calculate again for the current export.");
+                    }
+                } else if self.bank.is_some() && self.level_worker.is_none() {
+                    ui.small("Calculate once to inspect both load rows across the imported RPM range.");
+                }
+            });
+            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none()&&self.level_worker.is_none(),egui::Button::new("Create BeamNG configuration…")).clicked()
                 &&let Some(dir)=rfd::FileDialog::new().pick_folder(){
                 let bank=self.bank.clone().unwrap();let p=self.params;let h=self.settings;
                 let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Creating and verifying BeamNG configuration…".into();
@@ -1100,9 +1410,10 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    let capture_level = args.get(1).is_some_and(|arg| arg == "--capture-level");
     let capture = if matches!(
         args.get(1).map(String::as_str),
-        Some("--capture" | "--capture-driving")
+        Some("--capture" | "--capture-driving" | "--capture-level")
     ) {
         args.get(2).map(PathBuf::from)
     } else {
@@ -1119,13 +1430,18 @@ fn main() -> eframe::Result {
         "BESS — Hybrid Synthesis",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1180., 860.])
+                .with_inner_size(if capture_level {
+                    [1180., 1400.]
+                } else {
+                    [1180., 860.]
+                })
                 .with_min_inner_size([960., 720.]),
             ..Default::default()
         },
         Box::new(move |cc| {
             let mut app = App::new(cc, initial);
             app.capture = capture;
+            app.capture_level = capture_level;
             Ok(Box::new(app))
         }),
     )

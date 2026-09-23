@@ -288,6 +288,18 @@ fn pcm24(samples: &[f32], gain: f32) -> Result<Vec<u8>, String> {
     Ok(wav.into_inner())
 }
 
+pub(crate) fn engine_stem_gain(
+    exhaust_rms: f32,
+    engine_rms: f32,
+    engine_peak: f32,
+    load: f32,
+) -> f32 {
+    let target_ratio = if load == 0. { 0.35 } else { 0.55 };
+    (target_ratio * exhaust_rms / engine_rms)
+        .clamp(0.25, 12.)
+        .min(0.94 / engine_peak)
+}
+
 fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> {
     let source_hash = sha256_file(source)?;
     let processed_hash = sha256_file(processed)?;
@@ -526,10 +538,7 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         // The engine-side signal is inferred from an exhaust recording. A
         // fixed row-wide gain made some RPM knots dominate the sound. Balance
         // each knot, but never rescue a weak proxy with an enormous boost.
-        let target_ratio = if *load == 0. { 0.35 } else { 0.55 };
-        let gain = (target_ratio * exhaust_rms / engine_rms)
-            .clamp(0.25, 12.)
-            .min(0.94 / engine_peak);
+        let gain = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, *load);
         let ratio = gain * engine_rms / exhaust_rms;
         engine_gains.push(gain);
         engine_ratios.push(ratio);

@@ -125,6 +125,10 @@ fn aligned_warmup_frames(rpm: f32) -> usize {
     (warmup_cycles * 120. * 48000. / rpm as f64).round() as usize
 }
 
+pub(crate) fn exhaust_safety_gain(peak: f32) -> f32 {
+    (0.95 / peak).min(1.)
+}
+
 pub(crate) fn loop_stems(
     bank: Arc<Bank>,
     p: Parameters,
@@ -287,7 +291,7 @@ fn package_inner(
     if !peak.is_finite() || peak < 1e-8 || replacements.values().flatten().any(|v| !v.is_finite()) {
         return Err("Silent or non-finite rendering".into());
     }
-    let gain = (0.95 / peak).min(1.);
+    let gain = exhaust_safety_gain(peak);
     let zip_name = package_name(&bank);
     fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
     let result = (|| -> Result<String, String> {
