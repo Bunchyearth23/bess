@@ -2,13 +2,13 @@
 
 ## BeamNG installation
 
-The active `D:\BeamMP\current\mods` folder contains twelve original Automation vehicle ZIPs and twelve matching R6 BESS configuration add-ons. Eleven older dual-layer add-ons were moved to `D:\BeamMP\current\BESS-dual-layer-variants-backup-before-r6-20260923`; the existing R6 Cerberus add-on stayed in place. All twenty-four active ZIPs passed CRC checks. The twelve original and twelve R6 SHA-256 hashes match the release manifest; the old add-on hashes match the earlier installation manifest. The detailed local record is `output/beamng-r6-fleet-install-20260923/installation.json`.
+The active `D:\BeamMP\current\mods` folder contains twelve original Automation vehicle ZIPs and twelve matching R6 BESS configuration add-ons. Eleven older dual-layer add-ons were moved to `D:\BeamMP\current\BESS-dual-layer-variants-backup-before-r6-20260923`; the existing R6 Cerberus add-on stayed in place. All twenty-four active ZIPs passed CRC checks. The twelve original and twelve R6 SHA-256 hashes match the local R6 verification records; the old add-on hashes match the earlier installation manifest. The detailed local record is `output/beamng-r6-fleet-install-20260923/installation.json`. These vehicles remain local and are not part of a public download.
 
 BeamNG shut down normally before installation. The new files are ready for its next launch, but this installation has not been observed in a running game. It does not establish their audible balance or naturalness.
 
 ## Release assets
 
-`tools/package_090.py` copies the twelve verified R6 add-on ZIPs byte for byte and packages them beside the twelve original vehicle ZIPs. It updates only the adjacent portable manifests and project paths to version 0.9.0, preserving the original export version as provenance. The package has 1,376 nonempty mono 48 kHz / 24-bit PCM sound loops. `tools/verify_delivery_090.py` checked twelve source/add-on pairs, ZIP CRCs, disjoint paths, 128 file hashes, 41 start-page links, local README links, and standalone executable equivalence.
+The first 0.9.0 portable archive included the twelve development vehicles and their R6 add-ons. It was withdrawn after the user clarified that test vehicles must not be distributed. `tools/package_090.py` now builds an application-only archive with `BESS.exe`, a generic English `START.html`, README, release notes, and file hashes. `tools/verify_delivery_090.py` checks the complete allow-list, links, hashes, outer ZIP integrity, and standalone executable equivalence, and rejects vehicle archives, WAVs, projects, or other bundled test media. The older 0.8.4 portable archive was also withdrawn because it contained vehicle exports; its standalone executable remains available.
 
 The asset SHA-256 values are provided in the adjacent `.sha256` sidecars so they can be verified independently of this document.
 

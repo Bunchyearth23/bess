@@ -6,14 +6,14 @@ The **BeamNG volume estimate** panel measures the exact exported 48 kHz / 24-bit
 
 ## Windows downloads
 
-- `BESS-0.9.0-Windows-Portable.zip`: application, twelve Automation source vehicles, and twelve matching `(BESS)` configuration add-ons, with installation instructions and verification hashes.
+- `BESS-0.9.0-Windows-Portable.zip`: application, English setup instructions, release notes, and verification hashes. No test vehicles, sound banks, projects, or prepared vehicle add-ons are included.
 - `BESS-0.9.0-Windows.exe`: standalone application. Import your own Automation vehicle ZIP and use **Create BeamNG configuration** to make its add-on.
 
-For a supplied vehicle, install its original ZIP and matching BESS add-on ZIP together in BeamNG's `mods` folder. If the original is already installed, keep it and install only the BESS add-on. Remove an older BESS add-on for the same vehicle before enabling the new one; do not keep two `(BESS)` variants for one trim. Select the `(BESS)` configuration in BeamNG's vehicle selector. The add-on does not change vehicle physics.
+Install your own original Automation vehicle ZIP and the BESS add-on you export from it together in BeamNG's `mods` folder. If the original is already installed, keep it and install only the BESS add-on. Remove an older BESS add-on for the same vehicle before enabling the new one; do not keep two `(BESS)` variants for one trim. Select the `(BESS)` configuration in BeamNG's vehicle selector. The add-on does not change vehicle physics.
 
 ## Verification and limits
 
-The twelve add-ons contain 688 engine-side and 688 exhaust WAVs, all mono 48 kHz / 24-bit PCM. Their ZIP contents, unique paths, source hashes, and separation from the original vehicle files were checked. The Rust tests and strict Clippy checks pass. The Cerberus export-level analysis matches the actual exported WAV measurements across all 66 RPM/load points.
+Development checks on twelve local vehicles covered 1,376 mono 48 kHz / 24-bit PCM WAVs, ZIP integrity, unique paths, source hashes, and separation from the originals. Those vehicle files are not distributed. The 55 Rust tests and strict Clippy checks pass. A 66-point export-level analysis matched actual exported WAV measurements.
 
 The new mechanical layer has not yet received a user listening verdict in BeamNG. Some vehicles have a quiet inferred engine layer because BESS limits amplification of weak source detail. A simulated Cerberus adjacent-RPM crossfade shows a possible level dip around 5,200 RPM; BeamNG's actual crossfade and the audible result still need an in-game check. The live A/B audition is a mixed preview and does not reproduce BeamNG's separate engine-bay and tailpipe emitters.
 

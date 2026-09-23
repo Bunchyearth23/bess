@@ -1,14 +1,14 @@
 # BESS 0.8.4
 
+The former portable archive was withdrawn because it included development vehicle exports and listening files. Only the standalone `BESS-0.8.4-English.exe` remains available. For a current portable application without test vehicles, use [BESS 0.9.0](https://github.com/Bunchyearth23/bess/releases/tag/v0.9.0).
+
 BESS 0.8.4 improves the Cerberus sound around 5,200 RPM. Prepared source loops now play continuously, and neighboring RPM samples share a consistent cycle duration. This reduces the repeated level jumps heard at steady RPM.
 
 The application, generated pages, export instructions, and public documentation are in English. Live playback prefers 48 kHz when supported by the output device. Exported WAV files are mono 48 kHz / 24-bit PCM.
 
-## Portable Windows package
+## Windows download
 
-Download `BESS-0.8.4-Windows-Portable.zip`, extract the entire folder, and open `START.html`. It includes `BESS.exe`, twelve Automation source archives, A/B/C listening comparisons, six focused Cerberus clips, and twelve BeamNG vehicle copies.
-
-The source ZIPs and BeamNG copies are release assets rather than files in the Git checkout. Keep the extracted folder together so the included projects can resolve their relative source paths.
+Download `BESS-0.8.4-English.exe` to run this historical version. Import your own Automation vehicle ZIP. No example vehicle or prepared sound package is distributed with this release.
 
 The BDSP source dependency is currently private. Building BESS from this public Git checkout requires access to BDSP; the packaged Windows executable runs without it.
 

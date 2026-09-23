@@ -27,7 +27,7 @@ BESS uses the default Windows audio device. It prefers a 48 kHz floating-point o
 
 ## 0.9.0 delivery
 
-The portable v0.9.0 release contains the Windows application, twelve Automation source vehicle ZIPs, and twelve matching BESS configuration add-ons. Keep an original vehicle ZIP enabled beside its BESS add-on. Select the trim marked **(BESS)** in BeamNG; the original trim remains available. The source vehicles and sound banks are release assets rather than files in this source checkout. The [final test guide](docs/FINAL-TESTS.md) covers listening and BeamNG.
+The portable v0.9.0 release contains the Windows application and its instructions. It does not include test vehicles, sound banks, sample projects, or prepared BeamNG add-ons. Import your own Automation vehicle ZIP into BESS, then export a matching BESS configuration add-on. Keep your original vehicle ZIP enabled beside that add-on in BeamNG. Select the trim marked **(BESS)**; the original trim remains available.
 
 In **Engine and combustion**, enable a configuration only when the engine data are known: cylinder count, angles over 720°, force, pressure duration and exhaust-opening delay. The initial evenly spaced angles are not a manufacturer's firing order. These additions are optional and also controlled by **Added color**. If an Automation `.car` sheet matches the audio blend, active engine and JBeam, BESS shows its declared cylinder count and layout. It does not infer firing order or bank phasing. Optional activation suggests the declared count when available.
 
@@ -39,7 +39,7 @@ Before exporting, use **Calculate BeamNG level** in the BeamNG export panel. BES
 
 ## Settings and comparisons
 
-The 0.9.0 portable package focuses on the application and selectable BeamNG variants. The earlier 0.8.4 release retains its A/B/C listening comparisons and reopenable projects. Those older comparisons do not represent the new two-layer BeamNG export. Measurements describe signal differences; only listening can judge naturalness.
+The 0.9.0 portable package contains no example vehicles or listening corpus. Use your own Automation exports for A/B listening and BeamNG configurations. Measurements describe signal differences; only listening can judge naturalness.
 
 `output/corpus-0.8.0/index.html` compares twelve vehicles: A source and B with the automatic 0.8 preset. All twelve B tracks are identical to 0.7 because no engine configuration is assumed. Three dedicated clips demonstrate optional combustion. Hover over a slider and turn the **mouse wheel** to adjust it; **Shift + wheel** makes finer adjustments. Elsewhere, the wheel scrolls the panel.
 
@@ -103,4 +103,4 @@ The imported bank remains dominant. Intake and mechanical layers are reconstruct
 
 Profile alignment is an initial loop preparation, not the full PSOLA algorithm described in the research. A file with multiple blends is refused until explicit blend selection is available. Per-bank headers and automatic part identification are outside the current model. Explicit combustion remains a phenomenological excitation without thermodynamic pressure calculation. Driving-history effects require more than static exported loops. Listening and real BeamNG operation still need validation.
 
-[Research and roadmap](docs/ENGINE-SOUND-RESEARCH.md) · [Project index](docs/INDEX.md).
+[Research and roadmap](https://github.com/Bunchyearth23/bess/blob/main/docs/ENGINE-SOUND-RESEARCH.md) · [Project index](https://github.com/Bunchyearth23/bess/blob/main/docs/INDEX.md).
