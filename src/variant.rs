@@ -313,10 +313,43 @@ pub(crate) fn engine_stem_gain(
         .min(0.94 / engine_peak)
 }
 
-fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> {
+fn profile_identity(name: &str) -> Result<String, String> {
+    crate::project::validate_profile_name(name)?;
+    let name = name.trim();
+    let mut slug = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('_') && !slug.is_empty() {
+            slug.push('_');
+        }
+        if slug.len() >= 24 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('_');
+    let slug = if slug.is_empty() { "profile" } else { slug };
+    let hash = Sha256::digest(name.as_bytes());
+    Ok(format!(
+        "{slug}_{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2]
+    ))
+}
+
+fn build(
+    source: &Path,
+    processed: &Path,
+    dir: &Path,
+    profile: Option<&str>,
+) -> Result<String, String> {
     let source_hash = sha256_file(source)?;
     let processed_hash = sha256_file(processed)?;
     let short = &processed_hash[..10];
+    let suffix = if let Some(name) = profile {
+        format!("{short}_{}", profile_identity(name)?)
+    } else {
+        short.to_owned()
+    };
     let processed_manifest = processed
         .parent()
         .unwrap_or(Path::new("."))
@@ -383,12 +416,12 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         .next()
         .and_then(|base| base.strip_suffix(".sfxBlend2D.json"))
         .ok_or("Invalid source blend name")?;
-    let new_sample = format!("{old_sample}_BESS_{short}");
-    let engine_sample = format!("{old_sample}_BESS_ENGINE_{short}");
-    let config_id = format!("bess_{old_config}_{short}");
+    let new_sample = format!("{old_sample}_BESS_{suffix}");
+    let engine_sample = format!("{old_sample}_BESS_ENGINE_{suffix}");
+    let config_id = format!("bess_{old_config}_{suffix}");
     let config_path = format!("{root}{config_id}.pc");
     let info_path = format!("{root}info_{config_id}.json");
-    let engine_path = format!("{root}bess_engine_{short}.jbeam");
+    let engine_path = format!("{root}bess_engine_{suffix}.jbeam");
     let blend_path = format!("art/sound/blends/{new_sample}.sfxBlend2D.json");
     let engine_blend_path = format!("art/sound/blends/{engine_sample}.sfxBlend2D.json");
 
@@ -414,7 +447,7 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         .as_str()
         .ok_or("Original configuration has no Camso_Engine part")?
         .to_owned();
-    let new_part = format!("{old_part}_BESS_{short}");
+    let new_part = format!("{old_part}_BESS_{suffix}");
     config["parts"]["Camso_Engine"] = json!(new_part);
     let config_bytes = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
     let mut info: Value = serde_json::from_slice(&read(&mut original, &source_info, MAX_META)?)
@@ -422,7 +455,11 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
     let base_name = info["Configuration"]
         .as_str()
         .ok_or("Original configuration has no display name")?;
-    let display_name = format!("{base_name} (BESS)");
+    let display_name = if let Some(name) = profile {
+        format!("{base_name} (BESS - {})", name.trim())
+    } else {
+        format!("{base_name} (BESS)")
+    };
     info["Configuration"] = json!(display_name);
     let info_bytes = serde_json::to_vec_pretty(&info).map_err(|e| e.to_string())?;
     let engine_bytes = clone_engine_part(
@@ -586,7 +623,7 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         return Err("Empty blend load layer".into());
     }
 
-    let zip_file = format!("bess-variant-{vehicle}-{short}.zip");
+    let zip_file = format!("bess-variant-{vehicle}-{suffix}.zip");
     let partial = dir.join(format!("{zip_file}.partial"));
     let mut output = ZipWriter::new(File::create(&partial).map_err(|e| e.to_string())?);
     write_file(&mut output, &config_path, &config_bytes)?;
@@ -635,6 +672,7 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         "wav_paths":wav_paths,
         "engine_wav_paths":engine_wav_paths,
         "display_name":display_name,
+        "profile_name":profile,
         "engine_part":new_part,
         "sample_id":new_sample,
         "engine_sample_id":engine_sample,
@@ -661,7 +699,19 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         .unwrap_or(Path::new("."))
         .join("settings.bess.json");
     if source_settings.is_file() {
-        fs::copy(source_settings, dir.join("settings.bess.json")).map_err(|e| e.to_string())?;
+        let settings_path = dir.join("settings.bess.json");
+        fs::copy(source_settings, &settings_path).map_err(|e| e.to_string())?;
+        if let Some(name) = profile {
+            let mut project: Value =
+                serde_json::from_slice(&fs::read(&settings_path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            project["profile_name"] = json!(name.trim());
+            fs::write(
+                settings_path,
+                serde_json::to_vec_pretty(&project).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
     fs::write(
         dir.join("INSTALLATION.txt"),
@@ -674,7 +724,7 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
 /// Convert a verified BESS full-vehicle render into an additive BeamNG configuration.
 pub fn convert(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> {
     fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
-    let result = build(source, processed, dir);
+    let result = build(source, processed, dir, None);
     if let Err(error) = &result {
         let _ = fs::write(dir.join("ERROR.txt"), error);
     }
@@ -683,13 +733,35 @@ pub fn convert(source: &Path, processed: &Path, dir: &Path) -> Result<String, St
 
 /// Render and export the default GUI format: one additive BESS configuration.
 pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Result<String, String> {
+    package_with_profile(dir, p, h, bank, None)
+}
+
+/// Export a named, independently selectable sound profile for the vehicle.
+pub fn package_named(
+    dir: &Path,
+    p: Parameters,
+    h: Settings,
+    bank: Arc<Bank>,
+    profile: &str,
+) -> Result<String, String> {
+    profile_identity(profile)?;
+    package_with_profile(dir, p, h, bank, Some(profile))
+}
+
+fn package_with_profile(
+    dir: &Path,
+    p: Parameters,
+    h: Settings,
+    bank: Arc<Bank>,
+    profile: Option<&str>,
+) -> Result<String, String> {
     fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
     let h = h.for_beamng_export();
     let staging = dir.join(".bess-render");
     let result = (|| {
         export::package_exhaust_stem(&staging, p, h, bank.clone())?;
         let processed = staging.join(export::package_name(&bank));
-        let zip_file = build(Path::new(&bank.source.archive), &processed, dir)?;
+        let zip_file = build(Path::new(&bank.source.archive), &processed, dir, profile)?;
         let manifest_path = dir.join("manifest.json");
         let mut manifest: Value =
             serde_json::from_slice(&fs::read(&manifest_path).map_err(|e| e.to_string())?)
@@ -722,6 +794,17 @@ pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_profiles_are_distinct_and_path_safe() {
+        let raw = profile_identity("Raw").unwrap();
+        let smooth = profile_identity("Smooth").unwrap();
+        assert_ne!(raw, smooth);
+        assert_eq!(raw, profile_identity("Raw").unwrap());
+        assert!(raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        assert!(profile_identity("../bad").is_err());
+        assert!(profile_identity(" ").is_err());
+    }
 
     #[test]
     fn rejected_period_cannot_receive_a_normal_engine_stem_balance() {

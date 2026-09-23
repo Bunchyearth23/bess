@@ -126,7 +126,10 @@ fn rms_diff(a: &[f32], b: &[f32]) -> f64 {
 fn reconstructed_engine_stem_is_distinct_and_preserves_audition_mix() {
     let bank = fixture();
     let p = params();
-    let h = Settings::default();
+    let h = Settings {
+        source_timbre: 1.,
+        ..Settings::default()
+    };
     let mut normal = Hybrid::new(48000, p, h, Some(bank.clone()));
     let mut split = Hybrid::new(48000, p, h, Some(bank.clone()));
     let mut engine_energy = 0.;
@@ -159,6 +162,76 @@ fn reconstructed_engine_stem_is_distinct_and_preserves_audition_mix() {
     for _ in 0..48000 {
         assert_eq!(split.next_stems(true).engine, 0.);
     }
+}
+
+#[test]
+fn source_timbre_extremes_change_standard_resynthesis_without_changing_reference() {
+    let bank = fixture();
+    let p = params();
+    let mut retained = Hybrid::new(
+        48_000,
+        p,
+        Settings {
+            source_timbre: 1.,
+            ..Settings::default()
+        },
+        Some(bank.clone()),
+    );
+    let mut rebuilt = Hybrid::new(
+        48_000,
+        p,
+        Settings {
+            source_timbre: 0.,
+            ..Settings::default()
+        },
+        Some(bank),
+    );
+    let mut difference = 0.;
+    let mut energy = 0.;
+    for i in 0..48_000 {
+        let a = retained.next_stems(true);
+        let b = rebuilt.next_stems(true);
+        assert_eq!(a.source_reference, b.source_reference);
+        assert!(b.mixed.is_finite() && b.engine.is_finite());
+        if i >= 24_000 {
+            difference += (a.mixed - b.mixed).powi(2);
+            energy += b.mixed.powi(2);
+        }
+    }
+    assert!(
+        difference > 0.01,
+        "Timbre control made no audible-level change"
+    );
+    assert!(energy > 0.01, "Reconstructed engine is silent");
+}
+
+#[test]
+fn source_timbre_and_named_profile_validate_and_round_trip() {
+    let mut setting = Settings {
+        source_timbre: -0.01,
+        ..Settings::default()
+    };
+    assert!(setting.validate().is_err());
+    setting.source_timbre = 1.01;
+    assert!(setting.validate().is_err());
+    setting.source_timbre = 0.37;
+    assert!(setting.validate().is_ok());
+    assert!(project::validate_profile_name("Natural").is_ok());
+    assert!(project::validate_profile_name("Raw / Open").is_err());
+    let p = Project {
+        version: 3,
+        parameters: params(),
+        hybrid: setting,
+        source: None,
+        driving: Default::default(),
+        profile_name: "My raw tune".into(),
+    };
+    let path = std::env::temp_dir().join(format!("bess-profile-{}.json", std::process::id()));
+    project::save_project(&path, &p).unwrap();
+    let reopened = project::load_project(&path).unwrap();
+    assert_eq!(reopened.profile_name, p.profile_name);
+    assert_eq!(reopened.hybrid.source_timbre, setting.source_timbre);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -198,6 +271,51 @@ fn procedural_mode_preserves_source_a_and_generates_a_distinct_b() {
     }
     assert!(source_energy > 1e-6 && generated_energy > 1e-6);
     assert!(difference > source_energy * 0.25);
+}
+
+#[test]
+fn b5_a_early_recording_peak_no_longer_overpowers_b_modes_when_available() {
+    let path = std::path::Path::new("cars/bunchyearth23_b5_a.zip");
+    if !path.exists() {
+        return;
+    }
+    let bank = Arc::new(Bank::load(path, None).unwrap());
+    let level = |rpm: f32, load: f32, procedural: bool| {
+        let p = Parameters {
+            rpm,
+            load,
+            cylinders: bank.engine_meta.as_ref().map_or(4, |meta| meta.cylinders),
+            brightness: 10_000.,
+            exhaust: 1.,
+            intake: 0.25,
+            mechanical: 0.12,
+            ..Parameters::default()
+        };
+        let h = Settings {
+            procedural,
+            ..Settings::calibrated(&bank)
+        };
+        let mut voice = Hybrid::new(48_000, p, h, Some(bank.clone()));
+        let mut energy = 0.;
+        for i in 0..4 * 48_000 {
+            let sample = voice.next_stems(true).mixed as f64;
+            if i >= 3 * 48_000 {
+                energy += sample * sample;
+            }
+        }
+        (energy / 48_000.).sqrt()
+    };
+    for load in [0.12, 0.65] {
+        for procedural in [false, true] {
+            let early = level(1052., load, procedural);
+            let middle = level(3000., load, procedural);
+            assert!(early > 0.001 && middle > 0.001);
+            assert!(
+                early < middle * 1.15,
+                "B5 A load={load} procedural={procedural}: {early} vs {middle}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -328,12 +446,14 @@ fn imported_bank_and_project_retain_provenance() {
             resistance_nm: 450.,
             ..Default::default()
         },
+        profile_name: "Test profile".into(),
     };
     project::save_project(&path, &p).unwrap();
     let read = project::load_project(&path).unwrap();
     assert_eq!(read.hybrid, p.hybrid);
     assert_eq!(read.source, p.source);
     assert_eq!(read.driving, p.driving);
+    assert_eq!(read.profile_name, p.profile_name);
     std::fs::remove_file(path).unwrap();
 }
 #[test]
@@ -591,6 +711,7 @@ fn timbre_maps_change_selected_regions_and_roundtrip() {
         hybrid: h,
         source: Some(bank.source.clone()),
         driving: Default::default(),
+        profile_name: project::default_profile_name(),
     };
     project::save_project(&path, &project).unwrap();
     assert_eq!(project::load_project(&path).unwrap().hybrid.maps, h.maps);

@@ -493,6 +493,7 @@ fn package_inner(
                 hybrid: h,
                 source: Some(bank.source.clone()),
                 driving: Default::default(),
+                profile_name: crate::project::default_profile_name(),
             },
         )?;
         let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"render_channel":if exhaust_only {"exhaust"} else {"mixed"},"exhaust_level_reference":if exhaust_only && h.procedural {"estimated post-80-Hz low-cut RMS; absolute PCM peak still bounds gain"} else {"unfiltered AC RMS"},"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});

@@ -199,7 +199,10 @@ pub fn steady_procedural_comparison(
             target_rms = rms;
         } else {
             let gain = target_rms / rms.max(1e-9);
-            if gain > 8. {
+            // A bank with an extreme early-RPM source level can legitimately
+            // need a large audition-only gain after B's level correction.
+            // The shared peak safety factor below still bounds every file.
+            if rms < 1e-5 || gain > 64. {
                 return Err(format!("{name} is too quiet for a reliable level match"));
             }
             for sample in &mut samples {
@@ -281,6 +284,7 @@ pub fn characters(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
                     mode: Mode::Cycle,
                     ..Default::default()
                 },
+                profile_name: crate::project::default_profile_name(),
             },
         )?;
     }
@@ -355,6 +359,7 @@ pub fn drive_demo(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
                 hybrid: settings,
                 source: Some(bank.source.clone()),
                 driving: c,
+                profile_name: crate::project::default_profile_name(),
             },
         )?;
     }

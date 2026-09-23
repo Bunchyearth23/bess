@@ -54,6 +54,9 @@ pub struct Settings {
     pub rpm_character: f32,
     pub load_character: f32,
     pub coloration: f32,
+    /// How much of Automation's waveform character feeds standard BESS. At
+    /// zero, only descriptor-derived excitation enters its acoustic paths.
+    pub source_timbre: f32,
     pub combustion: crate::combustion::Combustion,
 }
 impl Default for Settings {
@@ -92,6 +95,7 @@ impl Default for Settings {
             rpm_character: 0.,
             load_character: 0.,
             coloration: 1.,
+            source_timbre: 0.45,
             combustion: Default::default(),
         }
     }
@@ -127,6 +131,7 @@ impl Settings {
             turbo: 0.,
             // The acoustic path now carries a clear part of the output.
             coloration: 0.6 + 0.1 * (1. - periodic),
+            source_timbre: 0.45,
             cycle_life: 0.5,
             pulse_texture: 0.55,
             pressure_shape: 0.5 - 0.3 * bright,
@@ -146,6 +151,7 @@ impl Settings {
                 generated_edge: 0.72,
                 generated_flow: 0.7,
                 generated_mechanics: 0.75,
+                source_timbre: 0.6,
                 ..base
             },
             2 => Self {
@@ -159,6 +165,7 @@ impl Settings {
                 generated_edge: 1.2,
                 generated_flow: 1.15,
                 generated_mechanics: 1.05,
+                source_timbre: 0.25,
                 ..base
             },
             3 => Self {
@@ -171,6 +178,7 @@ impl Settings {
                 generated_edge: 0.78,
                 generated_flow: 0.8,
                 generated_mechanics: 0.85,
+                source_timbre: 0.5,
                 ..base
             },
             4 => Self {
@@ -181,6 +189,7 @@ impl Settings {
                 generated_edge: 0.9,
                 generated_flow: 0.75,
                 generated_mechanics: 1.5,
+                source_timbre: 0.4,
                 ..base
             },
             5 => Self {
@@ -192,6 +201,7 @@ impl Settings {
                 generated_edge: 1.15,
                 generated_flow: 1.35,
                 generated_mechanics: 1.05,
+                source_timbre: 0.2,
                 ..base
             },
             _ => base,
@@ -250,6 +260,7 @@ impl Settings {
             self.airbox,
             self.fuel_cut,
             self.coloration,
+            self.source_timbre,
             self.cycle_life,
             self.pulse_texture,
             self.pressure_shape,
@@ -444,8 +455,8 @@ impl MechanicalImpacts {
             seed: 0x4D45_4348_414E_4943,
             delay: 0,
             pending: 0.,
-            cover: StateVariableFilter::new(rate, 2200., 0.65, SvfMode::Bandpass),
-            block: StateVariableFilter::new(rate, 850., 0.65, SvfMode::Bandpass),
+            cover: StateVariableFilter::new(rate, 1200., 0.65, SvfMode::Bandpass),
+            block: StateVariableFilter::new(rate, 500., 0.65, SvfMode::Bandpass),
         }
     }
 
@@ -519,6 +530,96 @@ impl TransitionLevel {
     }
 }
 
+/// A bounded B-only correction for banks whose early WAVs have a large
+/// recording-level jump relative to the rest of the RPM range.
+struct RpmBalance {
+    layers: [Vec<(f32, f32)>; 2],
+}
+
+impl RpmBalance {
+    fn for_bank(bank: &Bank) -> Self {
+        let points = std::array::from_fn(|layer| {
+            bank.layers[layer]
+                .iter()
+                .map(|sample| (sample.rpm, sample.rms))
+                .collect()
+        });
+        Self::from_points(points)
+    }
+
+    fn from_points(points: [Vec<(f32, f32)>; 2]) -> Self {
+        if points.iter().any(|layer| layer.len() < 4) {
+            return Self {
+                layers: points.map(|layer| layer.into_iter().map(|(rpm, _)| (rpm, 1.)).collect()),
+            };
+        }
+        let references = points.each_ref().map(|layer| {
+            let mut upper = layer[layer.len() / 2..]
+                .iter()
+                .map(|(_, rms)| *rms)
+                .collect::<Vec<_>>();
+            upper.sort_by(f32::total_cmp);
+            upper[upper.len() / 2].max(1e-6)
+        });
+        let abnormal_both = points.iter().enumerate().all(|(index, layer)| {
+            let early_end = layer[0].0 + 600.;
+            let early_max = layer
+                .iter()
+                .filter(|(rpm, _)| *rpm <= early_end)
+                .map(|(_, rms)| *rms)
+                .fold(0., f32::max);
+            early_max > references[index] * 2.5
+        });
+        let layers = std::array::from_fn(|index| {
+            let layer = &points[index];
+            let release_begin = layer[0].0 + 600.;
+            // Release across the lower operating range rather than at the
+            // median knot; an early release creates a new level hump near
+            // 1,900 rpm in banks with a broad low-RPM recording spike.
+            let release_end = layer
+                .last()
+                .unwrap()
+                .0
+                .min(layer[0].0 + 2200.)
+                .max(release_begin + 1.);
+            layer
+                .iter()
+                .map(|&(rpm, rms)| {
+                    let gain = if abnormal_both {
+                        let t = ((release_end - rpm) / (release_end - release_begin)).clamp(0., 1.);
+                        let weight = t * t * (3. - 2. * t);
+                        let cap = (references[index] * 0.5 / rms.max(1e-6)).min(1.);
+                        1. - weight * (1. - cap)
+                    } else {
+                        1.
+                    };
+                    (rpm, gain)
+                })
+                .collect()
+        });
+        Self { layers }
+    }
+
+    fn at(&self, rpm: f32, load: f32) -> f32 {
+        let layer_gain = |layer: &Vec<(f32, f32)>| {
+            if layer.is_empty() {
+                return 1.;
+            }
+            let upper = layer
+                .partition_point(|point| point.0 < rpm)
+                .min(layer.len() - 1);
+            let lower = upper.saturating_sub(1);
+            if lower == upper {
+                return layer[upper].1;
+            }
+            let t = ((rpm - layer[lower].0) / (layer[upper].0 - layer[lower].0)).clamp(0., 1.);
+            layer[lower].1 + (layer[upper].1 - layer[lower].1) * t
+        };
+        let low = layer_gain(&self.layers[0]);
+        low + (layer_gain(&self.layers[1]) - low) * load.clamp(0., 1.)
+    }
+}
+
 pub struct Hybrid {
     bank: Option<Arc<Bank>>,
     fallback: Option<Engine>,
@@ -542,6 +643,8 @@ pub struct Hybrid {
     low: StateVariableFilter,
     high: StateVariableFilter,
     intake: StateVariableFilter,
+    intake_warm: StateVariableFilter,
+    mechanical_warm: StateVariableFilter,
     muffler: StateVariableFilter,
     exhaust_line: Exhaust,
     intake_runner: Intake,
@@ -550,6 +653,7 @@ pub struct Hybrid {
     engine_dc: StateVariableFilter,
     engine_texture: StateVariableFilter,
     engine_air_band: StateVariableFilter,
+    mechanical_impact_band: StateVariableFilter,
     engine_stem_dc: StateVariableFilter,
     mechanical_impacts: MechanicalImpacts,
     mechanical_source_energy: f32,
@@ -559,6 +663,8 @@ pub struct Hybrid {
     raw_energy: f32,
     wet_energy: f32,
     compensation: f32,
+    rpm_balance: RpmBalance,
+    balance_gain: f32,
     transient: f32,
     crackle: f32,
     crackle_age: f32,
@@ -618,6 +724,11 @@ impl Hybrid {
         let procedural_voice = bank
             .as_ref()
             .map(|bank| ProceduralVoice::new(rate, bank.procedural_model(), procedural_cylinders));
+        let rpm_balance = bank.as_ref().map_or_else(
+            || RpmBalance::from_points([Vec::new(), Vec::new()]),
+            |bank| RpmBalance::for_bank(bank),
+        );
+        let balance_gain = rpm_balance.at(p.rpm, p.load);
         Self {
             bank,
             fallback,
@@ -640,7 +751,9 @@ impl Hybrid {
             noise: Noise::with_seed(NoiseColor::White, 0xB355),
             low: filter(240., 0.707, SvfMode::Lowpass),
             high: filter(1800., 0.707, SvfMode::Highpass),
-            intake: filter(1300., 0.8, SvfMode::Bandpass),
+            intake: filter(900., 0.8, SvfMode::Bandpass),
+            intake_warm: filter(1200., 0.707, SvfMode::Lowpass),
+            mechanical_warm: filter(1300., 0.707, SvfMode::Lowpass),
             muffler: filter(10000., 0.707, SvfMode::Lowpass),
             exhaust_line: Exhaust::new(rate, geometry(p, h)),
             intake_runner: Intake::new(rate, h.intake_length),
@@ -648,7 +761,8 @@ impl Hybrid {
             dc: filter(18., 0.707, SvfMode::Highpass),
             engine_dc: filter(18., 0.707, SvfMode::Highpass),
             engine_texture: filter(200., 0.707, SvfMode::Highpass),
-            engine_air_band: filter(3600., 0.707, SvfMode::Lowpass),
+            engine_air_band: filter(1800., 0.707, SvfMode::Lowpass),
+            mechanical_impact_band: filter(1400., 0.707, SvfMode::Lowpass),
             engine_stem_dc: filter(18., 0.707, SvfMode::Highpass),
             mechanical_impacts: MechanicalImpacts::new(rate, mechanical_cylinders),
             mechanical_source_energy: 0.,
@@ -658,6 +772,8 @@ impl Hybrid {
             raw_energy: 0.001,
             wet_energy: 0.001,
             compensation: 1.,
+            rpm_balance,
+            balance_gain,
             transient: 0.,
             crackle: 0.,
             crackle_age: 1.,
@@ -741,8 +857,13 @@ impl Hybrid {
             .next(self.p.rpm, self.fast_load, self.wet_cycle);
         // The neutral preset leaves the R8 generator unchanged. Other presets
         // adjust broad components, not the measured firing-order phases.
-        let low_tone = self.low.next_sample(generated.exhaust_tone);
-        let base_exhaust = generated.exhaust_tone
+        // A rising load briefly increases cylinder pressure before the slow
+        // level follower catches up. This restores an impact to a throttle
+        // application without adding a sustained bass oscillator or hiss.
+        let pressure =
+            generated.exhaust_tone * (1. + self.transient * (0.9 + self.current.attack * 0.8));
+        let low_tone = self.low.next_sample(pressure);
+        let base_exhaust = pressure
             + (self.current.generated_body - 1.) * low_tone
             + generated.exhaust_texture * self.current.generated_flow;
         let upper = self.high.next_sample(base_exhaust);
@@ -779,16 +900,18 @@ impl Hybrid {
             };
             self.compensation += (target - self.compensation) * (64. / (self.rate * 0.2));
         }
-        let out = self
-            .transition_level
-            .mix(raw, wet * self.compensation, self.blend, self.rate)
-            * self.gain;
+        let out = self.transition_level.mix(
+            raw,
+            wet * self.compensation * self.balance_gain,
+            self.blend,
+            self.rate,
+        ) * self.gain;
         let mixed = if out.abs() > 0.95 {
             out.signum() * (0.95 + 0.049 * ((out.abs() - 0.95) / 0.049).tanh())
         } else {
             out
         };
-        let engine_stem = engine * self.compensation * self.blend * self.gain;
+        let engine_stem = engine * self.compensation * self.balance_gain * self.blend * self.gain;
         HybridStems {
             exhaust: mixed - engine_stem * 0.25,
             engine: engine_stem,
@@ -828,6 +951,8 @@ impl Hybrid {
         self.wet_cycle += self.p.rpm as f64 / (120. * self.rate as f64) * rough as f64;
         if self.tick.is_multiple_of(64) {
             let s = (64. / (self.rate * 0.04)).min(1.);
+            let balance_target = self.rpm_balance.at(self.p.rpm, self.fast_load);
+            self.balance_gain += (balance_target - self.balance_gain) * s;
             self.current.maps.follow(self.h.maps, s);
             macro_rules! follow {($($field:ident),*)=>{$(self.current.$field+=(self.h.$field-self.current.$field)*s;)*};}
             follow!(
@@ -853,6 +978,7 @@ impl Hybrid {
                 pulse_texture,
                 pressure_shape,
                 coloration,
+                source_timbre,
                 generated_body,
                 generated_edge,
                 generated_flow,
@@ -870,9 +996,9 @@ impl Hybrid {
             );
             self.low.set_cutoff(110. + self.p.rpm * 0.025);
             self.engine_texture.set_cutoff(140. + self.p.rpm * 0.025);
-            self.engine_air_band.set_cutoff(3200. + self.p.rpm * 0.18);
+            self.engine_air_band.set_cutoff(1600. + self.p.rpm * 0.07);
             self.intake
-                .set_cutoff(500. + self.fast_load * 900. + self.p.rpm * 0.1);
+                .set_cutoff(550. + self.fast_load * 350. + self.p.rpm * 0.07);
             self.muffler
                 .set_cutoff(self.p.brightness * (0.55 + 0.45 * self.fast_load));
             self.exhaust_line
@@ -904,7 +1030,7 @@ impl Hybrid {
             let source_scale = bank.original_to_processed_gain();
             return self.next_procedural(raw, source_scale);
         }
-        let (periodic, residual) = bank.read_components(
+        let (recorded_pulse, recorded_texture) = bank.read_components(
             self.wet_cycle,
             self.p.rpm,
             self.fast_load,
@@ -923,12 +1049,22 @@ impl Hybrid {
             self.rate,
             &self.sinc,
         );
-        let inferred_residual = self.phase_locked_texture.next(
+        let recorded_engine_texture = self.phase_locked_texture.next(
             phase,
-            inferred_source - periodic,
+            inferred_source - recorded_pulse,
             self.p.rpm,
             self.rate,
         ) * self.inferred_weight;
+        let generated = self
+            .procedural_voice
+            .as_mut()
+            .expect("descriptor voice was prepared with the bank")
+            .next(self.p.rpm, self.fast_load, self.wet_cycle);
+        let retained = self.current.source_timbre;
+        let rebuilt = 1. - retained;
+        let periodic = recorded_pulse * retained + generated.exhaust_tone * rebuilt;
+        let residual = recorded_texture * retained + generated.exhaust_texture * rebuilt;
+        let inferred_residual = recorded_engine_texture * retained + generated.intake * rebuilt;
         let position = (self.p.rpm - bank.min_rpm) / (bank.max_rpm - bank.min_rpm).max(1.);
         let pulse_gain =
             self.current.pulse_gain * self.current.maps.pulse.at(position, self.fast_load);
@@ -967,7 +1103,16 @@ impl Hybrid {
         self.pressure_ready += (1. - self.pressure_ready) / (self.rate * 0.12);
         // Give a middle setting a meaningful pressure-front contribution while
         // preserving the zero and full-scale endpoints of the control.
-        let shape = self.current.pressure_shape.sqrt() * self.pressure_ready;
+        // The normalized derivative overemphasized upper firing harmonics at
+        // idle (a fixed low-RPM drone). Keep the pressure edge as RPM rises.
+        let idle_edge = ((self.p.rpm - 700.) / 1800.).clamp(0.18, 1.);
+        let requested_shape = self.current.pressure_shape.sqrt() * self.pressure_ready;
+        let shape = requested_shape * idle_edge;
+        // The earlier b5_a idle correction was calibrated with the stronger
+        // derivative. Preserve its level balance when that edge is reduced;
+        // ordinary banks (balance_gain = 1) receive no extra attenuation.
+        let edge_balance =
+            1. - requested_shape * (1. - idle_edge) * (1. - self.balance_gain) * 0.45;
         let modeled_pulse = periodic * (1. - shape) + edge * edge_scale * shape;
         let living_pulse = modeled_pulse
             * pulse_gain
@@ -1015,11 +1160,13 @@ impl Hybrid {
         let air = self
             .intake
             .next_sample(air_excitation + runner * self.current.airbox * 2.);
-        let intake = air
+        let intake = self.intake_warm.next_sample(air)
             * self.p.intake
             * self.current.maps.intake.at(position, self.fast_load)
-            * (0.25 + self.fast_load + burst * 2.);
-        let mechanical = (high * 0.13 + residual * texture_gain * 0.08) * self.p.mechanical;
+            * (0.35 + self.fast_load * 0.4 + burst * 0.75);
+        let mechanical = self.mechanical_warm.next_sample(
+            high * 0.13 + residual * texture_gain * 0.08 + generated.mechanical * rebuilt * 0.35,
+        ) * self.p.mechanical;
         // Discrete lift-off pressure events excite the same exhaust network.
         // Refractory time avoids clusters becoming continuous white-noise hiss.
         self.crackle_age += 1. / self.rate;
@@ -1081,12 +1228,13 @@ impl Hybrid {
         let engine_texture = self.engine_air_band.next_sample(upper_residual);
         self.mechanical_source_energy +=
             (engine_texture * engine_texture - self.mechanical_source_energy) / (self.rate * 0.06);
-        let engine_air = engine_texture * self.p.intake * (0.7 + 0.3 * self.fast_load);
+        let engine_air = engine_texture * self.p.intake * (0.38 + 0.17 * self.fast_load);
         let impacts = self.mechanical_impacts.next(
             self.wet_cycle,
-            self.mechanical_source_energy.max(0.).sqrt() * self.p.mechanical * 4.,
+            self.mechanical_source_energy.max(0.).sqrt() * self.p.mechanical * 1.4,
             self.fast_load,
         );
+        let impacts = self.mechanical_impact_band.next_sample(impacts);
         let engine_channel = self
             .engine_stem_dc
             .next_sample((engine_air + impacts + (intake + turbo) * 0.1) * self.current.coloration);
@@ -1101,7 +1249,7 @@ impl Hybrid {
         // six percent of that dry waveform in B.
         let wet = self
             .dc
-            .next_sample(shaped * path_gain + raw * (1. - path_gain));
+            .next_sample(shaped * path_gain + raw * retained * (1. - path_gain));
         let energy_smooth = 1. / (self.rate * 1.5);
         self.raw_energy += (raw * raw - self.raw_energy) * energy_smooth;
         self.wet_energy += (wet * wet - self.wet_energy) * energy_smooth;
@@ -1115,19 +1263,32 @@ impl Hybrid {
             };
             self.compensation += (target - self.compensation) * (64. / (self.rate * 0.2));
         }
-        let out = self
-            .transition_level
-            .mix(raw, wet * self.compensation, self.blend, self.rate)
-            * self.gain;
+        let out = self.transition_level.mix(
+            raw,
+            wet * self.compensation * self.balance_gain * edge_balance,
+            self.blend,
+            self.rate,
+        ) * self.gain;
         // Safety ceiling only: normal operating levels do not hit this branch.
         let mixed = if out.abs() > 0.95 {
             out.signum() * (0.95 + 0.049 * ((out.abs() - 0.95) / 0.049).tanh())
         } else {
             out
         };
-        let engine = engine_channel * self.compensation * self.blend * self.gain;
+        let engine = engine_channel
+            * self.compensation
+            * self.balance_gain
+            * edge_balance
+            * self.blend
+            * self.gain;
         HybridStems {
-            exhaust: mixed - mixed_engine * self.compensation * self.blend * self.gain,
+            exhaust: mixed
+                - mixed_engine
+                    * self.compensation
+                    * self.balance_gain
+                    * edge_balance
+                    * self.blend
+                    * self.gain,
             engine,
             source_reference: raw * bank.original_to_processed_gain() * self.gain,
             mixed,
@@ -1202,5 +1363,36 @@ mod transition_tests {
             (0.85..=1.15).contains(&corrected_ratio),
             "transition level {corrected_ratio}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rpm_balance_tests {
+    use super::RpmBalance;
+
+    #[test]
+    fn large_early_recording_jump_is_corrected_without_touching_upper_rpm() {
+        let rpms = [800., 1000., 1200., 1500., 1900., 2400., 2900., 3400., 3900.];
+        let low = [0.14, 0.30, 0.32, 0.07, 0.06, 0.04, 0.03, 0.03, 0.03];
+        let high = [0.15, 0.27, 0.28, 0.10, 0.09, 0.08, 0.08, 0.08, 0.08];
+        let balance = RpmBalance::from_points([
+            rpms.into_iter().zip(low).collect(),
+            rpms.into_iter().zip(high).collect(),
+        ]);
+        assert!(balance.at(1000., 0.) < 0.1);
+        assert!(balance.at(1000., 1.) < 0.2);
+        assert!(balance.at(1000., 0.5) > balance.at(1000., 0.));
+        assert!(balance.at(1900., 0.) > balance.at(1000., 0.));
+        assert_eq!(balance.at(3400., 0.), 1.);
+        assert_eq!(balance.at(3900., 1.), 1.);
+    }
+
+    #[test]
+    fn normal_recording_profile_stays_at_unity() {
+        let points = vec![(800., 0.05), (1400., 0.06), (2100., 0.07), (3000., 0.08)];
+        let balance = RpmBalance::from_points([points.clone(), points]);
+        for rpm in [800., 1100., 2100., 3000.] {
+            assert_eq!(balance.at(rpm, 0.5), 1.);
+        }
     }
 }

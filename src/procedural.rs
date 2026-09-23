@@ -9,24 +9,28 @@ use crate::bank::{Bank, Sample};
 use bdsp::svf::{StateVariableFilter, SvfMode};
 use std::{f32::consts::PI, sync::Arc};
 
-const BANDS: usize = 5;
+// Keep the bass above BeamNG's 80 Hz exhaust cut distinct from the firing
+// fundamental below it. A single 100-350 Hz band obscured this distinction.
+const BANDS: usize = 7;
 const LOW_ORDERS: usize = 4;
 const PHASE_BINS: usize = 256;
 const PULSE_BINS: usize = 512;
 const PRESSURE_BODY: f32 = 1.5;
-const FREQS: [f32; BANDS - 1] = [100., 350., 1200., 4200.];
+const FREQS: [f32; BANDS - 1] = [80., 200., 500., 1200., 2500., 5000.];
 
 #[derive(Clone, Copy)]
 struct Descriptor {
     rpm: f32,
     source_rms: f32,
     pulse_width_ms: f32,
+    bass_share: f32,
     pulse_level: f32,
     tone_gain: [f32; BANDS],
     order_correction: [(f32, f32); LOW_ORDERS],
     noise_color: [f32; BANDS],
     flow_level: f32,
     transient_level: f32,
+    event_variation: f32,
 }
 
 impl Descriptor {
@@ -35,9 +39,11 @@ impl Descriptor {
         let mut out = a;
         out.source_rms = mix(a.source_rms, b.source_rms);
         out.pulse_width_ms = mix(a.pulse_width_ms, b.pulse_width_ms);
+        out.bass_share = mix(a.bass_share, b.bass_share);
         out.pulse_level = mix(a.pulse_level, b.pulse_level);
         out.flow_level = mix(a.flow_level, b.flow_level);
         out.transient_level = mix(a.transient_level, b.transient_level);
+        out.event_variation = mix(a.event_variation, b.event_variation);
         for i in 0..BANDS {
             out.tone_gain[i] = mix(a.tone_gain[i], b.tone_gain[i]);
             out.noise_color[i] = mix(a.noise_color[i], b.noise_color[i]);
@@ -122,13 +128,11 @@ impl BroadBands {
         for i in 0..BANDS - 1 {
             self.state[i] = sample + self.pole[i] * (self.state[i] - sample);
         }
-        [
-            self.state[0],
-            self.state[1] - self.state[0],
-            self.state[2] - self.state[1],
-            self.state[3] - self.state[2],
-            sample - self.state[3],
-        ]
+        std::array::from_fn(|i| match i {
+            0 => self.state[0],
+            i if i == BANDS - 1 => sample - self.state[BANDS - 2],
+            i => self.state[i] - self.state[i - 1],
+        })
     }
 }
 
@@ -145,6 +149,12 @@ fn pulse_table() -> ([f32; PULSE_BINS], f32) {
     (table, rms.max(1e-6))
 }
 
+#[derive(Clone, Copy)]
+struct PulseEvent {
+    gain: f32,
+    delay: f32,
+}
+
 fn pulse_value(
     cycle: f64,
     rpm: f32,
@@ -152,23 +162,23 @@ fn pulse_value(
     width_ms: f32,
     table: &[f32; PULSE_BINS],
     shape_rms: f32,
-    event_gain: f32,
+    event: PulseEvent,
 ) -> f32 {
     let cylinders = cylinders.clamp(1, 12);
-    let event_phase = (cycle * cylinders as f64).rem_euclid(1.) as f32;
+    let event_phase = (cycle * cylinders as f64).rem_euclid(1.) as f32 - event.delay;
     let width = (width_ms * 0.001 * rpm * cylinders as f32 / 120.).clamp(0.025, 0.82);
     let body_mean = PRESSURE_BODY * 0.5 * width;
     let normalizer = (width * shape_rms * shape_rms - body_mean * body_mean)
         .max(1e-7)
         .sqrt();
-    if event_phase >= width {
+    if !(0. ..width).contains(&event_phase) {
         return -body_mean / normalizer;
     }
     let position = event_phase / width * (PULSE_BINS - 1) as f32;
     let index = position as usize;
     let frac = position - index as f32;
     let sample = table[index] * (1. - frac) + table[(index + 1).min(PULSE_BINS - 1)] * frac;
-    (sample * event_gain - body_mean) / normalizer
+    (sample * event.gain - body_mean) / normalizer
 }
 
 struct SourceAnalysis {
@@ -254,15 +264,16 @@ fn source_bands(
 // exhaust with strong high-frequency turbulence from one whose upper residual
 // is weak. The result is one scalar per WAV; no transform bins or PCM enter the
 // real-time voice.
-fn source_high_share(pcm: &[f32], rate: u32) -> f32 {
+fn source_spectral_shares(pcm: &[f32], rate: u32) -> (f32, f32) {
     const FFT: usize = 4096;
     if pcm.len() < FFT {
-        return 0.05;
+        return (0.6, 0.05);
     }
     let window: [f32; FFT] =
         std::array::from_fn(|i| 0.5 - 0.5 * (2. * PI * i as f32 / (FFT - 1) as f32).cos());
     let mut spectrum = vec![(0., 0.); FFT];
     let mut audible = 0.;
+    let mut bass = 0.;
     let mut high = 0.;
     for start in (0..=pcm.len() - FFT).step_by(FFT / 2).take(24) {
         for i in 0..FFT {
@@ -304,13 +315,63 @@ fn source_high_share(pcm: &[f32], rate: u32) -> f32 {
             let power = real * real + imag * imag;
             if (80. ..10_000.).contains(&frequency) {
                 audible += power;
+                if frequency < 500. {
+                    bass += power;
+                }
                 if (2000. ..5000.).contains(&frequency) {
                     high += power;
                 }
             }
         }
     }
-    (high / audible.max(1e-12)).clamp(0., 1.)
+    (
+        (bass / audible.max(1e-12)).clamp(0., 1.),
+        (high / audible.max(1e-12)).clamp(0., 1.),
+    )
+}
+
+// Variation of whole engine cycles is measured at import time. The residual
+// ratio supplies a conservative floor when a source WAV contains only one
+// cycle, which cannot reveal cycle-to-cycle motion by itself.
+fn source_cycle_variation(pcm: &[f32], cycles: usize) -> f32 {
+    if cycles < 2 || pcm.len() < cycles * 128 {
+        return 0.;
+    }
+    let cycle_len = pcm.len() / cycles;
+    let mut levels = [0.; 8];
+    let count = cycles.min(levels.len());
+    for (i, level) in levels.iter_mut().enumerate().take(count) {
+        let start = i * cycle_len;
+        let end = start + cycle_len;
+        let energy = pcm[start..end].iter().map(|x| x * x).sum::<f32>();
+        *level = (energy / cycle_len as f32).sqrt();
+    }
+    let mean = levels[..count].iter().sum::<f32>() / count as f32;
+    let variance = levels[..count]
+        .iter()
+        .map(|x| (x - mean).powi(2))
+        .sum::<f32>()
+        / count as f32;
+    (variance.sqrt() / mean.max(1e-6)).clamp(0., 0.2)
+}
+
+fn pressure_duration_scale(bass_share: f32) -> f32 {
+    (1. + 3.2 * (bass_share - 0.58).max(0.)).clamp(1., 2.4)
+}
+
+fn light_load_pressure_scale(bass_share: f32, load: f32) -> f32 {
+    let moderate_bass = ((0.9 - bass_share) / 0.2).clamp(0., 1.);
+    1. - 0.35 * (1. - load.clamp(0., 1.)).powi(2) * moderate_bass
+}
+
+fn full_load_pressure_scale(bass_share: f32, load: f32) -> f32 {
+    let mid_heavy = ((0.64 - bass_share) / 0.12).clamp(0., 1.);
+    1. + 0.3 * load.clamp(0., 1.).powi(8) * mid_heavy
+}
+
+fn full_load_mid_gain(bass_share: f32, load: f32) -> f32 {
+    let mid_heavy = ((0.64 - bass_share) / 0.12).clamp(0., 1.);
+    1. - 0.55 * load.clamp(0., 1.).powi(8) * mid_heavy
 }
 
 fn pulse_bands(
@@ -331,7 +392,18 @@ fn pulse_bands(
     let skip = (rate as usize / 40).min(frames / 4);
     for i in 0..frames {
         let cycle = i as f64 * rpm as f64 / (120. * rate as f64);
-        let pulse = pulse_value(cycle, rpm, cylinders, width_ms, table, shape_rms, 1.);
+        let pulse = pulse_value(
+            cycle,
+            rpm,
+            cylinders,
+            width_ms,
+            table,
+            shape_rms,
+            PulseEvent {
+                gain: 1.,
+                delay: 0.,
+            },
+        );
         let split = bands.next(pulse);
         if i >= skip {
             let mut mixed = 0.;
@@ -377,15 +449,18 @@ fn analyze_sample(
         sample.period.accepted,
     );
     let crest = (sample.peak / sample.rms.max(1e-6)).clamp(1., 12.);
+    let (bass_share, high_share) = source_spectral_shares(sample.analysis_pcm(), sample.rate);
     // Recordings specify broad timbre and level. The exact source cycle is not
-    // copied; pulse width is only weakly conditioned by its crest factor.
+    // copied. A bass-dominant reference calls for a longer pressure release,
+    // suppressing the artificial row of upper harmonics from a narrow pulse.
     let pulse_width_ms = (1.8 - (crest - 3.) * 0.09).clamp(1.1, 2.1);
+    let fitted_width_ms = (pulse_width_ms * pressure_duration_scale(bass_share)).min(4.8);
     let synth_cylinders = cylinders.clamp(1, 12);
     let (model_bands, _, _) = pulse_bands(
         sample.rpm,
         48_000.,
         synth_cylinders,
-        pulse_width_ms,
+        fitted_width_ms,
         table,
         shape_rms,
         [1.; BANDS],
@@ -411,7 +486,7 @@ fn analyze_sample(
     } else {
         // A rejected period cannot distinguish a tonal engine order from
         // source noise. Never fit a periodic synth to its raw spectrum.
-        [1.15, 1.08, 0.96, 0.82, 0.55]
+        [1.15, 1.12, 1.08, 0.96, 0.82, 0.68, 0.5]
     };
     // Smooth adjacent broad bands so isolated source peaks do not become
     // narrow resonators or a hard metallic spectral edge.
@@ -424,14 +499,23 @@ fn analyze_sample(
     // an off-load source is dominated by its lower firing orders. A modest
     // off-load shelf keeps the coarse band fit from sounding nasal at cruise.
     let off_load = 1. - load;
-    tone_gain[0] *= 1. + 0.45 * off_load;
-    tone_gain[1] *= 1. + 0.4 * off_load;
-    tone_gain[2] *= 1. - 0.22 * off_load;
+    tone_gain[0] *= 1. + 0.25 * off_load;
+    tone_gain[1] *= 1. + 0.35 * off_load;
+    tone_gain[2] *= 1. + 0.15 * off_load;
+    tone_gain[3] *= 1. - 0.18 * off_load;
+    // The broad-band pulse fit systematically overstates 500-2000 Hz when
+    // the reference is dominated by firing orders below 500 Hz. Use the
+    // source's audible bass share to constrain this ratio at every knot.
+    let bass_weight = (1. / (1. - bass_share).max(0.015))
+        .powf(0.35)
+        .clamp(1., 4.5);
+    tone_gain[1] *= bass_weight;
+    tone_gain[2] *= bass_weight;
     let (_, mixed_rms, model_orders) = pulse_bands(
         sample.rpm,
         48_000.,
         synth_cylinders,
-        pulse_width_ms,
+        fitted_width_ms,
         table,
         shape_rms,
         tone_gain,
@@ -445,7 +529,7 @@ fn analyze_sample(
     let mut noise_color = if sample.period.accepted && residual_total > 1e-9 {
         analysis.residual_bands.map(|x| x / residual_total)
     } else {
-        [0.05, 0.24, 0.56, 0.66, 0.42]
+        [0.02, 0.08, 0.22, 0.48, 0.62, 0.6, 0.38]
     };
     // The source recording is exhaust-only. Its residual gives a conservative
     // coloration cue, never evidence for a measured intake or a loud hiss.
@@ -463,15 +547,22 @@ fn analyze_sample(
     // audible rasp, especially when bass below the game's 80 Hz cutoff is
     // strong. Match its measured broad-band energy with independently drawn
     // noise rather than forcing it into phase-locked cylinder harmonics.
-    let high_share = source_high_share(sample.analysis_pcm(), sample.rate);
     let texture_fit = (high_share / 0.057).powf(0.85).clamp(0.3, 3.5);
     let stochastic_fit = (high_share / 0.09).powf(0.45).clamp(0.55, 1.7);
     let flow_level =
         (residual_total * bank_gain * 2.2 * texture_fit * stochastic_fit).min(source_rms * 1.7);
-    let transient_level = ((analysis.residual_bands[3] * 2.1 + analysis.residual_bands[4] * 0.35)
+    let transient_level = ((analysis.residual_bands[4] * 1.1
+        + analysis.residual_bands[5] * 1.1
+        + analysis.residual_bands[6] * 0.2)
         * bank_gain)
         .min(source_rms * 0.28)
         * stochastic_fit;
+    let residual_fraction = residual_total / (analysis.tonal_rms + residual_total).max(1e-6);
+    let cycle_motion = source_cycle_variation(sample.analysis_pcm(), sample.analysis_cycles());
+    // Whole-cycle source motion is a stronger clue for pressure irregularity
+    // than the residual spectrum alone. Preserve it in the independent pulse
+    // generator instead of repeating a nearly identical pressure event.
+    let event_variation = (0.04 + residual_fraction * 0.05 + cycle_motion * 1.25).clamp(0.04, 0.18);
     let tonal_level = if sample.period.accepted {
         (analysis.tonal_rms * bank_gain).max(source_rms * 0.25)
     } else {
@@ -498,12 +589,14 @@ fn analyze_sample(
         rpm: sample.rpm,
         source_rms,
         pulse_width_ms,
+        bass_share,
         pulse_level,
         tone_gain,
         order_correction,
         noise_color,
         flow_level,
         transient_level,
+        event_variation,
     }
 }
 
@@ -551,6 +644,9 @@ pub struct ProceduralVoice {
     pulse_rms: f32,
     last_event: i64,
     event_gain: f32,
+    event_delay: f32,
+    event_width: f32,
+    cylinder_gain: [f32; 12],
     event_seed: u64,
     flow_seed: u64,
     transient_seed: u64,
@@ -567,6 +663,9 @@ pub struct ProceduralVoice {
     transient_bands: BroadBands,
     engine_bands: BroadBands,
     mechanical_bands: BroadBands,
+    flow_warm: StateVariableFilter,
+    intake_warm: StateVariableFilter,
+    mechanical_warm: StateVariableFilter,
     low_resonator: StateVariableFilter,
     mid_resonator: StateVariableFilter,
 }
@@ -575,6 +674,8 @@ impl ProceduralVoice {
     pub fn new(rate: f32, descriptors: Arc<ProceduralBank>, cylinders: u32) -> Self {
         let rate = rate.max(8000.);
         let (pulse_table, pulse_rms) = pulse_table();
+        let mut cylinder_seed = 0x9C17_83D5_26A0_F21Bu64;
+        let cylinder_gain = std::array::from_fn(|_| 1. + 0.035 * xorshift(&mut cylinder_seed));
         Self {
             descriptors,
             white_band_rms: white_band_reference(rate),
@@ -583,6 +684,9 @@ impl ProceduralVoice {
             pulse_rms,
             last_event: i64::MIN,
             event_gain: 1.,
+            event_delay: 0.,
+            event_width: 1.,
+            cylinder_gain,
             event_seed: 0xA19E_5C45_21DA_7777,
             flow_seed: 0xF10F_8A7E_4251_1055,
             transient_seed: 0xC04B_0571_0AEE_2175,
@@ -599,6 +703,9 @@ impl ProceduralVoice {
             transient_bands: BroadBands::new(rate),
             engine_bands: BroadBands::new(rate),
             mechanical_bands: BroadBands::new(rate),
+            flow_warm: StateVariableFilter::new(rate, 2200., 0.707, SvfMode::Lowpass),
+            intake_warm: StateVariableFilter::new(rate, 950., 0.707, SvfMode::Lowpass),
+            mechanical_warm: StateVariableFilter::new(rate, 1300., 0.707, SvfMode::Lowpass),
             // Low Q and restrained wet gain bound metallic ringing.
             low_resonator: StateVariableFilter::new(rate, 260., 0.65, SvfMode::Bandpass),
             mid_resonator: StateVariableFilter::new(rate, 760., 0.65, SvfMode::Bandpass),
@@ -620,24 +727,39 @@ impl ProceduralVoice {
         let event = (cycle * self.cylinders as f64).floor() as i64;
         if event != self.last_event {
             self.last_event = event;
-            // A different event strength adds gentle short-time motion without
-            // introducing a slow repeating volume LFO or a phase jump.
-            self.event_gain = 1. + xorshift(&mut self.event_seed) * 0.09;
+            // Stable cylinder-to-cylinder imbalance combines with bounded
+            // cycle variation. A delayed onset changes timing without moving
+            // the global crank phase or discontinuously cutting off a pulse.
+            let cylinder = event.rem_euclid(self.cylinders as i64) as usize;
+            self.event_gain = self.cylinder_gain[cylinder]
+                * (1. + xorshift(&mut self.event_seed) * descriptor.event_variation);
+            self.event_delay = (0.012 + xorshift(&mut self.event_seed) * 0.012).max(0.);
+            self.event_width = 1. + xorshift(&mut self.event_seed) * 0.06;
         }
         let pulse = pulse_value(
             cycle,
             rpm,
             self.cylinders,
-            descriptor.pulse_width_ms,
+            (descriptor.pulse_width_ms
+                * pressure_duration_scale(descriptor.bass_share)
+                * light_load_pressure_scale(descriptor.bass_share, load)
+                * full_load_pressure_scale(descriptor.bass_share, load))
+            .min(4.8)
+                * self.event_width,
             &self.pulse_table,
             self.pulse_rms,
-            self.event_gain,
+            PulseEvent {
+                gain: self.event_gain,
+                delay: self.event_delay,
+            },
         );
         let tone = self.tone_bands.next(pulse);
+        let mid_gain = full_load_mid_gain(descriptor.bass_share, load);
         let mut tonal = tone
             .iter()
             .zip(descriptor.tone_gain)
-            .map(|(band, gain)| band * gain)
+            .enumerate()
+            .map(|(i, (band, gain))| band * gain * if i >= 3 { mid_gain } else { 1. })
             .sum::<f32>()
             * descriptor.pulse_level;
         let event_phase = (cycle * self.cylinders as f64).rem_euclid(1.) as f32;
@@ -665,29 +787,42 @@ impl ProceduralVoice {
             self.flow_release
         };
         self.flow_envelope += (pressure_activity - self.flow_envelope) * follow;
-        let flow_gate = (0.035 + load * (0.38 + 0.54 * self.flow_envelope)).min(1.);
+        // Airflow follows pressure events. A large load-only floor made a
+        // continuous hiss during acceleration even between those events.
+        let flow_gate = (0.012 + load * (0.035 + 0.75 * self.flow_envelope)).min(1.);
         let burst_gate = (pulse.abs() * 0.75).min(1.);
         let transient_noise = self
             .transient_bands
             .next(xorshift(&mut self.transient_seed));
-        let combustion_texture = (transient_noise[3] / self.white_band_rms[3] * 0.9
-            + transient_noise[4] / self.white_band_rms[4] * 0.2)
+        let combustion_texture = (transient_noise[4] / self.white_band_rms[4] * 0.45
+            + transient_noise[5] / self.white_band_rms[5] * 0.6
+            + transient_noise[6] / self.white_band_rms[6] * 0.1)
             * descriptor.transient_level
             * burst_gate
             * (0.55 + 0.45 * load);
-        let exhaust_texture = colored_flow * descriptor.flow_level * flow_gate + combustion_texture;
+        let exhaust_texture =
+            self.flow_warm.next_sample(colored_flow) * descriptor.flow_level * flow_gate
+                + combustion_texture;
 
         let engine_noise = self.engine_bands.next(xorshift(&mut self.engine_seed));
-        let air = engine_noise[2] / self.white_band_rms[2] * 0.6
-            + engine_noise[3] / self.white_band_rms[3] * 0.24;
+        // Keep valve airflow in the lower bands. Broad upper noise reads as
+        // constant electrical hiss when the intake is heard in isolation.
+        let air = engine_noise[1] / self.white_band_rms[1] * 0.26
+            + engine_noise[2] / self.white_band_rms[2] * 0.32
+            + engine_noise[3] / self.white_band_rms[3] * 0.04;
         let valve_phase = (cycle * self.cylinders as f64 + 0.47).rem_euclid(1.) as f32;
         let valve_window = if valve_phase < 0.24 {
             (PI * valve_phase / 0.24).sin().powi(2)
         } else {
             0.
         };
-        let intake =
-            descriptor.source_rms * air * valve_window * (0.65 + 0.25 * load) * (0.2 + 0.8 * load);
+        let intake = self.intake_warm.next_sample(
+            descriptor.source_rms
+                * air
+                * valve_window
+                * (0.65 + 0.25 * load)
+                * (0.25 + 0.45 * load),
+        );
 
         let mechanical_event = (cycle * self.cylinders as f64 + 0.47).floor() as i64;
         if mechanical_event != self.last_mechanical_event {
@@ -698,10 +833,15 @@ impl ProceduralVoice {
         let mechanical_noise = self
             .mechanical_bands
             .next(xorshift(&mut self.mechanical_seed));
-        let mechanical = descriptor.source_rms
-            * (mechanical_noise[3] / self.white_band_rms[3] * 0.5
-                + mechanical_noise[4] / self.white_band_rms[4] * 0.08)
-            * self.mechanical_envelope;
+        // Every mechanical contribution follows an event. The previous
+        // ungated band made a constant noise floor between valve impacts.
+        let mechanical = self.mechanical_warm.next_sample(
+            descriptor.source_rms
+                * (mechanical_noise[1] / self.white_band_rms[1] * 0.12
+                    + mechanical_noise[2] / self.white_band_rms[2] * 0.16
+                    + mechanical_noise[3] / self.white_band_rms[3] * 0.045)
+                * self.mechanical_envelope,
+        );
         ProceduralStems {
             exhaust_tone: resonant,
             exhaust_texture,
@@ -720,12 +860,14 @@ mod tests {
             rpm: 4000.,
             source_rms: 0.1,
             pulse_width_ms: 1.6,
+            bass_share: 0.6,
             pulse_level: 0.1,
             tone_gain: [1.; BANDS],
             order_correction: [(0., 0.); LOW_ORDERS],
-            noise_color: [0.05, 0.2, 0.6, 0.7, 0.3],
+            noise_color: [0.02, 0.08, 0.22, 0.48, 0.62, 0.6, 0.38],
             flow_level: 0.004,
             transient_level: 0.012,
+            event_variation: 0.09,
         };
         Arc::new(ProceduralBank {
             layers: [vec![point], vec![point]],
@@ -785,6 +927,23 @@ mod tests {
     }
 
     #[test]
+    fn mechanical_noise_dies_away_without_a_new_event() {
+        let mut voice = ProceduralVoice::new(48_000., test_bank(), 4);
+        let _ = voice.next(4000., 0.8, 0.);
+        let mut tail_energy = 0.;
+        for i in 0..12_000 {
+            let mechanical = voice.next(4000., 0.8, 0.).mechanical;
+            if i >= 11_000 {
+                tail_energy += mechanical * mechanical;
+            }
+        }
+        assert!(
+            tail_energy < 1e-12,
+            "ungated mechanical floor: {tail_energy}"
+        );
+    }
+
+    #[test]
     fn rejected_noise_cannot_become_a_tonal_profile() {
         let mut seed = 0x37AB_3214_7809_0042;
         let noise: Vec<_> = (0..24_000).map(|_| xorshift(&mut seed)).collect();
@@ -803,8 +962,24 @@ mod tests {
         let high: Vec<_> = (0..8192)
             .map(|i| (2. * PI * 3000. * i as f32 / rate as f32).sin())
             .collect();
-        assert!(source_high_share(&low, rate) < 0.01);
-        assert!(source_high_share(&high, rate) > 0.99);
+        assert!(source_spectral_shares(&low, rate).1 < 0.01);
+        assert!(source_spectral_shares(&high, rate).1 > 0.99);
+        assert!(source_spectral_shares(&low, rate).0 > 0.99);
+    }
+
+    #[test]
+    fn pressure_duration_and_cycle_motion_follow_source_evidence() {
+        assert_eq!(pressure_duration_scale(0.4), 1.);
+        assert!(pressure_duration_scale(0.98) > pressure_duration_scale(0.7));
+        assert!(pressure_duration_scale(1.) <= 2.4);
+        assert!(light_load_pressure_scale(0.76, 0.15) < light_load_pressure_scale(0.76, 0.7));
+        assert_eq!(full_load_pressure_scale(0.8, 1.), 1.);
+        assert!(full_load_pressure_scale(0.52, 1.) > full_load_pressure_scale(0.52, 0.7));
+        assert!(full_load_mid_gain(0.52, 1.) < full_load_mid_gain(0.52, 0.7));
+        let steady = vec![0.1; 2048];
+        let alternating = [vec![0.1; 1024], vec![0.2; 1024]].concat();
+        assert!(source_cycle_variation(&steady, 2) < 1e-5);
+        assert!(source_cycle_variation(&alternating, 2) > 0.1);
     }
 
     #[test]

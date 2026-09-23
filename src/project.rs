@@ -95,6 +95,23 @@ pub struct Project {
     pub source: Option<crate::bank::SourceRef>,
     #[serde(default)]
     pub driving: crate::drive::Controls,
+    #[serde(default = "default_profile_name")]
+    pub profile_name: String,
+}
+pub fn default_profile_name() -> String {
+    "Natural".to_owned()
+}
+pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > 48
+        || name
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '/' | '\\'))
+    {
+        return Err("Profile name must be 1–48 characters without slashes or controls".into());
+    }
+    Ok(())
 }
 pub fn save(path: &Path, parameters: Parameters) -> Result<(), String> {
     save_project(
@@ -105,6 +122,7 @@ pub fn save(path: &Path, parameters: Parameters) -> Result<(), String> {
             hybrid: Default::default(),
             source: None,
             driving: Default::default(),
+            profile_name: default_profile_name(),
         },
     )
 }
@@ -112,6 +130,7 @@ pub fn save_project(path: &Path, project: &Project) -> Result<(), String> {
     project.parameters.validate()?;
     project.hybrid.validate()?;
     project.driving.validate()?;
+    validate_profile_name(&project.profile_name)?;
     let json = serde_json::to_string_pretty(project).map_err(|e| e.to_string())?;
     std::fs::write(path, json).map_err(|e| e.to_string())
 }
@@ -127,5 +146,6 @@ pub fn load_project(path: &Path) -> Result<Project, String> {
     project.parameters.validate()?;
     project.hybrid.validate()?;
     project.driving.validate()?;
+    validate_profile_name(&project.profile_name)?;
     Ok(project)
 }

@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mode: Mode::Direct,
                         ..Default::default()
                     },
+                    profile_name: bess::project::default_profile_name(),
                 },
             )?;
             pair.push(audio);

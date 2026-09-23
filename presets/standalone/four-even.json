@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "cycle": "four_stroke",
+  "cylinders": [
+    {
+      "name": "C1",
+      "firing_deg": 0.0,
+      "bank": 0,
+      "strength": 1.0
+    },
+    {
+      "name": "C2",
+      "firing_deg": 180.0,
+      "bank": 0,
+      "strength": 1.0
+    },
+    {
+      "name": "C3",
+      "firing_deg": 360.0,
+      "bank": 0,
+      "strength": 1.0
+    },
+    {
+      "name": "C4",
+      "firing_deg": 540.0,
+      "bank": 0,
+      "strength": 1.0
+    }
+  ],
+  "banks": [
+    {
+      "exhaust_length_m": 1.6,
+      "intake_length_m": 0.7,
+      "sound_speed_m_s": 420.0,
+      "exhaust_reflection": -0.42,
+      "intake_reflection": 0.28,
+      "loss": 0.68
+    }
+  ],
+  "exhaust_open_after_deg": 140.0,
+  "intake_open_after_deg": 500.0,
+  "calibration": {
+    "pulse_ms": 2.2,
+    "event_variation": 0.08,
+    "residual": 0.0,
+    "block_hz": 125.0,
+    "block_decay_ms": 12.0,
+    "exhaust_level": 0.7,
+    "intake_level": 0.3,
+    "block_level": 0.025
+  },
+  "seed": 45909
+}

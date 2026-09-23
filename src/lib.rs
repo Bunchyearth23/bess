@@ -14,4 +14,5 @@ mod period;
 pub mod procedural;
 pub mod project;
 pub mod render;
+pub mod standalone;
 pub mod variant;

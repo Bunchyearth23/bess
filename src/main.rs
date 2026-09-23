@@ -22,6 +22,7 @@ struct Loaded {
     params: Parameters,
     settings: Settings,
     driving: Controls,
+    profile_name: String,
 }
 #[derive(Clone, PartialEq)]
 struct LevelKey {
@@ -76,6 +77,8 @@ struct App {
     level_report: Option<(LevelKey, beamng_level::Report)>,
     level_error: Option<String>,
     level_rpm: f32,
+    profile_name: String,
+    show_advanced_sound: bool,
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
@@ -113,6 +116,8 @@ impl App {
             level_report: None,
             level_error: None,
             level_rpm: 900.,
+            profile_name: "Natural".into(),
+            show_advanced_sound: false,
         };
         if let Some(path) = initial {
             app.import(path, None);
@@ -149,6 +154,10 @@ impl App {
                     mode: Mode::Simulated,
                     ..Default::default()
                 });
+                let profile_name = project
+                    .as_ref()
+                    .map(|p| p.profile_name.clone())
+                    .unwrap_or_else(project::default_profile_name);
                 let (mut params, settings) = if let Some(p) = project {
                     (p.parameters, p.hybrid)
                 } else {
@@ -179,6 +188,7 @@ impl App {
                     params,
                     settings,
                     driving,
+                    profile_name,
                 })
             })();
             let _ = tx.send(result);
@@ -191,6 +201,7 @@ impl App {
             hybrid: self.settings,
             source: self.bank.as_ref().map(|b| b.source.clone()),
             driving: self.driving,
+            profile_name: self.profile_name.clone(),
         }
     }
     fn level_key(&self) -> Option<LevelKey> {
@@ -228,6 +239,7 @@ impl App {
                     self.params = p.parameters;
                     self.settings = p.hybrid;
                     self.driving = p.driving;
+                    self.profile_name = p.profile_name;
                     self.bank = None;
                     self.vehicle = None;
                     self.audio = None;
@@ -340,7 +352,7 @@ impl App {
             "A plays the imported WAV files with prepared transitions. It is not a game recording.",
         );
         if self.settings.procedural {
-            ui.small("Experimental B uses the ZIP to measure level and broad tonal character, then generates new pulses and flow. The engine-side sound remains an estimate from exhaust-only audio.");
+            ui.small("Experimental B learns each RPM and load from the ZIP, then creates new combustion pulses with slight cycle variation, exhaust texture and mechanical detail. Intake and engine-side sound are still estimates from exhaust-only audio.");
         } else {
             ui.small("B uses the Automation recording as a seed. Its additional engine-side layer is estimated from exhaust-only audio.");
         }
@@ -850,6 +862,7 @@ impl eframe::App for App {
                     self.level_rpm = v.params.rpm;
                     self.settings = v.settings;
                     self.driving = v.driving;
+                    self.profile_name = v.profile_name;
                     self.bank = Some(v.bank);
                     self.vehicle = v.vehicle;
                     self.status =
@@ -995,6 +1008,21 @@ impl eframe::App for App {
                         slider(ui, "Mechanical detail", &mut self.settings.generated_mechanics, 0.0..=2.0);
                         ui.small("This is an experimental exhaust-guided model. Its intake and mechanical sound are estimates, not separate recordings.");
                     } else {
+                    slider(ui,"Automation timbre retained",&mut self.settings.source_timbre,0.0..=1.0);
+                    ui.small("0 builds a new tone from the ZIP analysis. 100% retains its timbre while BESS processing stays active.");
+                    slider(ui,"Resynthesis amount",&mut self.settings.coloration,0.0..=1.0);
+                    slider(ui,"Exhaust level",&mut self.params.exhaust,0.0..=1.0);
+                    slider(ui,"Intake level",&mut self.params.intake,0.0..=1.0);
+                    slider(ui,"Mechanical level",&mut self.params.mechanical,0.0..=1.0);
+                    if ui.add_enabled(self.bank.is_some(),egui::Button::new("Fit vehicle / natural background")).clicked()
+                        && let Some(bank)=&self.bank {
+                            let enhanced=self.settings.enhanced;let level_match=self.settings.level_match;
+                            let procedural=self.settings.procedural;
+                            let combustion=self.settings.combustion;
+                            self.settings=Settings{enhanced,procedural,level_match,combustion,..Settings::calibrated(bank)};
+                    }
+                    ui.checkbox(&mut self.show_advanced_sound,"Advanced sound controls");
+                    if self.show_advanced_sound {
                     ui.collapsing("Engine and combustion (optional)", |ui| {
                         ui.small("Automation engine data may provide the layout, but not the firing order. Combustion events are optional: the WAV files already contain pulses.");
                         let mut enabled=self.settings.combustion.cylinders>0;
@@ -1030,14 +1058,6 @@ impl eframe::App for App {
                     if before!=(self.settings.rpm_character,self.settings.load_character) {self.settings.rebuild_character_maps();}
                     if self.settings.maps != { let mut h=self.settings;h.rebuild_character_maps();h.maps } {
                         ui.small("The project's detailed curves are preserved. Changing either setting above replaces them.");
-                    }
-                    slider(ui,"Resynthesis amount",&mut self.settings.coloration,0.0..=1.0);
-                    if ui.add_enabled(self.bank.is_some(),egui::Button::new("Fit vehicle / natural background")).clicked()
-                        && let Some(bank)=&self.bank {
-                            let enhanced=self.settings.enhanced;let level_match=self.settings.level_match;
-                            let procedural=self.settings.procedural;
-                            let combustion=self.settings.combustion;
-                            self.settings=Settings{enhanced,procedural,level_match,combustion,..Settings::calibrated(bank)};
                     }
                     if self.settings.procedural {
                         ui.small("The source-pulse and source-texture controls below apply to the standard source-guided mode only.");
@@ -1170,12 +1190,6 @@ impl eframe::App for App {
                         &mut self.params.brightness,
                         200.0..=10000.0,
                     );
-                    slider(
-                        ui,
-                        "Source exhaust",
-                        &mut self.params.exhaust,
-                        0.0..=1.0,
-                    );
                     ui.separator();
                     ui.heading("04 / Intake and mechanical");
                     slider(
@@ -1190,21 +1204,10 @@ impl eframe::App for App {
                         &mut self.settings.airbox,
                         0.0..=1.0,
                     );
-                    slider(
-                        ui,
-                        "Inferred intake detail",
-                        &mut self.params.intake,
-                        0.0..=1.0,
-                    );
-                    slider(
-                        ui,
-                        "Reconstructed mechanical sound",
-                        &mut self.params.mechanical,
-                        0.0..=1.0,
-                    );
                     ui.small(
                         "Reconstructed layers are not isolated recordings from the vehicle.",
                     );
+                    }
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -1261,6 +1264,11 @@ impl eframe::App for App {
             ui.small("Adds a BESS configuration to the original Automation vehicle. Keep the original mod enabled.");
             ui.small("BeamNG always receives the standard source-guided sound. Experimental synthesis stays in the listening interface.");
             ui.small("Game afterfire, turbo, and startup sounds are preserved; BESS transient effects are not transferred.");
+            ui.horizontal(|ui| {
+                ui.label("Sound profile name");
+                ui.text_edit_singleline(&mut self.profile_name);
+            });
+            ui.small("Named profiles appear as separate BESS configurations for the same vehicle.");
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong("BeamNG volume estimate");
                 ui.small("Compare the WAV levels BESS will export with the original Automation samples. Listening volume does not change these files.");
@@ -1308,12 +1316,12 @@ impl eframe::App for App {
                     ui.small("Calculate once to inspect both load rows across the imported RPM range.");
                 }
             });
-            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none()&&self.level_worker.is_none(),egui::Button::new("Create BeamNG configuration…")).clicked()
+            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none()&&self.level_worker.is_none()&&project::validate_profile_name(&self.profile_name).is_ok(),egui::Button::new("Create BeamNG configuration…")).clicked()
                 &&let Some(dir)=rfd::FileDialog::new().pick_folder(){
-                let bank=self.bank.clone().unwrap();let p=self.params;let h=self.settings.for_beamng_export();
+                let bank=self.bank.clone().unwrap();let p=self.params;let h=self.settings.for_beamng_export();let profile=self.profile_name.trim().to_owned();
                 let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Creating and verifying BeamNG configuration…".into();
                 std::thread::spawn(move||{let folder=dir.join(format!("BESS-BeamNG-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()));
-                    let _=tx.send(bess::variant::package(&folder,p,h,bank));});
+                    let _=tx.send(bess::variant::package_named(&folder,p,h,bank,&profile));});
             }
             ui.separator();ui.heading("Listening exports");
             slider(ui,"WAV duration (seconds)",&mut self.seconds,1.0..=60.0);
@@ -1430,6 +1438,7 @@ fn main() -> eframe::Result {
                 | "--characters"
                 | "--drive-demo"
                 | "--beamng"
+                | "--beamng-profile"
                 | "--beamng-replacement"
         )
     ) {
@@ -1452,8 +1461,27 @@ fn main() -> eframe::Result {
                 ..Default::default()
             };
             let mut settings = Settings::calibrated(&bank);
+            if args[1] == "--beamng-profile" {
+                let preset = args
+                    .get(5)
+                    .ok_or("Preset index required")?
+                    .parse::<usize>()
+                    .map_err(|_| "Invalid preset index")?;
+                if preset > 5 {
+                    return Err("Preset index must be 0–5".into());
+                }
+                settings = Settings::character_for_bank(preset, &bank);
+            }
             settings.procedural = args[1] == "--compare-procedural";
-            if args[1] == "--beamng" {
+            if args[1] == "--beamng-profile" {
+                bess::variant::package_named(
+                    Path::new(dir),
+                    params,
+                    settings,
+                    bank,
+                    args.get(4).ok_or("Profile name required")?,
+                )
+            } else if args[1] == "--beamng" {
                 bess::variant::package(Path::new(dir), params, settings, bank)
             } else if args[1] == "--beamng-replacement" {
                 bess::export::package(Path::new(dir), params, settings, bank)
