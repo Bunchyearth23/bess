@@ -1,4 +1,4 @@
-//! Build all replacement mods and audit preservation of non-audio entries.
+//! Build mixed replacement mods or exhaust-stem inputs for selectable variants.
 use bess::{bank::Bank, hybrid::Settings, project::Parameters};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, path::Path, sync::Arc};
@@ -16,8 +16,9 @@ fn digest(mut r: impl Read) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 3 {
-        return Err("delivery CARS NEW_OUTPUT".into());
+    let exhaust_only = args.len() == 4 && args[3] == "--exhaust-stems";
+    if args.len() != 3 && !exhaust_only {
+        return Err("delivery CARS NEW_OUTPUT [--exhaust-stems]".into());
     }
     let out = Path::new(&args[2]);
     fs::create_dir(out)?;
@@ -42,10 +43,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let dir = out.join(path.file_stem().ok_or("Name")?);
         println!("Export {}", path.display());
-        bess::export::package(&dir, p, h, bank.clone())?;
+        if exhaust_only {
+            bess::export::package_exhaust_stem(&dir, p, h, bank.clone())?;
+        } else {
+            bess::export::package(&dir, p, h, bank.clone())?;
+        }
         assert_eq!(before, digest(fs::File::open(&path)?)?, "Source modified");
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("manifest.json"))?)?;
+        assert_eq!(
+            manifest["render_channel"],
+            if exhaust_only { "exhaust" } else { "mixed" }
+        );
         let loops = manifest["loops"].as_array().ok_or("Loops")?;
         let mut original = zip::ZipArchive::new(fs::File::open(&path)?)?;
         let zip_name = manifest["zip_file"].as_str().ok_or("ZIP name")?;

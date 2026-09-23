@@ -115,6 +115,7 @@ impl App {
                         .clamp(bank.min_rpm, bank.max_rpm);
                     (
                         Parameters {
+                            cylinders: bank.engine_meta.as_ref().map_or(4, |meta| meta.cylinders),
                             rpm,
                             load: 0.12,
                             brightness: 10000.,
@@ -997,6 +998,7 @@ fn main() -> eframe::Result {
                 .unwrap_or(bank.min_rpm)
                 .clamp(bank.min_rpm, bank.max_rpm);
             let params = Parameters {
+                cylinders: bank.engine_meta.as_ref().map_or(4, |meta| meta.cylinders),
                 rpm: idle,
                 load: 0.12,
                 brightness: 10000.,

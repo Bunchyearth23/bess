@@ -99,6 +99,7 @@ fn audit(
     let info_path = field(&manifest, "info_path")?;
     let engine_path = field(&manifest, "engine_path")?;
     let blend_path = field(&manifest, "blend_path")?;
+    let engine_blend_path = field(&manifest, "engine_blend_path")?;
     let display_name = field(&manifest, "display_name")?;
     let thumbnail_path = match &manifest["thumbnail_path"] {
         Value::Null => None,
@@ -111,8 +112,17 @@ fn audit(
     let wav_paths = manifest["wav_paths"]
         .as_array()
         .ok_or_else(|| invalid("Missing wav_paths array"))?;
+    let engine_wav_paths = manifest["engine_wav_paths"]
+        .as_array()
+        .ok_or_else(|| invalid("Missing engine_wav_paths array"))?;
     let mut expected = HashSet::new();
-    for path in [config_path, info_path, engine_path, blend_path] {
+    for path in [
+        config_path,
+        info_path,
+        engine_path,
+        blend_path,
+        engine_blend_path,
+    ] {
         if !expected.insert(path.to_owned()) {
             return Err(invalid(format!("Duplicate declared add-on path: {path}")).into());
         }
@@ -122,7 +132,7 @@ fn audit(
     {
         return Err(invalid(format!("Duplicate or invalid thumbnail path: {path}")).into());
     }
-    for wav in wav_paths {
+    for wav in wav_paths.iter().chain(engine_wav_paths.iter()) {
         let path = wav.as_str().ok_or_else(|| invalid("Non-string WAV path"))?;
         if !path.ends_with(".wav") || !expected.insert(path.to_owned()) {
             return Err(invalid(format!("Duplicate or invalid WAV path: {path}")).into());
@@ -206,29 +216,40 @@ fn audit(
         .next()
         .and_then(|name| name.strip_suffix(".sfxBlend2D.json"))
         .ok_or_else(|| invalid("Invalid blend path"))?;
-    if !engine.contains(&format!("\"{blend_uid}\"")) {
-        return Err(invalid("New engine does not reference the new sound blend").into());
-    }
-    let blend: Value = serde_json::from_str(&member_string(&mut addon, blend_path, 1_000_000)?)?;
-    let mut referenced_wavs = HashSet::new();
-    for row in blend["samples"]
-        .as_array()
-        .ok_or_else(|| invalid("Blend has no sample rows"))?
+    let engine_blend_uid = engine_blend_path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.strip_suffix(".sfxBlend2D.json"))
+        .ok_or_else(|| invalid("Invalid engine blend path"))?;
+    if !engine.contains(&format!("\"{blend_uid}\""))
+        || !engine.contains(&format!("\"{engine_blend_uid}\""))
+        || !engine.contains("\"soundConfig\": \"soundConfig\"")
     {
-        for sample in row
+        return Err(invalid("New engine does not reference both sound blends").into());
+    }
+    let mut referenced_wavs = HashSet::new();
+    for path in [blend_path, engine_blend_path] {
+        let blend: Value = serde_json::from_str(&member_string(&mut addon, path, 1_000_000)?)?;
+        for row in blend["samples"]
             .as_array()
-            .ok_or_else(|| invalid("Blend sample row is not an array"))?
+            .ok_or_else(|| invalid("Blend has no sample rows"))?
         {
-            let path = sample[0]
-                .as_str()
-                .ok_or_else(|| invalid("Blend contains an invalid WAV reference"))?;
-            if !referenced_wavs.insert(path.to_owned()) {
-                return Err(invalid(format!("Duplicate blend WAV reference: {path}")).into());
+            for sample in row
+                .as_array()
+                .ok_or_else(|| invalid("Blend sample row is not an array"))?
+            {
+                let path = sample[0]
+                    .as_str()
+                    .ok_or_else(|| invalid("Blend contains an invalid WAV reference"))?;
+                if !referenced_wavs.insert(path.to_owned()) {
+                    return Err(invalid(format!("Duplicate blend WAV reference: {path}")).into());
+                }
             }
         }
     }
     let declared_wavs: HashSet<String> = wav_paths
         .iter()
+        .chain(engine_wav_paths.iter())
         .map(|value| value.as_str().unwrap().to_owned())
         .collect();
     if referenced_wavs != declared_wavs {
@@ -246,6 +267,8 @@ fn audit(
         "display_name": display_name,
         "engine_part": new_part,
         "wav_loops": declared_wavs.len(),
+        "engine_wav_loops": engine_wav_paths.len(),
+        "exhaust_wav_loops": wav_paths.len(),
         "wav_frames": total_frames,
         "unique_addon_entries": addon_names.len(),
         "thumbnail_preserved": thumbnail_path.is_some(),
@@ -334,8 +357,8 @@ fn main() -> Result<()> {
         println!("Verified {} WAV loops", report["wav_loops"]);
         variants.push(report);
     }
-    if wav_loops != 688 {
-        return Err(invalid(format!("Expected 688 WAV loops, found {wav_loops}")).into());
+    if wav_loops != 1376 {
+        return Err(invalid(format!("Expected 1376 WAV loops, found {wav_loops}")).into());
     }
     let report = json!({"vehicles": variants.len(), "wav_loops": wav_loops, "variants": variants});
     fs::write(

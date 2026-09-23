@@ -1,0 +1,61 @@
+# Engine and exhaust layers for BeamNG — 2026-09-23
+
+## Why this revision was needed
+
+The user selected BESS configurations in BeamNG and did not hear a meaningful difference. The game log confirms that `Zero (BESS)` spawned, the selected engine part pointed to the BESS exhaust blend, and the WAVs differed from Automation's. This did not prove audible playback, but it ruled out a simple configuration selection mistake. The twelve Automation JBeams have only `mainEngine.soundConfigExhaust`. The earlier BESS add-ons also changed only that emitter. A 5,338 rpm Cerberus comparison measured source/BESS RMS of 0.0592/0.053 at full load and 0.0265/0.0207 off load; the small change is consistent with the listening report.
+
+[BeamNG's engine audio documentation](https://documentation.beamng.com/modding/vehicle/sections/sounds/engine_audio/) defines `soundConfig` for near-engine mechanical and induction sound and `soundConfigExhaust` for the tailpipe. Each of the twelve Automation ZIPs bundles `lua/powertrain/camsoEngine.lua`; its three file variants all implement both configs, with separate sound IDs and locations. Its sample-name lookup follows [BeamNG's blend naming rule](https://www.beamng.com/threads/custom-audio-samples.44840/).
+
+## Implementation
+
+- `Hybrid::next_stems` exposes distinct engine-side and exhaust stems while leaving the existing BESS audition mix unchanged. Later engine-side revisions add their own restrained mechanical texture, so the two export stems do not mathematically sum to the audition mix. No firing order is inferred.
+- Selectable variants bake the exhaust stem into one RPM/load bank and reconstruct the engine stem into another. Each receives its own unique `sfxBlend2D` file and WAV paths. The cloned JBeam engine part connects both `mainEngine.soundConfig` and `soundConfigExhaust`; the original Automation configuration remains untouched.
+- The current engine stem is balanced per RPM/load knot with a 12× gain cap and PCM peak ceiling. The engine-side `mainGain` starts at -2 dB against Automation's +6 dB exhaust; `intakeMuffling` starts at 0.5. These are listening starting points, not a measured vehicle calibration.
+- The explicit legacy full-replacement export keeps the previous single mixed BESS loop. Only the selectable variant path requests an exhaust-only stem, preventing the new engine bank from being doubled at the tailpipe.
+
+## Initial twelve-vehicle delivery and checks
+
+| Check | Result |
+| --- | --- |
+| Automation originals and new BESS variants active | 12 + 12 |
+| BESS exhaust and engine WAVs | 688 + 688; mono 48 kHz / PCM24 |
+| Unique BESS add-on ZIP paths | 1,448; zero overlaps with active originals |
+| Initial per-row engine WAV RMS / exhaust WAV RMS | 0.693–0.850 across all twelve initial variants; superseded for Cerberus |
+| Archive and install integrity | Every add-on ZIP CRC passes; installed bytes match the verified export; original vehicle hashes match `cars/` |
+| Earlier exhaust-only variants | 12 preserved in `D:\BeamMP\current\BESS-exhaust-only-variants-backup-20260923` |
+| BeamNG startup | Twelve new variants and twelve originals mounted and active; old add-ons removed from the mod database |
+| Source checks | 50 Rust tests pass; Clippy passes with warnings denied |
+
+Outputs and audit data for the initial twelve variants are in `output/beamng-dual-stem-variants-balanced-20260923`, with per-vehicle manifests, `verification.json`, and `installation.json`. The public v0.8.4 release assets predate this revision. The current source and Cerberus candidate are described below; the other eleven installed variants still use this initial dual-layer build.
+
+The user compared Cerberus A with A (BESS) and confirmed that the added layer was clearly audible, but still sounded artificial, specifically as an overly regular drone. ZIP validation and a mounted mod did not establish naturalness.
+
+## Cerberus naturalness follow-up
+
+[BeamNG's tuning guide](https://documentation.beamng.com/modding/vehicle/sections/sounds/engine_audio/) recommends distinct engine and exhaust layers, a cautious relative gain, and slow RPM sweeps to find phasing or hollow tone. The first BESS engine stem was a filtered copy of the exhaust source amplified 192× off-load and 30.9× on-load for Cerberus, aiming at a row-wide 0.85 RMS ratio. Its engine/exhaust ratio varied considerably between RPM knots. The fixed one-second pre-roll also started each knot at a different crank phase.
+
+R4 ends pre-roll at a shared 720-degree phase, emphasizes upper-band residual texture rather than a full filtered exhaust copy, adds load-dependent filtered airflow turbulence, and caps the inferred engine gain at 12× per knot. Off-load and on-load target ratios are 0.35 and 0.55, and the engine-side fundamental EQ is -3 dB. The measured Cerberus mean correlation of adjacent exhaust cycle templates improved from -0.045/-0.015 to +0.456/+0.451 for off-load/on-load, and the number of negatively correlated neighbor pairs fell from 19/21 to 3/0. At 5,338 rpm, the engine stem's 50–4,000 Hz harmonic energy fraction fell from 0.812/0.705 to 0.302/0.628 for off-load/on-load. These signal measurements support the change but cannot prove that it sounds natural in BeamNG.
+
+The revised Cerberus add-on is `output/cerberus-naturalness-prototype-r4-20260923/bess-variant-cerberus_a-b516c17f94.zip` (SHA256 `68dbecbc59dd303a03f70fea668d3778254cf7cf371b9f3837085f0f450b0162`). It has 66 exhaust and 66 engine WAVs, 138 disjoint ZIP paths, valid CRCs, and mono 48 kHz PCM24 audio. It replaced only the Cerberus BESS add-on; BeamNG logged dynamic activation and vehicle selector reload. The user heard a small improvement but called the modeled airflow synthetic. This R4 candidate is preserved in `D:\BeamMP\current\BESS-cerberus-naturalness-r4-backup-20260923`.
+
+For a controlled comparison, `output/cerberus-native-v6-reference-20260923/bess-variant-cerberus_a-native-v6-reference.zip` used BeamNG's installed `V6_2_engine` for the engine side and unchanged BESS exhaust WAVs. No BeamNG audio was copied into the add-on. The game mounted it and spawned the selected Cerberus configuration, but the user preferred R4, so the native reference was removed and R4 restored. The installed `V6_2_engine` blend points to an FMOD synthesis event rather than a separate engine-bay recording.
+
+The user then identified missing mechanical sound and requested slight irregularity to avoid audible phase locking. [Valve-train impact measurements](https://saemobilus.sae.org/papers/investigation-valve-train-noise-sound-quality-i-c-engines-1999-01-1711) and a [physically informed engine synthesis model](https://air.iuav.it/retrieve/de164c2a-5461-60ee-e053-3a05fe0a7787/SIVE15_submission_4.pdf) distinguish brief structure-borne events from continuous induction turbulence. R5 therefore removed the continuous white-noise airflow bed and added short, modestly varied cylinder-rate impacts exciting fixed 950 Hz and 3,300 Hz resonances. These are mechanical sound-design proxies, not measured valve or piston events. R5 reduced the 4–10 kHz energy share at 5,338 rpm on load from R4's 12.2% to 7.7%, but its firing-harmonic share rose from 39.8% to 51.3%. The independent engine/exhaust sample phase could also change the nominal-gain sum by 1.25 dB over one firing period. This risked recreating the earlier drone, so R5 was not installed.
+
+R6 keeps the source-derived upper residual, subtracts 75% of the residual one 720-degree cycle earlier, and makes the mechanical impacts and coherent source path quieter. This suppresses periodic exhaust orders without adding a continuous synthetic noise bed. Its engine WAVs last about four seconds, versus two seconds for exhaust; the longer variation does not turn the original 2.2-second Automation recording into a new recording. When the `.car` sheet and active part match, export uses the declared cylinder count (six for Cerberus) rather than the generic four-cylinder parameter default.
+
+At 5,338 rpm on load, R6's engine harmonic fraction is 21.6%, the 4–10 kHz share is 11.2%, and the engine/exhaust RMS ratio remains 0.55 before the JBeam's -8 dB engine/exhaust mainGain difference. Its modeled mechanical-cycle RMS variation is 12.7%, and its nominal-gain relative-phase sum varies 0.57 dB across one firing period. The engine loop is 4.0015 seconds; its two halves have 0.008 waveform correlation, with only a 0.01 dB level difference. The 5,338 rpm seam is not unusually large, and one of 66 R6 engine loops has a seam jump above its own 95th-percentile within-loop jump. These measures show the intended changes, not perceived naturalness.
+
+The R6 Cerberus ZIP is `output/cerberus-mechanical-prototype-r6-20260923/bess-variant-cerberus_a-b516c17f94.zip` (SHA256 `cd7d93bfa009482873584e77602965098e0c80d1a74588c867cb67b9f1fd7114`). It contains 66 exhaust and 66 engine PCM24/48 kHz mono WAVs, 138 unique paths, valid CRCs, and no path collision with the original Automation ZIP. The installed file in `D:\BeamMP\current\mods` has the same hash; all twelve originals and twelve BESS variants remain present. A fresh optimized rerender reproduced the entire R6 ZIP byte for byte. R4 is still preserved in `D:\BeamMP\current\BESS-cerberus-naturalness-r4-backup-20260923`. The current source passes 51 Rust tests and strict Clippy. A silent 15-second audio-device check opened the default output at 48 kHz float, processed 1,499 callbacks, peaked at 1.539 ms CPU time, and reported zero budget overruns. A matching local application executable is at `dist/BESS-mechanical-preview-20260923/BESS.exe`; it is not a new public release. The reusable `tools/audit_variant_audio.py` and `output/cerberus-r4-r5-r6-audio-audit-20260923.json` record the comparisons.
+
+## R6 fleet candidates and provenance guard
+
+The other eleven vehicles have been rendered with the same R6 source into `output/all-vehicles-mechanical-r6-20260923`, but these candidates are not installed. Together with Cerberus, the twelve R6 add-ons contain 1,376 WAVs (688 engine and 688 exhaust) in 1,448 unique paths. `verification.json` records the source and add-on SHA256 hashes, cylinder counts, ZIP entry counts, and engine/exhaust RMS ranges. A fresh full pass decompressed every ZIP entry, checked for case-insensitive duplicate names and overlaps with each original Automation ZIP, and checked every WAV header for nonempty mono 48 kHz PCM24 audio. The source ZIP hashes matched the manifests. These checks establish package integrity, not an audible preference.
+
+The per-knot 12× gain limit leaves some engine-side rows unusually quiet: the lowest engine/exhaust WAV RMS ratios are about 0.0065 on Volk Icarus II, 0.011 on B5 C, 0.014 on B5 A and B5 GT, and 0.015 on Nord Optis. Raising those weak inferred layers indiscriminately would amplify exhaust leakage and modeled artifacts. Their audibility and any vehicle-specific balance changes therefore await listening.
+
+A conversion review found that standalone `variant::convert` previously compared source and processed ZIP entry names without comparing the rendered sound-bank fingerprint. It now refuses a same-layout Automation ZIP whose blend or source fingerprint differs from the render manifest. This guard changes no R6 WAV or add-on bytes. The local preview executable was rebuilt with the guard, and its bytes match the release-profile build.
+
+The simulated linear 50/50 blend of adjacent RPM WAVs still dips about 2.35 dB on load near 5,200 rpm for the exhaust, and 2.72 dB for the engine. BeamNG's exact sample crossfade law is not established here. This possible in-game level dip and R6's perceived naturalness require user listening; the other eleven add-ons are intentionally unchanged until the Cerberus approach is accepted.
+
+Because Automation supplies only exhaust audio, the inferred engine-side content cannot be validated as genuine valve-train or intake sound. [Experimental combustion/mechanical separation](https://saemobilus.sae.org/papers/assessment-combustion-mechanical-noise-separation-techniques-a-v8-engine-2017-01-1846) uses additional measurements unavailable in these vehicle exports. Independent engine-bay recordings would be needed to establish physical timbre, even if this proxy is preferred in game.

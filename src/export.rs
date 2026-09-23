@@ -120,13 +120,29 @@ pub fn package_name(bank: &Bank) -> String {
     format!("bess-{}-{}.zip", slug, &bank.source.fingerprint[..8])
 }
 
-fn loop_samples(
+fn aligned_warmup_frames(rpm: f32) -> usize {
+    let warmup_cycles = (rpm as f64 / 120.).ceil();
+    (warmup_cycles * 120. * 48000. / rpm as f64).round() as usize
+}
+
+pub(crate) fn loop_stems(
+    bank: Arc<Bank>,
+    p: Parameters,
+    h: Settings,
+    rpm: f32,
+    load: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    render_stems(bank, p, h, rpm, load, 4.)
+}
+
+fn render_stems(
     bank: Arc<Bank>,
     mut p: Parameters,
     mut h: Settings,
     rpm: f32,
     load: f32,
-) -> Vec<f32> {
+    engine_seconds: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     p.rpm = rpm;
     p.load = load;
     p.volume = 0.8;
@@ -139,25 +155,63 @@ fn loop_samples(
     h.roughness = 0.;
     h.fuel_cut = 0.;
     let mut engine = Hybrid::new(48000, p, h, Some(bank.clone()));
-    for _ in 0..48000 {
+    // Start every RPM knot at the same 720-degree phase. A fixed one-second
+    // preroll ends at a different crank angle for every RPM and makes adjacent
+    // BeamNG samples cancel as they crossfade.
+    for _ in 0..aligned_warmup_frames(rpm) {
         engine.next(true);
     }
     let cycle = 48000. * 120. / rpm;
     let frames = (cycle * (2. * 48000. / cycle).ceil()) as usize;
+    // The engine-side mechanical variation needs longer before it repeats.
+    // Its emitter has independent WAVs; keep the exhaust bank compact.
+    let engine_frames = (cycle * (engine_seconds * 48000. / cycle).ceil()) as usize;
     let overlap = cycle.round().max(64.) as usize;
-    let raw: Vec<f32> = (0..frames + overlap)
-        .map(|_| engine.next(true) / (0.8 * bank.gain))
+    let stems: Vec<_> = (0..engine_frames + overlap)
+        .map(|_| engine.next_stems(true))
         .collect();
-    let mut out = raw[overlap..].to_vec();
-    for i in 0..overlap {
-        let t = i as f32 / (overlap - 1) as f32;
-        let w = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
-        out[frames - overlap + i] = raw[frames + i] * (1. - w) + raw[i] * w;
-    }
-    out
+    let join = |frames: usize, sample: fn(&crate::hybrid::HybridStems) -> f32| {
+        let raw: Vec<f32> = stems
+            .iter()
+            .map(|stem| sample(stem) / (0.8 * bank.gain))
+            .collect();
+        let mut out = raw[overlap..overlap + frames].to_vec();
+        for i in 0..overlap {
+            let t = i as f32 / (overlap - 1) as f32;
+            let w = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
+            out[frames - overlap + i] = raw[frames + i] * (1. - w) + raw[i] * w;
+        }
+        out
+    };
+    (
+        join(frames, |s| s.exhaust),
+        join(engine_frames, |s| s.engine),
+        join(frames, |s| s.mixed),
+    )
 }
 
+/// Keep the previous full-replacement sound as a single mixed exhaust bank.
 pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Result<String, String> {
+    package_inner(dir, p, h, bank, false)
+}
+
+/// Produce the exhaust stem used by selectable variants with a second emitter.
+pub fn package_exhaust_stem(
+    dir: &Path,
+    p: Parameters,
+    h: Settings,
+    bank: Arc<Bank>,
+) -> Result<String, String> {
+    package_inner(dir, p, h, bank, true)
+}
+
+fn package_inner(
+    dir: &Path,
+    p: Parameters,
+    h: Settings,
+    bank: Arc<Bank>,
+    exhaust_only: bool,
+) -> Result<String, String> {
     p.validate()?;
     h.validate()?;
     // Verify the file has not been swapped since import before copying the vehicle.
@@ -216,9 +270,13 @@ pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Resul
                     "A WAV shared by multiple RPM points cannot be replaced unambiguously".into(),
                 );
             }
+            // Replacement and intermediate exhaust rendering use only their
+            // two-second channels; variant conversion renders the four-second
+            // engine stem separately with `loop_stems`.
+            let stems = render_stems(bank.clone(), p, h, rpm, layer as f32, 2.);
             replacements.insert(
                 name.to_owned(),
-                loop_samples(bank.clone(), p, h, rpm, layer as f32),
+                if exhaust_only { stems.0 } else { stems.2 },
             );
         }
     }
@@ -304,17 +362,40 @@ pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Resul
                 driving: Default::default(),
             },
         )?;
-        let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});
+        let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"render_channel":if exhaust_only {"exhaust"} else {"mixed"},"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});
         fs::write(
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        fs::write(dir.join("INSTALLATION.txt"),format!("BESS — full vehicle with modified engine loops\n\nThe vehicle selector shows: {display_name}\n\n1. Keep a backup of the original Automation ZIP.\n2. Disable the original vehicle in BeamNG's mod manager.\n3. Install {zip_name} in the mods folder under your BeamNG user folder.\n4. Enable only this copy. Do not enable both versions at once.\n5. Reload the vehicle and compare idle, acceleration, lift-off, and camera views.\n6. To restore the original, disable the BESS copy and re-enable the original.\n\nEach BESS copy has a distinct ZIP name to avoid collisions between vehicles.\nThe off-load and on-load loops cover every RPM point in the original blend.\nEvents and physics remain those of the original vehicle. BESS transients are not exported as a BeamNG driving script.\nThe listening volume is not applied to the mod; one common safety gain preserves the relative dynamics.\nIn-game validation is still required.\n")).map_err(|e|e.to_string())?;
+        let instructions = if exhaust_only {
+            "BESS intermediate exhaust-stem render\n\nDo not install this ZIP directly. It contains only the exhaust half of the selectable BESS sound and is an input to variant conversion. Install the final bess-variant-*.zip beside the original Automation vehicle instead.\n".to_owned()
+        } else {
+            format!(
+                "BESS — full vehicle with modified engine loops\n\nThe vehicle selector shows: {display_name}\n\n1. Keep a backup of the original Automation ZIP.\n2. Disable the original vehicle in BeamNG's mod manager.\n3. Install {zip_name} in the mods folder under your BeamNG user folder.\n4. Enable only this copy. Do not enable both versions at once.\n5. Reload the vehicle and compare idle, acceleration, lift-off, and camera views.\n6. To restore the original, disable the BESS copy and re-enable the original.\n\nEach BESS copy has a distinct ZIP name to avoid collisions between vehicles.\nThe off-load and on-load loops cover every RPM point in the original blend.\nEvents and physics remain those of the original vehicle. BESS transients are not exported as a BeamNG driving script.\nThe listening volume is not applied to the mod; one common safety gain preserves the relative dynamics.\nIn-game validation is still required.\n"
+            )
+        };
+        fs::write(dir.join("INSTALLATION.txt"), instructions).map_err(|e| e.to_string())?;
         Ok(format!("{} loops — {}", replacements.len(), dir.display()))
     })();
     if let Err(e) = &result {
         let _ = fs::write(dir.join("ERROR.txt"), e);
     }
     result
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::aligned_warmup_frames;
+
+    #[test]
+    fn export_preroll_lands_at_a_shared_crank_phase() {
+        for rpm in [803., 2215., 4989., 5338., 5712., 10_000.] {
+            let frames = aligned_warmup_frames(rpm);
+            assert!(frames >= 48_000);
+            let cycles = frames as f64 * rpm as f64 / (48_000. * 120.);
+            let sample_tolerance = rpm as f64 / (2. * 48_000. * 120.);
+            assert!((cycles - cycles.round()).abs() <= sample_tolerance + 1e-9);
+        }
+    }
 }

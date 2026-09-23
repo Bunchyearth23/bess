@@ -5,6 +5,7 @@ use crate::{
     project::Parameters,
 };
 use bdsp::{
+    delay::DelayLine,
     noise::{Noise, NoiseColor},
     resample::{SincQuality, SincTable},
     svf::{StateVariableFilter, SvfMode},
@@ -256,12 +257,81 @@ fn geometry(p: Parameters, h: Settings) -> Geometry {
     }
 }
 
+fn mechanical_cylinders(bank: Option<&Bank>, h: Settings) -> u32 {
+    (h.combustion.cylinders > 0)
+        .then_some(h.combustion.cylinders)
+        .or_else(|| bank.and_then(|bank| bank.engine_meta.as_ref().map(|meta| meta.cylinders)))
+        .unwrap_or(0)
+}
+
 /// Short-time level and covariance for a phase-safe A/B audition transition.
 /// This only changes the intermediate blend: pure A and pure B are untouched.
 struct TransitionLevel {
     a2: f32,
     b2: f32,
     ab: f32,
+}
+
+/// A quiet, irregular valve-cover/engine-block texture. The impact rate follows
+/// known cylinder metadata, but this does not assign a firing order or add an
+/// exhaust pulse. Fixed resonances and small timing/strength changes prevent an
+/// identical click from repeating in phase with the recorded exhaust.
+struct MechanicalImpacts {
+    slots: u32,
+    previous_slot: i64,
+    seed: u64,
+    delay: u32,
+    pending: f32,
+    cover: StateVariableFilter,
+    block: StateVariableFilter,
+}
+
+impl MechanicalImpacts {
+    fn new(rate: f32, slots: u32) -> Self {
+        Self {
+            slots,
+            previous_slot: -1,
+            seed: 0x4D45_4348_414E_4943,
+            delay: 0,
+            pending: 0.,
+            cover: StateVariableFilter::new(rate, 3300., 1.3, SvfMode::Bandpass),
+            block: StateVariableFilter::new(rate, 950., 0.85, SvfMode::Bandpass),
+        }
+    }
+
+    fn set_slots(&mut self, slots: u32) {
+        if self.slots != slots {
+            self.slots = slots;
+            self.previous_slot = -1;
+            self.delay = 0;
+            self.pending = 0.;
+        }
+    }
+
+    fn next(&mut self, cycle: f64, source_level: f32, load: f32) -> f32 {
+        if self.slots == 0 {
+            return 0.;
+        }
+        let slot = (cycle * self.slots as f64 + 0.13).floor() as i64;
+        if slot != self.previous_slot {
+            self.previous_slot = slot;
+            self.seed ^= self.seed << 13;
+            self.seed ^= self.seed >> 7;
+            self.seed ^= self.seed << 17;
+            // At 48 kHz the maximum offset is 0.21 ms. Strength changes remain
+            // small enough to preserve the engine's steady operating level.
+            self.delay = ((self.seed >> 32) % 11) as u32;
+            let strength = 0.78 + ((self.seed >> 48) as u16 as f32 / 65535.) * 0.44;
+            self.pending = source_level * (0.8 + 0.2 * load) * strength;
+        }
+        let impulse = if self.delay == 0 {
+            std::mem::take(&mut self.pending)
+        } else {
+            self.delay -= 1;
+            0.
+        };
+        self.cover.next_sample(impulse) + self.block.next_sample(impulse) * 0.38
+    }
 }
 impl TransitionLevel {
     fn new() -> Self {
@@ -327,6 +397,12 @@ pub struct Hybrid {
     intake_runner: Intake,
     cut: f32,
     dc: StateVariableFilter,
+    engine_dc: StateVariableFilter,
+    engine_texture: StateVariableFilter,
+    engine_cycle_delay: DelayLine,
+    engine_stem_dc: StateVariableFilter,
+    mechanical_impacts: MechanicalImpacts,
+    mechanical_source_energy: f32,
     raw_energy: f32,
     wet_energy: f32,
     compensation: f32,
@@ -352,6 +428,17 @@ pub struct Hybrid {
     edge_energy: f32,
     pressure_ready: f32,
 }
+
+/// BeamNG exhaust and engine emitters derived from one Automation recording.
+/// `mixed` remains the normal audition output. The engine stem also contains
+/// subtle modeled mechanical impacts, so the two export stems do not sum to it.
+#[derive(Clone, Copy, Debug)]
+pub struct HybridStems {
+    pub exhaust: f32,
+    pub engine: f32,
+    pub mixed: f32,
+}
+
 impl Hybrid {
     pub fn new(rate: u32, mut p: Parameters, h: Settings, bank: Option<Arc<Bank>>) -> Self {
         if let Some(bank) = &bank {
@@ -364,6 +451,8 @@ impl Hybrid {
         } else {
             None
         };
+        let mechanical_cylinders = mechanical_cylinders(bank.as_deref(), h);
+        let max_cycle_seconds = bank.as_ref().map_or(0.3, |bank| 120. / bank.min_rpm) * 1.05;
         Self {
             bank,
             fallback,
@@ -392,6 +481,12 @@ impl Hybrid {
             intake_runner: Intake::new(rate, h.intake_length),
             cut: 0.,
             dc: filter(18., 0.707, SvfMode::Highpass),
+            engine_dc: filter(18., 0.707, SvfMode::Highpass),
+            engine_texture: filter(350., 0.707, SvfMode::Highpass),
+            engine_cycle_delay: DelayLine::new(rate, max_cycle_seconds),
+            engine_stem_dc: filter(18., 0.707, SvfMode::Highpass),
+            mechanical_impacts: MechanicalImpacts::new(rate, mechanical_cylinders),
+            mechanical_source_energy: 0.,
             raw_energy: 0.001,
             wet_energy: 0.001,
             compensation: 1.,
@@ -428,6 +523,8 @@ impl Hybrid {
         }
         self.target = p;
         self.h = h;
+        let mechanical_cylinders = mechanical_cylinders(self.bank.as_deref(), h);
+        self.mechanical_impacts.set_slots(mechanical_cylinders);
         if let Some(e) = &mut self.fallback {
             e.set_parameters(p);
         }
@@ -439,8 +536,16 @@ impl Hybrid {
         self.fast_load
     }
     pub fn next(&mut self, playing: bool) -> f32 {
+        self.next_stems(playing).mixed
+    }
+    pub fn next_stems(&mut self, playing: bool) -> HybridStems {
         if let Some(e) = &mut self.fallback {
-            return e.next_sample(playing);
+            let sample = e.next_sample(playing);
+            return HybridStems {
+                exhaust: sample,
+                engine: 0.,
+                mixed: sample,
+            };
         }
         let smooth = 1. / (self.rate * 0.025);
         self.gain += (if playing { self.target.volume } else { 0. } - self.gain) * smooth;
@@ -501,6 +606,7 @@ impl Hybrid {
                 uneven
             );
             self.low.set_cutoff(110. + self.p.rpm * 0.025);
+            self.engine_texture.set_cutoff(280. + self.p.rpm * 0.06);
             self.intake
                 .set_cutoff(600. + self.fast_load * 1800. + self.p.rpm * 0.15);
             self.muffler
@@ -667,6 +773,35 @@ impl Hybrid {
                 + intake
                 + mechanical
                 + turbo;
+        // Automation supplies an exhaust recording only. Keep its periodic
+        // exhaust orders out of the companion emitter: emphasize the
+        // non-periodic, upper-band source residual. A small, source-level
+        // driven mechanical texture replaces the continuous synthetic airflow
+        // bed. It is only emitted when the vehicle's cylinder count is known.
+        let upper_residual = self.engine_texture.next_sample(residual);
+        // A one-cycle difference suppresses the exhaust orders still leaking
+        // through the source residual. Its remaining grain is recorded, not a
+        // second independent noise bed, and follows live RPM continuously.
+        let previous_cycle = self
+            .engine_cycle_delay
+            .read_at(self.rate * 120. / self.p.rpm);
+        self.engine_cycle_delay.write(upper_residual);
+        let irregular_residual = upper_residual - previous_cycle * 0.75;
+        self.mechanical_source_energy +=
+            (upper_residual * upper_residual - self.mechanical_source_energy) / (self.rate * 0.15);
+        let engine_air = irregular_residual * self.p.intake * (0.55 + 0.25 * self.fast_load);
+        let impacts = self.mechanical_impacts.next(
+            self.wet_cycle,
+            self.mechanical_source_energy.max(0.).sqrt() * self.p.mechanical * 12.,
+            self.fast_load,
+        );
+        let engine_channel = self.engine_stem_dc.next_sample(
+            (engine_air + mechanical * 0.5 + impacts + (intake + turbo) * 0.1)
+                * self.current.coloration,
+        );
+        let mixed_engine = self
+            .engine_dc
+            .next_sample((intake + mechanical + turbo) * self.current.coloration);
         let direct =
             source * self.p.exhaust * self.current.maps.exhaust.at(position, self.fast_load);
         let wet = self.dc.next_sample(
@@ -690,10 +825,16 @@ impl Hybrid {
             .mix(raw, wet * self.compensation, self.blend, self.rate)
             * self.gain;
         // Safety ceiling only: normal operating levels do not hit this branch.
-        if out.abs() > 0.95 {
+        let mixed = if out.abs() > 0.95 {
             out.signum() * (0.95 + 0.049 * ((out.abs() - 0.95) / 0.049).tanh())
         } else {
             out
+        };
+        let engine = engine_channel * self.compensation * self.blend * self.gain;
+        HybridStems {
+            exhaust: mixed - mixed_engine * self.compensation * self.blend * self.gain,
+            engine,
+            mixed,
         }
     }
 }

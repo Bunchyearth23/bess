@@ -109,6 +109,43 @@ fn rms_diff(a: &[f32], b: &[f32]) -> f64 {
 }
 
 #[test]
+fn reconstructed_engine_stem_is_distinct_and_preserves_audition_mix() {
+    let bank = fixture();
+    let p = params();
+    let h = Settings::default();
+    let mut normal = Hybrid::new(48000, p, h, Some(bank.clone()));
+    let mut split = Hybrid::new(48000, p, h, Some(bank.clone()));
+    let mut engine_energy = 0.;
+    let mut exhaust_energy = 0.;
+    for i in 0..48000 {
+        let sample = normal.next(true);
+        let stems = split.next_stems(true);
+        assert_eq!(sample, stems.mixed);
+        assert!(stems.exhaust.is_finite() && stems.engine.is_finite());
+        if i >= 24000 {
+            engine_energy += stems.engine * stems.engine;
+            exhaust_energy += stems.exhaust * stems.exhaust;
+        }
+    }
+    assert!(
+        engine_energy > 1e-6,
+        "The reconstructed engine stem is silent"
+    );
+    assert!(
+        engine_energy < exhaust_energy,
+        "The companion stem is an exhaust copy"
+    );
+
+    let mut source_only = p;
+    source_only.intake = 0.;
+    source_only.mechanical = 0.;
+    let mut split = Hybrid::new(48000, source_only, h, Some(bank));
+    for _ in 0..48000 {
+        assert_eq!(split.next_stems(true).engine, 0.);
+    }
+}
+
+#[test]
 fn imported_bank_and_project_retain_provenance() {
     let bank = fixture();
     assert_eq!(bank.layers[0].len(), 3);

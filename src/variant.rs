@@ -1,5 +1,10 @@
 //! Add a selectable BESS configuration without replacing the Automation vehicle.
-use crate::{bank::Bank, export, hybrid::Settings, project::Parameters};
+use crate::{
+    bank::{self, Bank},
+    export,
+    hybrid::Settings,
+    project::Parameters,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -144,7 +149,9 @@ fn clone_engine_part(
     original_part: &str,
     new_part: &str,
     original_sample: &str,
-    new_sample: &str,
+    new_exhaust_sample: &str,
+    new_engine_sample: &str,
+    cylinders: Option<u32>,
 ) -> Result<Vec<u8>, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
     let quoted = serde_json::to_string(original_part).map_err(|e| e.to_string())?;
@@ -166,14 +173,83 @@ fn clone_engine_part(
         return Err("Engine part has no unique sound sampleName".into());
     }
     let new_key = serde_json::to_string(new_part).map_err(|e| e.to_string())?;
-    let cloned = original
-        .replacen(&quoted, &new_key, 1)
-        .replacen(original_sample, new_sample, 1);
+    let mut cloned =
+        original
+            .replacen(&quoted, &new_key, 1)
+            .replacen(original_sample, new_exhaust_sample, 1);
     if !cloned.contains("\"slotType\" : \"Camso_Engine\"")
         && !cloned.contains("\"slotType\": \"Camso_Engine\"")
     {
         return Err("Cloned engine part does not use the Camso_Engine slot".into());
     }
+    let main_key = "\"mainEngine\"";
+    let mut main_positions = cloned
+        .match_indices(main_key)
+        .map(|(pos, _)| pos)
+        .filter(|&pos| {
+            cloned
+                .as_bytes()
+                .get(skip_ws(cloned.as_bytes(), pos + main_key.len()))
+                == Some(&b':')
+        });
+    let main_start = main_positions
+        .next()
+        .ok_or("Engine part has no mainEngine")?;
+    if main_positions.next().is_some() {
+        return Err("Engine part has ambiguous mainEngine fields".into());
+    }
+    let main_colon = skip_ws(cloned.as_bytes(), main_start + main_key.len());
+    if cloned.as_bytes().get(main_colon) != Some(&b':') {
+        return Err("mainEngine is not a JBeam field".into());
+    }
+    let main_object = skip_ws(cloned.as_bytes(), main_colon + 1);
+    let main_end = object_end(cloned.as_bytes(), main_object)?;
+    let reference = "\"soundConfigExhaust\"";
+    let references: Vec<_> = cloned[main_object..main_end]
+        .match_indices(reference)
+        .map(|(pos, _)| main_object + pos)
+        .filter(|&pos| {
+            cloned
+                .as_bytes()
+                .get(skip_ws(cloned.as_bytes(), pos + reference.len()))
+                == Some(&b':')
+        })
+        .collect();
+    if references.len() != 1 || cloned[main_object..main_end].contains("\"soundConfig\"") {
+        return Err("Expected one exhaust-only mainEngine sound reference".into());
+    }
+    let reference_pos = references[0];
+    let reference_colon = skip_ws(cloned.as_bytes(), reference_pos + reference.len());
+    let reference_value = skip_ws(cloned.as_bytes(), reference_colon + 1);
+    if cloned.as_bytes().get(reference_colon) != Some(&b':')
+        || !cloned[reference_value..].starts_with("\"soundConfigExhaust\"")
+    {
+        return Err("mainEngine exhaust sound reference is unsupported".into());
+    }
+    cloned.insert_str(reference_pos, "\"soundConfig\": \"soundConfig\",\n\t\t\t");
+    let mut engine_config = json!({
+        "sampleName": new_engine_sample,
+        "mainGain": -2,
+        "intakeMuffling": 0.5,
+        "onLoadGain": 1.1,
+        "offLoadGain": 0.8,
+        "maxLoadMix": 1,
+        "minLoadMix": 0,
+        "eqFundamentalGain": -3
+    });
+    if let Some(cylinders) = cylinders {
+        engine_config["fundamentalFrequencyCylinderCount"] = json!(cylinders);
+    }
+    let close = cloned.len() - 1;
+    let separator = if cloned[..close].trim_end().ends_with(',') {
+        ""
+    } else {
+        ","
+    };
+    cloned.insert_str(
+        close,
+        &format!("{separator}\n\t\t\"soundConfig\": {engine_config}\n\t"),
+    );
     Ok(format!("{{\n{cloned}\n}}\n").into_bytes())
 }
 
@@ -183,6 +259,33 @@ fn write_file(writer: &mut ZipWriter<File>, path: &str, bytes: &[u8]) -> Result<
         .start_file(path, options)
         .map_err(|e| e.to_string())?;
     writer.write_all(bytes).map_err(|e| e.to_string())
+}
+
+fn pcm24(samples: &[f32], gain: f32) -> Result<Vec<u8>, String> {
+    let mut wav = Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(
+            &mut wav,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 24,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        for &sample in samples {
+            let value = sample * gain;
+            if !value.is_finite() || value.abs() > 0.951 {
+                return Err("Engine stem is non-finite or clips PCM24".into());
+            }
+            writer
+                .write_sample((value * 8_388_607.) as i32)
+                .map_err(|e| e.to_string())?;
+        }
+        writer.finalize().map_err(|e| e.to_string())?;
+    }
+    Ok(wav.into_inner())
 }
 
 fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> {
@@ -204,6 +307,9 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
             .as_ref()
     {
         return Err("Processed ZIP does not match its manifest".into());
+    }
+    if previous["render_channel"] != "exhaust" {
+        return Err("Variant requires a BESS exhaust-stem render, not a mixed replacement".into());
     }
     let mut original = ZipArchive::new(File::open(source).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -248,11 +354,29 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         .and_then(|base| base.strip_suffix(".sfxBlend2D.json"))
         .ok_or("Invalid source blend name")?;
     let new_sample = format!("{old_sample}_BESS_{short}");
+    let engine_sample = format!("{old_sample}_BESS_ENGINE_{short}");
     let config_id = format!("bess_{old_config}_{short}");
     let config_path = format!("{root}{config_id}.pc");
     let info_path = format!("{root}info_{config_id}.json");
     let engine_path = format!("{root}bess_engine_{short}.jbeam");
     let blend_path = format!("art/sound/blends/{new_sample}.sfxBlend2D.json");
+    let engine_blend_path = format!("art/sound/blends/{engine_sample}.sfxBlend2D.json");
+
+    let bank = Arc::new(Bank::load(source, Some(&source_blend))?);
+    // Standalone conversion may be given a different Automation ZIP with the
+    // same member names. The rendered exhaust and reconstructed engine must
+    // still come from the exact sound bank recorded in the render manifest.
+    if previous["source"]["fingerprint"] != bank.source.fingerprint
+        || previous["source"]["blend"] != bank.source.blend
+    {
+        return Err("Automation source does not match the rendered sound bank".into());
+    }
+    let p: Parameters = serde_json::from_value(previous["parameters"].clone())
+        .map_err(|e| format!("Invalid processed parameters: {e}"))?;
+    let h: Settings = serde_json::from_value(previous["settings"].clone())
+        .map_err(|e| format!("Invalid processed settings: {e}"))?;
+    p.validate()?;
+    h.validate()?;
 
     let mut config: Value = serde_json::from_slice(&read(&mut original, &source_config, MAX_META)?)
         .map_err(|e| e.to_string())?;
@@ -277,23 +401,38 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         &new_part,
         old_sample,
         &new_sample,
+        &engine_sample,
+        bank.engine_meta.as_ref().map(|meta| meta.cylinders),
     )?;
-    let mut blend: Value = serde_json::from_slice(&read(&mut original, &source_blend, MAX_META)?)
+    let blend: Value = serde_json::from_slice(&read(&mut original, &source_blend, MAX_META)?)
         .map_err(|e| e.to_string())?;
     let layers = blend["samples"]
-        .as_array_mut()
+        .as_array()
         .filter(|layers| layers.len() == 2)
+        .cloned()
         .ok_or("Original blend must have two load layers")?;
     let old_prefix = format!("art/sound/engine/{old_sample}/");
     let new_prefix = format!("art/sound/engine/{new_sample}/");
+    let engine_prefix = format!("art/sound/engine/{engine_sample}/");
+    let mut exhaust_blend = blend.clone();
+    let mut engine_blend = blend;
     let mut wav_pairs = Vec::new();
     let mut seen_old = HashSet::new();
-    for layer in layers {
-        for point in layer.as_array_mut().ok_or("Invalid blend load layer")? {
+    for (load, layer) in layers.iter().enumerate() {
+        for (index, point) in layer
+            .as_array()
+            .ok_or("Invalid blend load layer")?
+            .iter()
+            .enumerate()
+        {
             let old_path = point[0]
                 .as_str()
                 .ok_or("Invalid blend WAV path")?
                 .to_owned();
+            let rpm = point[1]
+                .as_f64()
+                .filter(|rpm| rpm.is_finite() && (200.0..=20_000.0).contains(rpm))
+                .ok_or("Invalid blend RPM")? as f32;
             let suffix = old_path
                 .strip_prefix(&old_prefix)
                 .filter(|suffix| !suffix.is_empty() && !suffix.contains('/'))
@@ -302,11 +441,14 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
                 return Err("Blend has missing or duplicate WAV paths".into());
             }
             let new_path = format!("{new_prefix}{suffix}");
-            point[0] = json!(new_path);
-            wav_pairs.push((old_path, new_path));
+            let engine_path = format!("{engine_prefix}ENG_{suffix}");
+            exhaust_blend["samples"][load][index][0] = json!(new_path);
+            engine_blend["samples"][load][index][0] = json!(engine_path);
+            wav_pairs.push((old_path, new_path, engine_path, rpm, load as f32));
         }
     }
-    let blend_bytes = serde_json::to_vec_pretty(&blend).map_err(|e| e.to_string())?;
+    let blend_bytes = serde_json::to_vec_pretty(&exhaust_blend).map_err(|e| e.to_string())?;
+    let engine_blend_bytes = serde_json::to_vec_pretty(&engine_blend).map_err(|e| e.to_string())?;
     let source_thumb = format!("{root}{old_config}.png");
     let target_thumb = format!("{root}{config_id}.png");
     let thumb = if original_names.contains(&source_thumb) {
@@ -319,14 +461,15 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         info_path.clone(),
         engine_path.clone(),
         blend_path.clone(),
+        engine_blend_path.clone(),
     ]
     .into_iter()
     .collect();
     if thumb.is_some() {
         target_paths.insert(target_thumb.clone());
     }
-    for (_, path) in &wav_pairs {
-        if !target_paths.insert(path.clone()) {
+    for (_, exhaust_path, engine_path, _, _) in &wav_pairs {
+        if !target_paths.insert(exhaust_path.clone()) || !target_paths.insert(engine_path.clone()) {
             return Err("Duplicate BESS variant path".into());
         }
     }
@@ -337,17 +480,15 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         return Err("BESS variant would overwrite an original vehicle file".into());
     }
 
-    let zip_file = format!("bess-variant-{vehicle}-{short}.zip");
-    let partial = dir.join(format!("{zip_file}.partial"));
-    let mut output = ZipWriter::new(File::create(&partial).map_err(|e| e.to_string())?);
-    write_file(&mut output, &config_path, &config_bytes)?;
-    write_file(&mut output, &info_path, &info_bytes)?;
-    write_file(&mut output, &engine_path, &engine_bytes)?;
-    write_file(&mut output, &blend_path, &blend_bytes)?;
-    if let Some(bytes) = thumb {
-        write_file(&mut output, &target_thumb, &bytes)?;
-    }
-    for (old_path, new_path) in &wav_pairs {
+    // The two BeamNG emitters need separate recordings. The exhaust loops come
+    // from the processed archive; the companion stem is reconstructed from the
+    // same source, RPM points, load rows, and saved BESS settings.
+    let mut exhaust_wavs = Vec::with_capacity(wav_pairs.len());
+    let mut engine_loops = Vec::with_capacity(wav_pairs.len());
+    let mut engine_gains = Vec::with_capacity(wav_pairs.len());
+    let mut engine_ratios = Vec::with_capacity(wav_pairs.len());
+    let mut engine_points = Vec::with_capacity(wav_pairs.len());
+    for (old_path, _, _, rpm, load) in &wav_pairs {
         let wav = read(&mut rendered, old_path, MAX_WAV)?;
         let spec = hound::WavReader::new(Cursor::new(&wav))
             .map_err(|e| e.to_string())?
@@ -361,7 +502,74 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
                 "Rendered WAV is not mono 48 kHz / PCM24: {old_path}"
             ));
         }
-        write_file(&mut output, new_path, &wav)?;
+        let (_, exhaust) = bank::decode_wav(&wav)?;
+        let (_, engine, _) = export::loop_stems(bank.clone(), p, h, *rpm, *load);
+        if engine.is_empty() || exhaust.is_empty() || engine.len() < exhaust.len() {
+            return Err(format!("Invalid engine or exhaust loop length: {old_path}"));
+        }
+        let mean_power = |samples: &[f32]| -> f64 {
+            samples.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / samples.len() as f64
+        };
+        let exhaust_rms = mean_power(&exhaust).sqrt() as f32;
+        let engine_rms = mean_power(&engine).sqrt() as f32;
+        let engine_peak = engine.iter().fold(0f32, |peak, &x| peak.max(x.abs()));
+        if !exhaust_rms.is_finite()
+            || !engine_rms.is_finite()
+            || !engine_peak.is_finite()
+            || exhaust_rms < 1e-7
+            || engine_rms < 1e-7
+        {
+            return Err(format!(
+                "Exhaust or engine stem is silent or non-finite: {old_path}"
+            ));
+        }
+        // The engine-side signal is inferred from an exhaust recording. A
+        // fixed row-wide gain made some RPM knots dominate the sound. Balance
+        // each knot, but never rescue a weak proxy with an enormous boost.
+        let target_ratio = if *load == 0. { 0.35 } else { 0.55 };
+        let gain = (target_ratio * exhaust_rms / engine_rms)
+            .clamp(0.25, 12.)
+            .min(0.94 / engine_peak);
+        let ratio = gain * engine_rms / exhaust_rms;
+        engine_gains.push(gain);
+        engine_ratios.push(ratio);
+        engine_points.push(json!({"rpm":rpm,"load":load,"gain":gain,"rms_ratio":ratio}));
+        exhaust_wavs.push(wav);
+        engine_loops.push(engine);
+    }
+    let row_range = |values: &[f32], layer: f32| -> (f32, f32) {
+        wav_pairs
+            .iter()
+            .zip(values.iter())
+            .filter(|((_, _, _, _, load), _)| *load == layer)
+            .fold((f32::INFINITY, 0f32), |(min, max), (_, &value)| {
+                (min.min(value), max.max(value))
+            })
+    };
+    if row_range(&engine_ratios, 0.).0 == f32::INFINITY
+        || row_range(&engine_ratios, 1.).0 == f32::INFINITY
+    {
+        return Err("Empty blend load layer".into());
+    }
+
+    let zip_file = format!("bess-variant-{vehicle}-{short}.zip");
+    let partial = dir.join(format!("{zip_file}.partial"));
+    let mut output = ZipWriter::new(File::create(&partial).map_err(|e| e.to_string())?);
+    write_file(&mut output, &config_path, &config_bytes)?;
+    write_file(&mut output, &info_path, &info_bytes)?;
+    write_file(&mut output, &engine_path, &engine_bytes)?;
+    write_file(&mut output, &blend_path, &blend_bytes)?;
+    write_file(&mut output, &engine_blend_path, &engine_blend_bytes)?;
+    if let Some(bytes) = thumb {
+        write_file(&mut output, &target_thumb, &bytes)?;
+    }
+    for (((_, exhaust_path, engine_path, _, _), (wav, engine)), &gain) in wav_pairs
+        .iter()
+        .zip(exhaust_wavs.iter().zip(engine_loops.iter()))
+        .zip(engine_gains.iter())
+    {
+        write_file(&mut output, exhaust_path, wav)?;
+        write_file(&mut output, engine_path, &pcm24(engine, gain)?)?;
     }
     output.finish().map_err(|e| e.to_string())?;
     let mut check = ZipArchive::new(File::open(&partial).map_err(|e| e.to_string())?)
@@ -370,7 +578,14 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         return Err("BESS variant ZIP verification failed".into());
     }
     fs::rename(&partial, dir.join(&zip_file)).map_err(|e| e.to_string())?;
-    let wav_paths: Vec<_> = wav_pairs.into_iter().map(|(_, new)| new).collect();
+    let wav_paths: Vec<_> = wav_pairs
+        .iter()
+        .map(|(_, path, _, _, _)| path.clone())
+        .collect();
+    let engine_wav_paths: Vec<_> = wav_pairs
+        .iter()
+        .map(|(_, _, path, _, _)| path.clone())
+        .collect();
     let report = json!({
         "kind":"configuration_addon",
         "version":env!("CARGO_PKG_VERSION"),
@@ -382,10 +597,16 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
         "thumbnail_path":if original_names.contains(&source_thumb) { Some(target_thumb) } else { None },
         "engine_path":engine_path,
         "blend_path":blend_path,
+        "engine_blend_path":engine_blend_path,
         "wav_paths":wav_paths,
+        "engine_wav_paths":engine_wav_paths,
         "display_name":display_name,
         "engine_part":new_part,
         "sample_id":new_sample,
+        "engine_sample_id":engine_sample,
+        "engine_stem_gain":{"off_load":row_range(&engine_gains,0.),"on_load":row_range(&engine_gains,1.)},
+        "engine_stem_rms_ratio":{"off_load":row_range(&engine_ratios,0.),"on_load":row_range(&engine_ratios,1.)},
+        "engine_stem_points":engine_points,
         "source_archive":source,
         "processed_archive":processed,
         "source_sha256":source_hash,
@@ -409,7 +630,7 @@ fn build(source: &Path, processed: &Path, dir: &Path) -> Result<String, String> 
     }
     fs::write(
         dir.join("INSTALLATION.txt"),
-        format!("BESS configuration add-on for {vehicle}\n\n1. Keep the original Automation vehicle ZIP enabled.\n2. Disable any earlier full-replacement BESS ZIP for this vehicle.\n3. Place {zip_file} in your active BeamNG mods folder.\n4. In the vehicle selector, open the original vehicle and choose the {display_name} configuration.\n5. To return to the stock sound, select the original configuration.\n\nThe add-on adds only a configuration, an alternate engine part, and uniquely named audio. It does not replace the original model or sound files. BESS driving transients are not exported as a BeamNG controller. Test the sound in BeamNG; structural validation is not an in-game test.\n"),
+        format!("BESS configuration add-on for {vehicle}\n\n1. Keep the original Automation vehicle ZIP enabled.\n2. Disable any earlier full-replacement BESS ZIP for this vehicle.\n3. Place {zip_file} in your active BeamNG mods folder.\n4. In the vehicle selector, open the original vehicle and choose the {display_name} configuration.\n5. Compare the stock and BESS configurations from the hood, cockpit, and tailpipe cameras.\n\nThe add-on adds a configuration, an alternate engine part, and separate engine/intake and exhaust audio banks. It does not replace the original model or sound files. BESS driving transients are not exported as a BeamNG controller. Structural validation is not an in-game listening test.\n"),
     )
     .map_err(|e| e.to_string())?;
     Ok(zip_file)
@@ -430,9 +651,20 @@ pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Resul
     fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
     let staging = dir.join(".bess-render");
     let result = (|| {
-        export::package(&staging, p, h, bank.clone())?;
+        export::package_exhaust_stem(&staging, p, h, bank.clone())?;
         let processed = staging.join(export::package_name(&bank));
         let zip_file = build(Path::new(&bank.source.archive), &processed, dir)?;
+        let manifest_path = dir.join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        manifest["processed_archive"] = Value::Null;
+        manifest["processed_archive_note"] = json!("Temporary render removed after export");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(format!("{zip_file} — {}", dir.display()))
     })();
     if result.is_ok() {
@@ -462,7 +694,7 @@ mod tests {
   "information": {"name":"Literal { brace"},
   "slotType" : "Camso_Engine",
   "soundConfigExhaust": {"sampleName":"SOURCE"},
-  /* { ignored } */ "mainEngine": {"note":"escaped \" }"}
+  /* { ignored } */ "mainEngine": {"note":"escaped \" }", "soundConfigExhaust":"soundConfigExhaust"}
 },
 "Camso_EngineManagement_abc": {"slotType":"Camso_EngineManagement"}
 }"#;
@@ -472,11 +704,16 @@ mod tests {
             "Camso_Engine_abc_BESS",
             "SOURCE",
             "SOURCE_BESS",
+            "SOURCE_BESS_ENGINE",
+            Some(8),
         )
         .unwrap();
         let text = String::from_utf8(cloned).unwrap();
         assert!(text.contains("Camso_Engine_abc_BESS"));
         assert!(text.contains("SOURCE_BESS"));
+        assert!(text.contains("SOURCE_BESS_ENGINE"));
+        assert!(text.contains("\"soundConfig\": \"soundConfig\""));
+        assert!(text.contains("\"fundamentalFrequencyCylinderCount\":8"));
         assert!(!text.contains("Camso_EngineManagement_abc"));
     }
 }
