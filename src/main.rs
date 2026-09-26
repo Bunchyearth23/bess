@@ -3,7 +3,7 @@ mod audio;
 use bess::{
     bank::Bank,
     beamng, beamng_level,
-    bench::AuditionMix,
+    bench::{AuditionMix, BeamNgCamera},
     drive::{Controls, Mode},
     hybrid::Settings,
     project::{self, Parameters, Project},
@@ -64,6 +64,7 @@ struct App {
     audio: Option<audio::Audio>,
     playing: bool,
     audition_mix: AuditionMix,
+    camera: BeamNgCamera,
     driving: Controls,
     restart: u64,
     show_driving: bool,
@@ -100,6 +101,7 @@ impl App {
             audio: None,
             playing: false,
             audition_mix: AuditionMix::Live,
+            camera: BeamNgCamera::Cockpit,
             driving: Controls {
                 mode: Mode::Simulated,
                 ..Default::default()
@@ -356,20 +358,43 @@ impl App {
         } else {
             ui.small("B uses the Automation recording as a seed. Its additional engine-side layer is estimated from exhaust-only audio.");
         }
-        if self.bank.is_some() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("BeamNG camera:");
+                let cams = [
+                    (BeamNgCamera::Cockpit, "🛋 Cockpit / Interior"),
+                    (BeamNgCamera::Hood, "🚗 Hood"),
+                    (BeamNgCamera::Tailpipe, "💨 Tailpipe"),
+                    (BeamNgCamera::Orbit, "🌐 Orbit / Exterior"),
+                ];
+                for (cam, label) in cams {
+                    let is_active = self.audition_mix == AuditionMix::BeamNgTwoEmitter && self.camera == cam;
+                    if ui.selectable_label(is_active, label).clicked() {
+                        self.audition_mix = AuditionMix::BeamNgTwoEmitter;
+                        self.camera = cam;
+                    }
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label("Listening mix:");
-                ui.selectable_value(&mut self.audition_mix, AuditionMix::Live, "BESS live mix");
                 ui.selectable_value(
                     &mut self.audition_mix,
                     AuditionMix::BeamNgTwoEmitter,
                     "BeamNG two-emitter preview",
                 );
+                ui.selectable_value(&mut self.audition_mix, AuditionMix::Live, "BESS live mix");
             });
             if self.audition_mix == AuditionMix::BeamNgTwoEmitter {
-                ui.small("Preview of the standard source-guided BeamNG export, even if experimental live sound is enabled. This approximates the two emitters in mono and assumes -8 dB engine gain relative to exhaust. BeamNG camera, cabin and spatial filtering can change what you hear. A remains the source reference.");
+                ui.small(self.camera.description());
+                if let Some(audio) = &self.audio {
+                    let peak = f32::from_bits(audio.meter.peak.load(Ordering::Relaxed));
+                    let peak_db = if peak > 1e-5 { 20. * peak.log10() } else { -100. };
+                    ui.label(format!("Live peak ({}) : {peak_db:.1} dBFS", self.camera.label()));
+                } else if self.bank.is_none() {
+                    ui.small("💡 Import a vehicle (Import Automation ZIP…) to preview audio.");
+                }
             }
-        }
+        });
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -646,7 +671,7 @@ fn adjacent_level_points(
 }
 fn level_span(
     pair: (&beamng_level::Point, &beamng_level::Point),
-    value: fn(&beamng_level::Point) -> f32,
+    value: impl Fn(&beamng_level::Point) -> f32,
     unit: &str,
 ) -> String {
     let a = value(pair.0);
@@ -711,6 +736,34 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
     } else {
         ui.small("Positive exhaust values have more AC energy than the original WAV at the same RPM and load. DC offset is excluded from RMS; engine and exhaust play from different locations in the vehicle.");
     }
+    ui.add_space(4.0);
+    ui.strong("BeamNG camera volume preview");
+    ui.small("Estimated in-game levels by camera position and cabin insulation:");
+    egui::Grid::new("beamng-camera-levels")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Camera / Perspective");
+            ui.strong("Off load (idle/decel)");
+            ui.strong("Full load");
+            ui.strong("Engine / Exhaust balance");
+            ui.end_row();
+            for camera in [
+                BeamNgCamera::Cockpit,
+                BeamNgCamera::Hood,
+                BeamNgCamera::Tailpipe,
+                BeamNgCamera::Orbit,
+            ] {
+                let off_rms = level_span(off, |p| p.camera_rms_dbfs(camera), "dBFS");
+                let on_rms = level_span(on, |p| p.camera_rms_dbfs(camera), "dBFS");
+                let eng_share = on.1.camera_engine_share(camera);
+                let ex_share = 100. - eng_share;
+                ui.label(camera.label());
+                ui.label(off_rms);
+                ui.label(on_rms);
+                ui.label(format!("{eng_share:.0}% eng. / {ex_share:.0}% exh."));
+                ui.end_row();
+            }
+        });
     ui.collapsing("WAV level details", |ui| {
         egui::Grid::new("beamng-export-level-details")
             .striped(true)
@@ -799,6 +852,28 @@ mod level_ui_tests {
             adjacent_level_points(&report, 0., 9000.).unwrap().1.rpm,
             5338.
         );
+    }
+
+    #[test]
+    fn camera_level_preview_orders_cockpit_quieter_than_tailpipe() {
+        let pt = beamng_level::Point {
+            rpm: 3000.,
+            load: 1.,
+            source_rms_dbfs: -15.,
+            exhaust_rms_dbfs: -15.,
+            engine_rms_dbfs: -23.,
+            exhaust_peak_dbfs: -6.,
+            engine_peak_dbfs: -12.,
+            exhaust_vs_source_db: 0.,
+            engine_vs_exhaust_db: -8.,
+        };
+        let cockpit = pt.camera_rms_dbfs(BeamNgCamera::Cockpit);
+        let tailpipe = pt.camera_rms_dbfs(BeamNgCamera::Tailpipe);
+        let hood = pt.camera_rms_dbfs(BeamNgCamera::Hood);
+        let orbit = pt.camera_rms_dbfs(BeamNgCamera::Orbit);
+        assert!(cockpit < tailpipe, "Cockpit should be quieter than tailpipe due to cabin insulation");
+        assert!(cockpit.is_finite() && tailpipe.is_finite() && hood.is_finite() && orbit.is_finite());
+        assert!(pt.camera_engine_share(BeamNgCamera::Hood) > pt.camera_engine_share(BeamNgCamera::Tailpipe));
     }
 }
 impl eframe::App for App {
@@ -1006,6 +1081,7 @@ impl eframe::App for App {
                         slider(ui, "Exhaust edge", &mut self.settings.generated_edge, 0.0..=2.0);
                         slider(ui, "Flow texture", &mut self.settings.generated_flow, 0.0..=2.0);
                         slider(ui, "Mechanical detail", &mut self.settings.generated_mechanics, 0.0..=2.0);
+                        slider(ui, "Idle gain", &mut self.settings.idle_gain, 0.0..=2.0);
                         ui.small("This is an experimental exhaust-guided model. Its intake and mechanical sound are estimates, not separate recordings.");
                     } else {
                     slider(ui,"Automation timbre retained",&mut self.settings.source_timbre,0.0..=1.0);
@@ -1014,6 +1090,7 @@ impl eframe::App for App {
                     slider(ui,"Exhaust level",&mut self.params.exhaust,0.0..=1.0);
                     slider(ui,"Intake level",&mut self.params.intake,0.0..=1.0);
                     slider(ui,"Mechanical level",&mut self.params.mechanical,0.0..=1.0);
+                    slider(ui, "Idle gain", &mut self.settings.idle_gain, 0.0..=2.0);
                     if ui.add_enabled(self.bank.is_some(),egui::Button::new("Fit vehicle / natural background")).clicked()
                         && let Some(bank)=&self.bank {
                             let enhanced=self.settings.enhanced;let level_match=self.settings.level_match;
@@ -1113,6 +1190,12 @@ impl eframe::App for App {
                         "Intake texture",
                         &mut self.settings.texture,
                         0.0..=1.0,
+                    );
+                    slider(
+                        ui,
+                        "Idle gain",
+                        &mut self.settings.idle_gain,
+                        0.0..=2.0,
                     );
                     slider(
                         ui,
@@ -1272,6 +1355,12 @@ impl eframe::App for App {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong("BeamNG volume estimate");
                 ui.small("Compare the WAV levels BESS will export with the original Automation samples. Listening volume does not change these files.");
+                slider(
+                    ui,
+                    "Idle gain",
+                    &mut self.settings.idle_gain,
+                    0.0..=2.0,
+                );
                 if ui
                     .add_enabled(
                         self.bank.is_some()
@@ -1363,6 +1452,7 @@ impl eframe::App for App {
             driving: self.driving,
             restart: self.restart,
             audition_mix: self.audition_mix,
+            camera: self.camera,
         };
         if self.sent != Some(command)
             && let Some(audio) = &self.audio
@@ -1549,6 +1639,7 @@ fn main() -> eframe::Result {
                     },
                     restart: 0,
                     audition_mix: AuditionMix::Live,
+                    camera: BeamNgCamera::Cockpit,
                 })
                 .map_err(|e| e.to_string())?;
                 a

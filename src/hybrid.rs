@@ -57,6 +57,8 @@ pub struct Settings {
     /// How much of Automation's waveform character feeds standard BESS. At
     /// zero, only descriptor-derived excitation enters its acoustic paths.
     pub source_timbre: f32,
+    /// Gain multiplier at idle RPM, fading to unity at higher RPM.
+    pub idle_gain: f32,
     pub combustion: crate::combustion::Combustion,
 }
 impl Default for Settings {
@@ -68,6 +70,7 @@ impl Default for Settings {
             generated_edge: 1.,
             generated_flow: 1.,
             generated_mechanics: 1.,
+            idle_gain: 1.,
             level_match: true,
             response: 0.14,
             attack: 0.4,
@@ -274,6 +277,7 @@ impl Settings {
             self.generated_edge,
             self.generated_flow,
             self.generated_mechanics,
+            self.idle_gain,
         ] {
             if !value.is_finite() || !(0.0..=2.0).contains(&value) {
                 return Err("Generated sound setting out of range".into());
@@ -847,6 +851,13 @@ impl Hybrid {
     pub fn next(&mut self, playing: bool) -> f32 {
         self.next_stems(playing).mixed
     }
+    fn idle_gain_mult(&self) -> f32 {
+        let idle_ref = self.bank.as_ref().map_or(800., |b| b.min_rpm);
+        let idle_span = 1400.0f32;
+        let idle_t = ((idle_ref + idle_span - self.p.rpm) / idle_span).clamp(0., 1.);
+        let idle_weight = idle_t * idle_t * (3. - 2. * idle_t);
+        1.0 + (self.current.idle_gain - 1.0) * idle_weight
+    }
     fn next_procedural(&mut self, raw: f32, source_scale: f32) -> HybridStems {
         let bank = self.bank.as_ref().expect("procedural voice has a bank");
         let position = (self.p.rpm - bank.min_rpm) / (bank.max_rpm - bank.min_rpm).max(1.);
@@ -900,9 +911,10 @@ impl Hybrid {
             };
             self.compensation += (target - self.compensation) * (64. / (self.rate * 0.2));
         }
+        let idle_mult = self.idle_gain_mult();
         let out = self.transition_level.mix(
             raw,
-            wet * self.compensation * self.balance_gain,
+            wet * self.compensation * self.balance_gain * idle_mult,
             self.blend,
             self.rate,
         ) * self.gain;
@@ -911,7 +923,7 @@ impl Hybrid {
         } else {
             out
         };
-        let engine_stem = engine * self.compensation * self.balance_gain * self.blend * self.gain;
+        let engine_stem = engine * self.compensation * self.balance_gain * idle_mult * self.blend * self.gain;
         HybridStems {
             exhaust: mixed - engine_stem * 0.25,
             engine: engine_stem,
@@ -982,7 +994,8 @@ impl Hybrid {
                 generated_body,
                 generated_edge,
                 generated_flow,
-                generated_mechanics
+                generated_mechanics,
+                idle_gain
             );
             macro_rules! follow_p {($($field:ident),*)=>{$(self.p.$field+=(self.target.$field-self.p.$field)*s;)*};}
             follow_p!(
@@ -1263,9 +1276,10 @@ impl Hybrid {
             };
             self.compensation += (target - self.compensation) * (64. / (self.rate * 0.2));
         }
+        let idle_mult = self.idle_gain_mult();
         let out = self.transition_level.mix(
             raw,
-            wet * self.compensation * self.balance_gain * edge_balance,
+            wet * self.compensation * self.balance_gain * edge_balance * idle_mult,
             self.blend,
             self.rate,
         ) * self.gain;
@@ -1279,6 +1293,7 @@ impl Hybrid {
             * self.compensation
             * self.balance_gain
             * edge_balance
+            * idle_mult
             * self.blend
             * self.gain;
         HybridStems {
@@ -1287,6 +1302,7 @@ impl Hybrid {
                     * self.compensation
                     * self.balance_gain
                     * edge_balance
+                    * idle_mult
                     * self.blend
                     * self.gain,
             engine,

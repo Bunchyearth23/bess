@@ -47,6 +47,53 @@ pub struct Point {
     pub engine_vs_exhaust_db: f32,
 }
 
+impl Point {
+    /// Estimated RMS level (in dBFS) for a given BeamNG camera perspective.
+    pub fn camera_rms_dbfs(&self, camera: crate::bench::BeamNgCamera) -> f32 {
+        let exhaust_rms = 10f32.powf(self.exhaust_rms_dbfs / 20.);
+        let engine_rms = 10f32.powf(self.engine_rms_dbfs / 20.);
+        let (ex_mult, eng_mult, overall, is_cabin) = camera.gains();
+        let ex_level = exhaust_rms * ex_mult;
+        let eng_level = engine_rms * eng_mult;
+        let total = (ex_level * ex_level + eng_level * eng_level).sqrt() * overall;
+        let total = if is_cabin { total * 0.75 } else { total };
+        if total > 1e-6 {
+            20. * total.log10()
+        } else {
+            f32::NEG_INFINITY
+        }
+    }
+
+    /// Estimated peak level (in dBFS) for a given BeamNG camera perspective.
+    pub fn camera_peak_dbfs(&self, camera: crate::bench::BeamNgCamera) -> f32 {
+        let exhaust_peak = 10f32.powf(self.exhaust_peak_dbfs / 20.);
+        let engine_peak = 10f32.powf(self.engine_peak_dbfs / 20.);
+        let (ex_mult, eng_mult, overall, is_cabin) = camera.gains();
+        let total = (exhaust_peak * ex_mult + engine_peak * eng_mult) * overall;
+        let total = if is_cabin { total * 0.78 } else { total };
+        if total > 1e-6 {
+            20. * total.log10()
+        } else {
+            f32::NEG_INFINITY
+        }
+    }
+
+    /// Balance between engine and exhaust in percentage (engine %)
+    pub fn camera_engine_share(&self, camera: crate::bench::BeamNgCamera) -> f32 {
+        let exhaust_rms = 10f32.powf(self.exhaust_rms_dbfs / 20.);
+        let engine_rms = 10f32.powf(self.engine_rms_dbfs / 20.);
+        let (ex_mult, eng_mult, _, _) = camera.gains();
+        let ex_power = (exhaust_rms * ex_mult).powi(2);
+        let eng_power = (engine_rms * eng_mult).powi(2);
+        let sum = ex_power + eng_power;
+        if sum > 1e-12 {
+            (eng_power / sum) * 100.
+        } else {
+            50.
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Stats {
     /// Energy after removing the sample mean, used for level reporting and

@@ -16,7 +16,7 @@ Banks with an extreme recorded idle-level jump receive a bounded B-only RPM bala
 
 1. Use a Windows package for this version, extract the portable ZIP, open `START.html`, launch **BESS.exe**, and choose **Import Automation ZIP**. The project also provides a standalone executable and the application-only packaging commands below. See [published releases](https://github.com/Bunchyearth23/bess/releases) for available downloads.
 2. Wait for both load banks to finish loading. Choose **Play** or press Space.
-3. Compare **A · Automation source** with **B · BESS resynthesis**. Level compensation helps compare tone in the live mix. A replays prepared WAV loops; it is not a capture of Automation's in-game sound engine. The optional **BeamNG two-emitter preview** follows the export's exhaust level calibration and engine balance in real time, then approximates a mono mix using a generic -8 dB engine-to-exhaust gain. BeamNG's spatial and cabin processing can sound different.
+3. Compare **A · Automation source** with **B · BESS resynthesis**. Level compensation helps compare tone in the live mix. A replays prepared WAV loops; it is not a capture of Automation's in-game sound engine. The **BeamNG camera preview** (**Cockpit / Interior**, **Hood**, **Tailpipe**, **Orbit / Exterior**) lets you audition in-bench acoustic perspectives with cabin low-pass filtering and firewall attenuation.
 4. Use the **Driving** block at the upper right; its top button shows or hides it. In **Simulated driving**, apply throttle, select an automatic gearbox or manual gears N/1–6, and add braking or resistance at the wheels. **Reset to standstill** resets the vehicle; stopping playback pauses it.
 5. Set **Automation timbre retained**, **Resynthesis amount**, and the exhaust, intake and mechanical levels. Use **Advanced sound controls** for dynamics, pulses, texture, acoustic geometry and optional turbo. Added effects apply only to B.
 6. Try **Balanced**, **Muted**, **Open**, **Warm**, **Mechanical** and **Grit**. These presets change tone while preserving engine timing and driving response. The generated body, edge, flow and mechanical controls apply only when experimental listening is enabled.
@@ -31,9 +31,9 @@ The acoustic path has a header, expansion chamber and outlet. Length, diameter, 
 
 BESS uses the default Windows audio device. It prefers a 48 kHz floating-point output when available, then another compatible 48 kHz format, and otherwise falls back to the device default. The actual format is shown in the application; internal processing stays in floating point. Exported WAVs remain **48 kHz / 24-bit PCM**. **Reconnect audio** applies a device change. Imports and renders run in the background.
 
-## 0.11.0 delivery
+## 0.11.1 delivery
 
-The portable v0.11.0 application package contains the Windows application and its instructions. It does not include test vehicles, sound banks, sample projects, or prepared BeamNG add-ons. Import your own Automation vehicle ZIP into BESS, then export a matching BESS configuration add-on. Keep your original vehicle ZIP enabled beside that add-on in BeamNG. Select the trim marked **(BESS)**; the original trim remains available.
+The portable v0.11.1 application package contains the Windows application and its instructions. It does not include test vehicles, sound banks, sample projects, or prepared BeamNG add-ons. Import your own Automation vehicle ZIP into BESS, then export a matching BESS configuration add-on. Keep your original vehicle ZIP enabled beside that add-on in BeamNG. Select the trim marked **(BESS)**; the original trim remains available.
 
 A separate recording-free instrument package contains `standalone_engine.exe`, `standalone_live.exe`, three generic JSON presets and a quick-start guide. It does not need an Automation ZIP. The live instrument uses a terminal and the default Windows audio device; it is not integrated into the main BESS GUI or BeamNG export.
 
@@ -49,7 +49,7 @@ Before exporting, use **Calculate BeamNG level** in the BeamNG export panel. BES
 
 ## Settings and comparisons
 
-The 0.11.0 portable application contains no example vehicles or listening corpus. Use your own Automation exports for A/B listening and BeamNG configurations. Measurements describe signal differences; only listening can judge naturalness.
+The 0.11.1 portable application contains no example vehicles or listening corpus. Use your own Automation exports for A/B listening and BeamNG configurations. Measurements describe signal differences; only listening can judge naturalness.
 
 Hover over a slider and turn the **mouse wheel** to adjust it; **Shift + wheel** makes finer adjustments. Elsewhere, the wheel scrolls the panel.
 

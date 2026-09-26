@@ -578,6 +578,7 @@ fn every_exposed_hybrid_control_affects_the_audio() {
         ),
         ("airbox", Settings { airbox: 1., ..h }),
         ("fuel_cut", Settings { fuel_cut: 1., ..h }),
+        ("idle_gain", Settings { idle_gain: 0.2, ..h }),
     ] {
         let audio = render::hybrid_samples(params(), variant, bank.clone(), 3., true).unwrap();
         let diff = rms_diff(&baseline, &audio);
@@ -1173,4 +1174,47 @@ fn vehicle_label_preserves_nested_names_escapes_and_duplicate_paints() {
     let (again, _) = bess::export::label_vehicle_info(&labelled).unwrap();
     assert_eq!(again, labelled);
     assert!(bess::export::label_vehicle_info(br#"{"Name":"A","Name":"B"}"#).is_err());
+}
+
+#[test]
+fn idle_gain_scales_low_rpm_level_without_touching_high_rpm() {
+    let bank = fixture();
+    let base_settings = Settings {
+        level_match: false,
+        idle_gain: 1.0,
+        ..Settings::default()
+    };
+    let quiet_idle_settings = Settings {
+        level_match: false,
+        idle_gain: 0.4,
+        ..Settings::default()
+    };
+
+    let p_idle = Parameters {
+        rpm: 800.,
+        ..params()
+    };
+    let idle_base = render::hybrid_samples(p_idle, base_settings, bank.clone(), 2., false).unwrap();
+    let idle_quiet =
+        render::hybrid_samples(p_idle, quiet_idle_settings, bank.clone(), 2., false).unwrap();
+    let rms = |s: &[f32]| (s.iter().map(|&x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+    let base_idle_rms = rms(&idle_base);
+    let quiet_idle_rms = rms(&idle_quiet);
+    assert!(
+        quiet_idle_rms < base_idle_rms * 0.65,
+        "Idle gain failed to reduce idle RMS: {quiet_idle_rms} vs {base_idle_rms}"
+    );
+
+    let p_high = Parameters {
+        rpm: 4000.,
+        ..params()
+    };
+    let high_base = render::hybrid_samples(p_high, base_settings, bank.clone(), 2., false).unwrap();
+    let high_quiet =
+        render::hybrid_samples(p_high, quiet_idle_settings, bank.clone(), 2., false).unwrap();
+    let diff = rms_diff(&high_base, &high_quiet);
+    assert!(
+        diff < 1e-4,
+        "Idle gain altered high RPM audio: diff = {diff}"
+    );
 }

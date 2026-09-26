@@ -1,6 +1,6 @@
 use bess::{
     bank::Bank,
-    bench::{AuditionMix, Bench},
+    bench::{AuditionMix, BeamNgCamera, Bench},
     drive::Controls,
     hybrid::Settings,
     project::Parameters,
@@ -131,6 +131,7 @@ impl Audio {
                         if let Ok(next) = rx.try_recv() {
                             let command: Command = next;
                             engine.set_audition_mix(command.audition_mix);
+                            engine.set_beamng_camera(command.camera);
                             engine.set(
                                 command.params,
                                 command.settings,
@@ -256,4 +257,5 @@ pub struct Command {
     pub driving: Controls,
     pub restart: u64,
     pub audition_mix: AuditionMix,
+    pub camera: BeamNgCamera,
 }

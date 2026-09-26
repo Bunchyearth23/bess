@@ -18,6 +18,46 @@ pub enum AuditionMix {
     BeamNgTwoEmitter,
 }
 
+/// BeamNG camera perspective for listening preview and volume estimation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BeamNgCamera {
+    #[default]
+    Cockpit,
+    Hood,
+    Tailpipe,
+    Orbit,
+}
+
+impl BeamNgCamera {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cockpit => "Cockpit / Interior",
+            Self::Hood => "Hood / Engine bay",
+            Self::Tailpipe => "Tailpipe / Exhaust",
+            Self::Orbit => "Orbit / Exterior",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Cockpit => "Cabin insulation filter (~1100 Hz low-pass), dominant engine sound through firewall, muted exhaust.",
+            Self::Hood => "Direct engine bay and intake sound, no cabin filter, distant exhaust (-12 dB).",
+            Self::Tailpipe => "Direct tailpipe outlet at full level (0 dB), distant engine sound (-16 dB).",
+            Self::Orbit => "Standard exterior two-emitter mix (-8 dB engine relative to exhaust).",
+        }
+    }
+
+    /// Returns `(exhaust_multiplier, engine_multiplier, overall_gain, is_cabin)`
+    pub fn gains(&self) -> (f32, f32, f32, bool) {
+        match self {
+            Self::Cockpit => (0.35, 0.55, 0.70, true),
+            Self::Hood => (0.25, 0.90, 0.95, false),
+            Self::Tailpipe => (1.00, 0.16, 1.00, false),
+            Self::Orbit => (1.00, TwoEmitterPreview::NOMINAL_ENGINE_GAIN, 1.00, false),
+        }
+    }
+}
+
 /// Allocation-free block maxima over roughly one exported loop duration.
 struct PeakWindow<const BLOCKS: usize> {
     blocks: [f32; BLOCKS],
@@ -78,6 +118,12 @@ struct TwoEmitterPreview {
     engine_peak: PeakWindow<192>,
     engine_gain: f32,
     blend: f32,
+    camera: BeamNgCamera,
+    cam_exhaust_gain: f32,
+    cam_engine_gain: f32,
+    cam_overall_gain: f32,
+    cam_cabin_amount: f32,
+    cabin_filter: StateVariableFilter,
 }
 
 impl TwoEmitterPreview {
@@ -99,7 +145,17 @@ impl TwoEmitterPreview {
             engine_peak: PeakWindow::new(rate),
             engine_gain: 1.,
             blend: 0.,
+            camera: BeamNgCamera::Orbit,
+            cam_exhaust_gain: 1.,
+            cam_engine_gain: Self::NOMINAL_ENGINE_GAIN,
+            cam_overall_gain: 1.,
+            cam_cabin_amount: 0.,
+            cabin_filter: StateVariableFilter::new(rate as f32, 1100., 0.707, SvfMode::Lowpass),
         }
+    }
+
+    pub fn set_camera(&mut self, camera: BeamNgCamera) {
+        self.camera = camera;
     }
 
     fn next(
@@ -165,12 +221,24 @@ impl TwoEmitterPreview {
         self.engine_gain += (target_gain - self.engine_gain) / (self.rate * 0.3);
         self.blend += (f32::from(u8::from(selected)) - self.blend) / (self.rate * 0.06);
 
-        let two_emitters = stems.exhaust * self.exhaust_gain
-            + stems.engine * self.engine_gain * Self::NOMINAL_ENGINE_GAIN;
-        let two_emitters = if two_emitters.abs() > 0.95 {
-            two_emitters.signum() * (0.95 + 0.049 * ((two_emitters.abs() - 0.95) / 0.049).tanh())
+        let (target_ex, target_eng, target_overall, is_cabin) = self.camera.gains();
+        let cam_slew = 1. / (self.rate * 0.05);
+        self.cam_exhaust_gain += (target_ex - self.cam_exhaust_gain) * cam_slew;
+        self.cam_engine_gain += (target_eng - self.cam_engine_gain) * cam_slew;
+        self.cam_overall_gain += (target_overall - self.cam_overall_gain) * cam_slew;
+        let target_cabin = if is_cabin { 1.0 } else { 0.0 };
+        self.cam_cabin_amount += (target_cabin - self.cam_cabin_amount) * cam_slew;
+
+        let raw_emitters = stems.exhaust * self.exhaust_gain * self.cam_exhaust_gain
+            + stems.engine * self.engine_gain * self.cam_engine_gain;
+        let cabin_muffled = self.cabin_filter.next_sample(raw_emitters);
+        let combined = (raw_emitters * (1. - self.cam_cabin_amount)
+            + cabin_muffled * self.cam_cabin_amount)
+            * self.cam_overall_gain;
+        let two_emitters = if combined.abs() > 0.95 {
+            combined.signum() * (0.95 + 0.049 * ((combined.abs() - 0.95) / 0.049).tanh())
         } else {
-            two_emitters
+            combined
         };
         stems.mixed + (two_emitters - stems.mixed) * self.blend
     }
@@ -189,6 +257,7 @@ pub struct Bench {
     reset_token: u64,
     cycle_seconds: f32,
     audition_mix: AuditionMix,
+    beamng_camera: BeamNgCamera,
     two_emitter_preview: TwoEmitterPreview,
 }
 impl Bench {
@@ -230,6 +299,7 @@ impl Bench {
             reset_token: 0,
             cycle_seconds: 16.,
             audition_mix: AuditionMix::Live,
+            beamng_camera: BeamNgCamera::Cockpit,
             two_emitter_preview: TwoEmitterPreview::new(rate, settings.procedural),
         }
     }
@@ -238,6 +308,10 @@ impl Bench {
     }
     pub fn set_audition_mix(&mut self, mix: AuditionMix) {
         self.audition_mix = mix;
+    }
+    pub fn set_beamng_camera(&mut self, camera: BeamNgCamera) {
+        self.beamng_camera = camera;
+        self.two_emitter_preview.set_camera(camera);
     }
     pub fn set(&mut self, p: Parameters, h: Settings, c: Controls, reset_token: u64) {
         if p.validate().is_err() || h.validate().is_err() || c.validate().is_err() {
@@ -449,5 +523,41 @@ mod preview_tests {
         let low_cut_basis = run(true);
         assert!((original_basis - 0.891_250_9).abs() < 0.02);
         assert!((low_cut_basis - 0.25).abs() < 0.02);
+    }
+
+    #[test]
+    fn camera_perspectives_produce_distinct_and_finite_mixes() {
+        let stems = HybridStems {
+            source_reference: 0.1,
+            exhaust: 0.1,
+            engine: 0.05,
+            mixed: 0.1,
+        };
+        let mut outputs = Vec::new();
+        for camera in [
+            BeamNgCamera::Cockpit,
+            BeamNgCamera::Hood,
+            BeamNgCamera::Tailpipe,
+            BeamNgCamera::Orbit,
+        ] {
+            let mut preview = TwoEmitterPreview::new(48_000, false);
+            preview.set_camera(camera);
+            let mut out = 0.;
+            for _ in 0..48_000 {
+                out = preview.next(stems, 1., 1., 1., 1., true);
+            }
+            assert!(out.is_finite() && out.abs() < 1.);
+            outputs.push((camera, out));
+        }
+        for i in 0..outputs.len() {
+            for j in (i + 1)..outputs.len() {
+                assert!(
+                    (outputs[i].1 - outputs[j].1).abs() > 0.001,
+                    "Cameras {:?} and {:?} produced identical output",
+                    outputs[i].0,
+                    outputs[j].0
+                );
+            }
+        }
     }
 }
