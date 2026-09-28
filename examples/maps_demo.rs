@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ..Default::default()
                     },
                     profile_name: bess::project::default_profile_name(),
+                    scratch: None,
                 },
             )?;
             pair.push(audio);

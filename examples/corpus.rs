@@ -111,6 +111,7 @@ fn audit(path: &Path, out: &Path) -> Result<Value, Box<dyn std::error::Error>> {
                 source: Some(bank.source.clone()),
                 driving,
                 profile_name: project::default_profile_name(),
+                scratch: None,
             },
         )?;
         let reopened = project::load_project(&file)?;

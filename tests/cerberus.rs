@@ -17,6 +17,9 @@ fn level_variation(samples: &[f32]) -> f64 {
 #[test]
 fn cerberus_5200_has_no_excess_level_modulation_at_steady_load() {
     let archive = Path::new(env!("CARGO_MANIFEST_DIR")).join("cars/bunchyearth23_cerberus_a.zip");
+    if !archive.is_file() {
+        return;
+    }
     let bank = Arc::new(Bank::load(&archive, None).unwrap());
     let settings = Settings::calibrated(&bank);
     for load in [0.12, 1.0] {

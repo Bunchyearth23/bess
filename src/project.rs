@@ -97,6 +97,9 @@ pub struct Project {
     pub driving: crate::drive::Controls,
     #[serde(default = "default_profile_name")]
     pub profile_name: String,
+    /// An engine designed from scratch; `source` is then absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<crate::scratch::Scratch>,
 }
 pub fn default_profile_name() -> String {
     "Natural".to_owned()
@@ -123,6 +126,7 @@ pub fn save(path: &Path, parameters: Parameters) -> Result<(), String> {
             source: None,
             driving: Default::default(),
             profile_name: default_profile_name(),
+            scratch: None,
         },
     )
 }
@@ -131,6 +135,9 @@ pub fn save_project(path: &Path, project: &Project) -> Result<(), String> {
     project.hybrid.validate()?;
     project.driving.validate()?;
     validate_profile_name(&project.profile_name)?;
+    if let Some(scratch) = &project.scratch {
+        scratch.validate()?;
+    }
     let json = serde_json::to_string_pretty(project).map_err(|e| e.to_string())?;
     std::fs::write(path, json).map_err(|e| e.to_string())
 }
@@ -147,5 +154,8 @@ pub fn load_project(path: &Path) -> Result<Project, String> {
     project.hybrid.validate()?;
     project.driving.validate()?;
     validate_profile_name(&project.profile_name)?;
+    if let Some(scratch) = &project.scratch {
+        scratch.validate()?;
+    }
     Ok(project)
 }

@@ -390,6 +390,14 @@ fn build(
     .to_owned();
     let parts: Vec<_> = source_config.split('/').collect();
     let vehicle = parts[1];
+    // Used in host filenames and add-on entry paths: reject `..`, `:` and the like.
+    if vehicle.is_empty()
+        || !vehicle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!("Unsupported vehicle folder name: {vehicle}"));
+    }
     let root = format!("vehicles/{vehicle}/");
     let old_config = parts[2]
         .strip_suffix(".pc")

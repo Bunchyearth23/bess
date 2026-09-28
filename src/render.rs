@@ -57,6 +57,32 @@ pub fn bench_samples(
     seconds: f32,
     driving: Controls,
 ) -> Result<Vec<f32>, String> {
+    render_bench(params, settings, seconds, driving, |params| {
+        Ok(Bench::new(48000, params, settings, driving, Some(bank)))
+    })
+}
+/// WAV of an engine designed from scratch, with the same transport as listening.
+pub fn scratch_wav(
+    path: &Path,
+    params: Parameters,
+    settings: Settings,
+    scratch: &crate::scratch::Scratch,
+    seconds: f32,
+    driving: Controls,
+) -> Result<(), String> {
+    let samples = render_bench(params, settings, seconds, driving, |params| {
+        let model = crate::scratch::ScratchModel::build(scratch, 48000)?;
+        Ok(Bench::from_scratch(48000, params, settings, driving, model))
+    })?;
+    write_pcm(path, &samples)
+}
+fn render_bench(
+    params: Parameters,
+    settings: Settings,
+    seconds: f32,
+    driving: Controls,
+    make: impl FnOnce(Parameters) -> Result<Bench, String>,
+) -> Result<Vec<f32>, String> {
     params.validate()?;
     settings.validate()?;
     driving.validate()?;
@@ -64,7 +90,7 @@ pub fn bench_samples(
         return Err("Duration: 1–60 seconds".into());
     }
     let frames = (seconds * 48000.) as usize;
-    let mut engine = Bench::new(48000, params, settings, driving, Some(bank));
+    let mut engine = make(params)?;
     engine.set_cycle_seconds(seconds);
     let mut samples = Vec::with_capacity(frames);
     for i in 0..frames {
@@ -285,6 +311,7 @@ pub fn characters(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
                     ..Default::default()
                 },
                 profile_name: crate::project::default_profile_name(),
+                scratch: None,
             },
         )?;
     }
@@ -360,6 +387,7 @@ pub fn drive_demo(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
                 source: Some(bank.source.clone()),
                 driving: c,
                 profile_name: crate::project::default_profile_name(),
+                scratch: None,
             },
         )?;
     }

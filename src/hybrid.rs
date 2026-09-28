@@ -4,6 +4,8 @@ use crate::{
     engine::Engine,
     procedural::ProceduralVoice,
     project::Parameters,
+    scratch::{ScratchModel, ScratchVoice},
+    standalone::{CombustionState, Commands, Synth},
 };
 use bdsp::{
     noise::{Noise, NoiseColor},
@@ -624,9 +626,88 @@ impl RpmBalance {
     }
 }
 
+/// Scratch output scale: a big engine with an open exhaust, heard at the
+/// tailpipe at full listening volume, peaks just under full scale.
+const SCRATCH_GAIN: f32 = 0.45;
+
+/// Deceleration fuel cut-off as ECUs run it: lift-off retards spark for a
+/// moment (pops possible), then cuts fuel above ~1.8× idle and re-enables
+/// it with hysteresis near 1.4× idle. Values follow rusEFI/Speeduino practice.
+#[derive(Default)]
+struct Overrun {
+    stage: OverrunStage,
+    timer: f32,
+    motoring: f32,
+    retard: f32,
+}
+#[derive(Default, PartialEq)]
+enum OverrunStage {
+    #[default]
+    Firing,
+    Retard,
+    Cut,
+}
+impl Overrun {
+    /// Advance by `dt` seconds; returns (motoring, retard) weights 0–1.
+    fn step(&mut self, dt: f32, rpm: f32, load: f32, idle: f32, hold: f32) -> (f32, f32) {
+        let lifted = load < 0.04;
+        self.timer += dt;
+        match self.stage {
+            OverrunStage::Firing if lifted && rpm > (idle * 1.8).max(idle + 600.) => {
+                self.stage = OverrunStage::Retard;
+                self.timer = 0.;
+            }
+            OverrunStage::Retard if !lifted => self.stage = OverrunStage::Firing,
+            // Pop-and-bang calibrations (afterfire) hold the retarded, fuelled phase longer.
+            // Without afterfire, spark ramps out in a few cycles (~50 ms).
+            OverrunStage::Retard if self.timer > 0.05 + 1.4 * hold => {
+                self.stage = OverrunStage::Cut;
+                self.timer = 0.;
+            }
+            OverrunStage::Cut if load > 0.06 || rpm < idle * 1.4 => {
+                self.stage = OverrunStage::Firing;
+                self.timer = 0.;
+            }
+            _ => {}
+        }
+        // Spark retard ramps in ~0.1 s. ECUs ramp torque out and back in
+        // (GM steps spark every 12.5 ms): the cut fades over two engine cycles
+        // (at least 40 ms): no audible step, and no audible delay either.
+        let cycle = 120. / rpm.max(300.);
+        let retard_target = f32::from(self.stage == OverrunStage::Retard);
+        let motoring_target = f32::from(self.stage == OverrunStage::Cut);
+        self.retard += (retard_target - self.retard) * (dt / 0.1).min(1.);
+        self.motoring += (motoring_target - self.motoring) * (dt / (2. * cycle).max(0.04)).min(1.);
+        (self.motoring, self.retard)
+    }
+}
+
 pub struct Hybrid {
     bank: Option<Arc<Bank>>,
     fallback: Option<Engine>,
+    /// RPM range of a scratch engine; `None` with a bank or the generic fallback.
+    scratch_range: Option<(f32, f32)>,
+    /// Event synth whose pulses replace the descriptor voice's in a scratch engine.
+    standalone: Option<Box<Synth>>,
+    /// Previous event synth, faded out after a live rebuild.
+    outgoing: Option<Box<Synth>>,
+    swap_fade: f32,
+    /// Voices and networks displaced on the audio thread, dropped elsewhere.
+    retired: [Option<ScratchVoice>; 3],
+    /// Scratch engines radiate through the parts' own exhaust network.
+    scratch_exhaust: Option<Box<crate::acoustics::ExhaustNetwork>>,
+    scratch_layout: Option<crate::acoustics::ExhaustLayout>,
+    synth_energy: f32,
+    tone_energy: f32,
+    overrun: Overrun,
+    blow_off: Option<crate::engine_build::BlowOff>,
+    /// Boost dump: envelope, flutter phase and age since lift-off (s).
+    dump: [f32; 3],
+    dump_band: StateVariableFilter,
+    dump_low: StateVariableFilter,
+    scratch_afterfire: f32,
+    /// Exhaust gas temperature (°C): fast gas exchange plus slow wall heat.
+    exhaust_temp: [f32; 2],
     sinc: SincTable,
     target: Parameters,
     p: Parameters,
@@ -736,6 +817,22 @@ impl Hybrid {
         Self {
             bank,
             fallback,
+            scratch_range: None,
+            standalone: None,
+            outgoing: None,
+            swap_fade: 1.,
+            retired: [None, None, None],
+            scratch_exhaust: None,
+            scratch_layout: None,
+            synth_energy: 1e-6,
+            tone_energy: 1e-6,
+            overrun: Overrun::default(),
+            blow_off: None,
+            dump: [0., 0., 10.],
+            dump_band: filter(2500., 0.7, SvfMode::Bandpass),
+            dump_low: filter(600., 0.707, SvfMode::Lowpass),
+            scratch_afterfire: 0.,
+            exhaust_temp: [h.temperature; 2],
             sinc: SincTable::for_quality(SincQuality::Realtime),
             target: p,
             p,
@@ -801,17 +898,174 @@ impl Hybrid {
             pressure_ready: 0.,
         }
     }
-    pub fn set(&mut self, mut p: Parameters, h: Settings) {
+    /// A bank-free engine designed from scratch. The experimental voice runs
+    /// through the same B chain as imported banks; A is silent.
+    pub fn from_scratch(rate: u32, mut p: Parameters, mut h: Settings, model: ScratchModel) -> Self {
+        p.rpm = p.rpm.clamp(model.idle_rpm, model.redline_rpm);
+        (h.enhanced, h.coloration, h.source_timbre) = (true, 1., 0.);
+        // The scratch voice owns fuel cut and afterfire (see `Overrun`).
+        (h.overrun, h.fuel_cut) = (0., 0.);
+        let mut hybrid = Self::new(rate, p, h, None);
+        hybrid.fallback = None;
+        hybrid.scratch_range = Some((model.idle_rpm, model.redline_rpm));
+        let mut voice = ProceduralVoice::new(hybrid.rate, model.descriptors, p.cylinders);
+        voice.set_firing(model.firing);
+        voice.set_life(model.life);
+        hybrid.scratch_afterfire = model.life.afterfire;
+        hybrid.blow_off = model.life.blow_off;
+        hybrid.procedural_voice = Some(voice);
+        let mut network = model.exhaust;
+        network.tune(geometry(p, h), true);
+        hybrid.scratch_exhaust = Some(network);
+        hybrid.scratch_layout = Some(model.life.exhaust);
+        hybrid.standalone = model.synth;
+        hybrid
+    }
+    /// Install a rebuilt scratch voice of the same kind. Returns whatever it
+    /// displaced so the caller can drop it outside the audio callback.
+    pub fn swap_scratch(&mut self, model: ScratchModel) -> Option<ScratchVoice> {
+        self.scratch_range?;
+        self.scratch_range = Some((model.idle_rpm, model.redline_rpm));
+        match (model.synth, self.standalone.is_some()) {
+            (Some(synth), true) => {
+                // A fade already in progress loses its oldest voice at once.
+                if let Some(old) = self.outgoing.take() {
+                    self.retire(ScratchVoice::Synth(old));
+                }
+                self.outgoing = self.standalone.replace(synth);
+                self.swap_fade = 0.;
+            }
+            // A voice-type change rebuilds the chain; never switch here.
+            (Some(synth), false) => self.retire(ScratchVoice::Synth(synth)),
+            (None, _) => {}
+        }
+        self.scratch_afterfire = model.life.afterfire;
+        self.blow_off = model.life.blow_off;
+        // Only a part change (catalyst, muffler) rebuilds the network; a live
+        // tweak keeps the running one so its reflections do not restart.
+        let mut network = model.exhaust;
+        if self.scratch_layout != Some(model.life.exhaust) {
+            network.tune(geometry(self.p, self.current), true);
+            if let Some(old) = self.scratch_exhaust.replace(network) {
+                self.retire(ScratchVoice::Exhaust(old));
+            }
+            self.scratch_layout = Some(model.life.exhaust);
+        } else {
+            self.retire(ScratchVoice::Exhaust(network));
+        }
+        let voice = self.procedural_voice.as_mut()?;
+        voice.set_firing(model.firing);
+        voice.set_life(model.life);
+        Some(ScratchVoice::Descriptors(voice.replace_descriptors(model.descriptors)))
+    }
+    /// A voice whose crossfade finished inside the callback, to drop elsewhere.
+    pub fn take_retired(&mut self) -> Option<ScratchVoice> {
+        self.retired.iter_mut().find_map(Option::take)
+    }
+    fn retire(&mut self, voice: ScratchVoice) {
+        // A full list (never expected) drops on this thread rather than leak.
+        if let Some(slot) = self.retired.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(voice);
+        }
+    }
+    fn rpm_range(&self) -> (f32, f32) {
+        self.bank
+            .as_ref()
+            .map(|bank| (bank.min_rpm, bank.max_rpm))
+            .or(self.scratch_range)
+            .unwrap_or((300., 8000.))
+    }
+    /// Lift-off boost dump for a scratch turbo engine: a vented "pssh",
+    /// a recirculated whoosh, or compressor surge flutter (30–85 Hz, slowing
+    /// toward 10–20 Hz) when there is no valve.
+    fn boost_dump(&mut self, kind: crate::engine_build::BlowOff, lift: f32, noise: f32) -> f32 {
+        use crate::engine_build::BlowOff;
+        let scale = self.designed_level_hint();
+        let rate = self.rate;
+        let [envelope, phase, age] = &mut self.dump;
+        *age += 1. / rate;
+        if lift > 0.15 && self.boost > 0.25 && *age > 1.5 {
+            *envelope = self.boost.min(1.);
+            *age = 0.;
+        }
+        // < 20 ms attack, 0.2–0.8 s decay.
+        let attack = (*age / 0.015).min(1.);
+        *envelope *= 1. - 1. / (rate * 0.45);
+        let level = *envelope * attack * scale;
+        let band = self.dump_band.next_sample(noise);
+        match kind {
+            BlowOff::Atmospheric => band * level * 6.,
+            BlowOff::Recirculating => band * level * 1.2,
+            BlowOff::None => {
+                let hz = 15. + 30. * (-*age / 0.6).exp();
+                *phase = (*phase + hz / rate).fract();
+                let flutter = 0.5 + 0.5 * (std::f32::consts::TAU * *phase).sin();
+                self.dump_low.next_sample(noise) * flutter * flutter * level * 4.
+            }
+        }
+    }
+    /// Descriptor level at the current operating point: a scale for effects.
+    fn designed_level_hint(&self) -> f32 {
+        self.procedural_voice
+            .as_ref()
+            .map_or(0.05, |voice| voice.mean_source_rms(self.p.rpm, 0.5))
+    }
+    /// The event synth's pressure, level-matched to the descriptor pulses it
+    /// replaces, with a short crossfade after a live rebuild.
+    fn synth_pulse(&mut self, tone: f32) -> f32 {
+        let commands = Commands {
+            rpm: self.p.rpm.min(12_000.),
+            load: self.fast_load,
+            volume: 1.,
+            // The fuel-cut controller also drives the explicit event synth.
+            combustion: if self.overrun.motoring > 0.5 {
+                CombustionState::Motoring
+            } else {
+                CombustionState::Firing
+            },
+        };
+        let Some(synth) = &mut self.standalone else {
+            return tone;
+        };
+        let _ = synth.set_commands(commands);
+        let mut sample = synth.next_sample();
+        if let Some(old) = &mut self.outgoing {
+            let _ = old.set_commands(commands);
+            sample = sample * self.swap_fade + old.next_sample() * (1. - self.swap_fade);
+            self.swap_fade += 1. / (self.rate * 0.03);
+            if self.swap_fade >= 1. {
+                self.swap_fade = 1.;
+                if let Some(old) = self.outgoing.take() {
+                    self.retire(ScratchVoice::Synth(old));
+                }
+            }
+        }
+        let smooth = 1. / self.rate;
+        self.synth_energy += (sample * sample - self.synth_energy) * smooth;
+        self.tone_energy += (tone * tone - self.tone_energy) * smooth;
+        sample * (self.tone_energy / self.synth_energy.max(1e-12)).sqrt().clamp(0.05, 20.)
+    }
+    pub fn set(&mut self, mut p: Parameters, mut h: Settings) {
         if p.validate().is_err() || h.validate().is_err() {
             return;
         }
+        if self.scratch_range.is_some() {
+            // Only B exists without a bank, fully resynthesized.
+            (h.enhanced, h.coloration, h.source_timbre) = (true, 1., 0.);
+        // The scratch voice owns fuel cut and afterfire (see `Overrun`).
+        (h.overrun, h.fuel_cut) = (0., 0.);
+        }
         // The same exported limits apply to manual control, audition and WAV rendering.
-        if let Some(bank) = &self.bank {
-            p.rpm = p.rpm.clamp(bank.min_rpm, bank.max_rpm);
+        if self.bank.is_some() || self.scratch_range.is_some() {
+            let (min, max) = self.rpm_range();
+            p.rpm = p.rpm.clamp(min, max);
         }
         self.target = p;
         self.h = h;
-        let mechanical_cylinders = mechanical_cylinders(self.bank.as_deref(), h);
+        let mut mechanical_cylinders = mechanical_cylinders(self.bank.as_deref(), h);
+        if self.scratch_range.is_some() && mechanical_cylinders == 0 {
+            mechanical_cylinders = p.cylinders;
+        }
         self.mechanical_impacts.set_slots(mechanical_cylinders);
         if let Some(voice) = &mut self.procedural_voice {
             voice.set_cylinders(
@@ -852,15 +1106,19 @@ impl Hybrid {
         self.next_stems(playing).mixed
     }
     fn idle_gain_mult(&self) -> f32 {
-        let idle_ref = self.bank.as_ref().map_or(800., |b| b.min_rpm);
+        let idle_ref = if self.bank.is_some() || self.scratch_range.is_some() {
+            self.rpm_range().0
+        } else {
+            800.
+        };
         let idle_span = 1400.0f32;
         let idle_t = ((idle_ref + idle_span - self.p.rpm) / idle_span).clamp(0., 1.);
         let idle_weight = idle_t * idle_t * (3. - 2. * idle_t);
         1.0 + (self.current.idle_gain - 1.0) * idle_weight
     }
     fn next_procedural(&mut self, raw: f32, source_scale: f32) -> HybridStems {
-        let bank = self.bank.as_ref().expect("procedural voice has a bank");
-        let position = (self.p.rpm - bank.min_rpm) / (bank.max_rpm - bank.min_rpm).max(1.);
+        let (min_rpm, max_rpm) = self.rpm_range();
+        let position = (self.p.rpm - min_rpm) / (max_rpm - min_rpm).max(1.);
         let generated = self
             .procedural_voice
             .as_mut()
@@ -949,6 +1207,9 @@ impl Hybrid {
         self.p.rpm += (self.target.rpm - self.p.rpm) * rpm_smooth;
         let response = if self.target.load > self.fast_load {
             0.015 + self.h.response * 0.14
+        } else if self.scratch_range.is_some() {
+            // A closed throttle empties the manifold in about three revolutions.
+            (180. / self.p.rpm.max(300.)).max(0.012)
         } else {
             0.025 + self.h.response * 0.2
         };
@@ -960,7 +1221,11 @@ impl Hybrid {
         self.flutter += (noise - self.flutter) / (self.rate * 0.025);
         let rough = 1. + self.current.roughness * self.flutter * 0.3 * (1. - self.fast_load);
         self.cycle += self.p.rpm as f64 / (120. * self.rate as f64);
-        self.wet_cycle += self.p.rpm as f64 / (120. * self.rate as f64) * rough as f64;
+        let crank = self
+            .procedural_voice
+            .as_ref()
+            .map_or(1., |voice| voice.speed_factor());
+        self.wet_cycle += self.p.rpm as f64 / (120. * self.rate as f64) * (rough * crank) as f64;
         if self.tick.is_multiple_of(64) {
             let s = (64. / (self.rate * 0.04)).min(1.);
             let balance_target = self.rpm_balance.at(self.p.rpm, self.fast_load);
@@ -1014,8 +1279,37 @@ impl Hybrid {
                 .set_cutoff(550. + self.fast_load * 350. + self.p.rpm * 0.07);
             self.muffler
                 .set_cutoff(self.p.brightness * (0.55 + 0.45 * self.fast_load));
+            if let Some((idle, redline)) = self.scratch_range {
+                let dt = 64. / self.rate;
+                let (motoring, retard) = self.overrun.step(
+                    dt,
+                    self.p.rpm,
+                    self.fast_load,
+                    idle,
+                    self.scratch_afterfire,
+                );
+                if let Some(voice) = &mut self.procedural_voice {
+                    voice.set_overrun(motoring, retard);
+                }
+                // Firing: ~350 °C at idle to ~900 °C at full power. Fuel cut
+                // blows air through: the gas cools in 1–3 s, the walls in ~30 s,
+                // and every resonance slides down with the speed of sound.
+                let target = if motoring > 0.5 {
+                    280.
+                } else {
+                    330. + 570. * self.fast_load * (0.45 + 0.55 * self.p.rpm / redline)
+                        + 60. * retard
+                };
+                self.exhaust_temp[0] += (target - self.exhaust_temp[0]) * dt / 1.5;
+                self.exhaust_temp[1] += (target - self.exhaust_temp[1]) * dt / 30.;
+                self.current.temperature =
+                    (0.6 * self.exhaust_temp[0] + 0.4 * self.exhaust_temp[1]).clamp(150., 950.);
+            }
             self.exhaust_line
                 .tune(geometry(self.p, self.current), false);
+            if let Some(network) = &mut self.scratch_exhaust {
+                network.tune(geometry(self.p, self.current), false);
+            }
             self.intake_runner.tune(
                 self.current.intake_length,
                 self.fast_load,
@@ -1028,57 +1322,58 @@ impl Hybrid {
             }
         }
         self.tick = self.tick.wrapping_add(1);
-        let bank = self
-            .bank
-            .as_ref()
-            .expect("constructed with bank or fallback");
-        let raw = bank.read_original(
-            self.cycle,
-            self.p.rpm,
-            self.fast_load,
-            self.rate,
-            &self.sinc,
-        );
-        if self.h.procedural {
+        // Without a bank (a scratch engine) the generated voice alone excites
+        // the full acoustic chain below, as at 0% retained Automation timbre.
+        let bank = self.bank.as_ref();
+        let raw = bank.map_or(0., |bank| {
+            bank.read_original(self.cycle, self.p.rpm, self.fast_load, self.rate, &self.sinc)
+        });
+        if let Some(bank) = bank
+            && self.h.procedural
+        {
             let source_scale = bank.original_to_processed_gain();
             return self.next_procedural(raw, source_scale);
         }
-        let (recorded_pulse, recorded_texture) = bank.read_components(
-            self.wet_cycle,
-            self.p.rpm,
-            self.fast_load,
-            self.rate,
-            &self.sinc,
-        );
+        let (recorded_pulse, recorded_texture) = bank.map_or((0., 0.), |bank| {
+            bank.read_components(self.wet_cycle, self.p.rpm, self.fast_load, self.rate, &self.sinc)
+        });
         let phase = self.wet_cycle.fract() as f32;
         // Reuse the measured recording at a different complete 720-degree
         // cycle for the engine-side texture. Its pressure phase still aligns
         // with the current exhaust, but irregular detail is not copied at the
         // same instant into both spatial emitters.
-        let inferred_source = bank.read(
-            self.wet_cycle + 7.,
-            self.p.rpm,
-            self.fast_load,
-            self.rate,
-            &self.sinc,
-        );
-        let recorded_engine_texture = self.phase_locked_texture.next(
-            phase,
-            inferred_source - recorded_pulse,
-            self.p.rpm,
-            self.rate,
-        ) * self.inferred_weight;
-        let generated = self
+        let recorded_engine_texture = match bank {
+            Some(bank) => {
+                let inferred_source = bank.read(
+                    self.wet_cycle + 7.,
+                    self.p.rpm,
+                    self.fast_load,
+                    self.rate,
+                    &self.sinc,
+                );
+                self.phase_locked_texture.next(
+                    phase,
+                    inferred_source - recorded_pulse,
+                    self.p.rpm,
+                    self.rate,
+                ) * self.inferred_weight
+            }
+            None => 0.,
+        };
+        let voice = self
             .procedural_voice
             .as_mut()
-            .expect("descriptor voice was prepared with the bank")
-            .next(self.p.rpm, self.fast_load, self.wet_cycle);
-        let retained = self.current.source_timbre;
+            .expect("descriptor voice was prepared with the bank or scratch model");
+        let mut generated = voice.next(self.p.rpm, self.fast_load, self.wet_cycle);
+        let has_bank = bank.is_some();
+        let retained = if has_bank { self.current.source_timbre } else { 0. };
+        generated.exhaust_tone = self.synth_pulse(generated.exhaust_tone);
         let rebuilt = 1. - retained;
         let periodic = recorded_pulse * retained + generated.exhaust_tone * rebuilt;
         let residual = recorded_texture * retained + generated.exhaust_texture * rebuilt;
         let inferred_residual = recorded_engine_texture * retained + generated.intake * rebuilt;
-        let position = (self.p.rpm - bank.min_rpm) / (bank.max_rpm - bank.min_rpm).max(1.);
+        let (min_rpm, max_rpm) = self.rpm_range();
+        let position = (self.p.rpm - min_rpm) / (max_rpm - min_rpm).max(1.);
         let pulse_gain =
             self.current.pulse_gain * self.current.maps.pulse.at(position, self.fast_load);
         let texture_gain =
@@ -1142,11 +1437,17 @@ impl Hybrid {
         self.pulse_envelope += (level - self.pulse_envelope) / (self.rate * follower);
         self.pulse_average += (self.pulse_envelope - self.pulse_average) / (self.rate * 0.35);
         let activity = (self.pulse_envelope / self.pulse_average.max(0.002)).clamp(0., 2.5);
-        let texture_shape = 1. + self.current.pulse_texture * (activity - 1.) * 0.6;
+        // Scratch voices already gate their noise by each pulse; this slow
+        // (0.35 s) follower only delayed their lift-off.
+        let texture_shape = if has_bank {
+            1. + self.current.pulse_texture * (activity - 1.) * 0.6
+        } else {
+            1.
+        };
         // Smooth fuel cutoff above idle. Only the enhanced path is affected; the
         // off-load recording remains audible, retaining mechanical/flow texture.
         let coasting = ((0.1 - self.fast_load) / 0.08).clamp(0., 1.)
-            * ((self.p.rpm - bank.min_rpm * 1.35) / 500.).clamp(0., 1.);
+            * ((self.p.rpm - min_rpm * 1.35) / 500.).clamp(0., 1.);
         self.cut += (coasting * self.current.fuel_cut - self.cut) / (self.rate * 0.06);
         // During fuel cut, pressure pulses fall much more than the recorded
         // mechanical/flow residual. Suppressing both together sounds like a
@@ -1214,26 +1515,38 @@ impl Hybrid {
             * self.event_gain
             * (1. - self.cut);
         let excitation = (source + body + rasp) * (1. + burst * 0.5) + overrun + events;
-        let propagated = self.exhaust_line.next(excitation);
-        // Even a restrained Pipe setting must let the modeled outlet matter.
-        // Previously a calibrated value near 0.04 sent about 97% of the
-        // excitation straight to the output, leaving the acoustic network
-        // almost inaudible.
-        let acoustic_mix = 0.5 + self.current.pipe * 0.4;
-        let exhaust = self
-            .muffler
-            .next_sample(excitation * (1. - acoustic_mix * 0.65) + propagated * acoustic_mix * 1.3);
+        let exhaust = if let Some(network) = &mut self.scratch_exhaust {
+            // Nothing reaches the listener without crossing the exhaust.
+            let radiated = network.next(excitation);
+            // Radiation from ka ≪ 1 is weak; restore the level-match range.
+            self.muffler.next_sample(radiated * 10.)
+        } else {
+            let propagated = self.exhaust_line.next(excitation);
+            // Even a restrained Pipe setting must let the modeled outlet matter.
+            // Previously a calibrated value near 0.04 sent about 97% of the
+            // excitation straight to the output, leaving the acoustic network
+            // almost inaudible.
+            let acoustic_mix = 0.5 + self.current.pipe * 0.4;
+            self.muffler.next_sample(
+                excitation * (1. - acoustic_mix * 0.65) + propagated * acoustic_mix * 1.3,
+            )
+        };
         self.boost +=
             (self.fast_load * (self.p.rpm / 5000.).min(1.) - self.boost) / (self.rate * 0.4);
         self.turbo_phase = (self.turbo_phase + (1700. + self.boost * 4300.) / self.rate).fract();
-        let turbo = self.current.turbo
+        let mut turbo = self.current.turbo
             * (0.009 * self.boost * (self.turbo_phase * std::f32::consts::TAU).sin()
                 + lift * noise * 0.03);
+        if let Some(kind) = self.blow_off {
+            turbo += self.boost_dump(kind, lift, noise);
+        }
+        let detail = generated.detail * self.p.mechanical.max(0.3) * 2.;
         let shaped =
             exhaust * self.p.exhaust * self.current.maps.exhaust.at(position, self.fast_load)
                 + intake
                 + mechanical
-                + turbo;
+                + turbo
+                + detail;
         // This emitter has no independent intake microphone. Use a warm,
         // bounded band of the source residual. The old one-cycle subtraction
         // made regularly spaced comb notches and a hollow artificial timbre.
@@ -1250,7 +1563,9 @@ impl Hybrid {
         let impacts = self.mechanical_impact_band.next_sample(impacts);
         let engine_channel = self
             .engine_stem_dc
-            .next_sample((engine_air + impacts + (intake + turbo) * 0.1) * self.current.coloration);
+            .next_sample(
+                (engine_air + impacts + (intake + turbo) * 0.1 + detail) * self.current.coloration,
+            );
         // Added coloration remains exactly off at zero, but a calibrated middle
         // value now favors the reconstructed path over the source reference.
         let path_gain = 1. - (1. - self.current.coloration).powi(3);
@@ -1263,18 +1578,25 @@ impl Hybrid {
         let wet = self
             .dc
             .next_sample(shaped * path_gain + raw * retained * (1. - path_gain));
-        let energy_smooth = 1. / (self.rate * 1.5);
-        self.raw_energy += (raw * raw - self.raw_energy) * energy_smooth;
-        self.wet_energy += (wet * wet - self.wet_energy) * energy_smooth;
-        if self.tick.is_multiple_of(64) {
-            let target = if self.h.level_match {
-                (self.raw_energy / self.wet_energy.max(1e-9))
-                    .sqrt()
-                    .clamp(0.4, 2.)
-            } else {
-                1.
-            };
-            self.compensation += (target - self.compensation) * (64. / (self.rate * 0.2));
+        if has_bank {
+            let energy_smooth = 1. / (self.rate * 1.5);
+            self.raw_energy += (raw * raw - self.raw_energy) * energy_smooth;
+            self.wet_energy += (wet * wet - self.wet_energy) * energy_smooth;
+            if self.tick.is_multiple_of(64) {
+                let target = if self.h.level_match {
+                    (self.raw_energy / self.wet_energy.max(1e-9))
+                        .sqrt()
+                        .clamp(0.4, 2.)
+                } else {
+                    1.
+                };
+                self.compensation += (target - self.compensation) * (64. / (self.rate * 0.2));
+            }
+        } else {
+            // No automatic gain on a scratch engine: it pumped for a second
+            // after every lift-off. The voice already produces its designed
+            // level; the chain's own response is the dynamics.
+            self.compensation = SCRATCH_GAIN;
         }
         let idle_mult = self.idle_gain_mult();
         let out = self.transition_level.mix(
@@ -1306,7 +1628,9 @@ impl Hybrid {
                     * self.blend
                     * self.gain,
             engine,
-            source_reference: raw * bank.original_to_processed_gain() * self.gain,
+            source_reference: raw
+                * self.bank.as_ref().map_or(0., |bank| bank.original_to_processed_gain())
+                * self.gain,
             mixed,
         }
     }

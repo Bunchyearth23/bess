@@ -106,6 +106,9 @@ pub struct Simulator {
     shift_cooldown: f32,
     requested_gear: u8,
     was_auto: bool,
+    /// Dashpot: after a rev drop the idle target starts ~20 % high and ramps
+    /// down (rusEFI idleReturnTargetRamp), so rpm lands instead of snapping.
+    idle_raise: f32,
 }
 impl Simulator {
     pub fn new(min: f32, max: f32, controls: Controls) -> Self {
@@ -120,11 +123,17 @@ impl Simulator {
             shift_cooldown: 0.,
             requested_gear: controls.gear,
             was_auto: controls.automatic,
+            idle_raise: 0.,
         };
         result.reset(controls);
         result
     }
+    pub fn set_range(&mut self, min: f32, max: f32) {
+        self.idle = min / RPM_PER_RAD;
+        self.maximum = max / RPM_PER_RAD;
+    }
     pub fn reset(&mut self, c: Controls) {
+        self.idle_raise = 0.;
         self.omega = self.idle;
         self.wheel = 0.;
         self.throttle = 0.;
@@ -192,13 +201,20 @@ impl Simulator {
         }
         let ratio = Self::ratio(c, self.state.gear);
         let shift_open = (self.shift_left / 0.2).clamp(0., 1.);
-        self.throttle += (c.throttle * (1. - shift_open * 0.95) - self.throttle) * STEP / 0.06;
+        // A throttle plate moves in ~30 ms.
+        self.throttle += (c.throttle * (1. - shift_open * 0.95) - self.throttle) * STEP / 0.03;
         let position =
             ((self.omega - self.idle) / (self.maximum - self.idle).max(1.)).clamp(0., 1.);
         let available = c.peak_torque_nm * (0.65 + 0.35 * (std::f32::consts::PI * position).sin());
         let drag = c.peak_torque_nm * (0.045 + 0.055 * position);
+        if self.throttle < 0.02 && self.omega > self.idle * 1.5 {
+            self.idle_raise = 1.;
+        } else {
+            self.idle_raise *= 1. - STEP / 1.2;
+        }
+        let idle_target = self.idle * (1.015 + 0.2 * self.idle_raise);
         let idle_throttle =
-            (drag / available + (self.idle * 1.015 - self.omega) * 0.012).clamp(0., 0.3);
+            (drag / available + (idle_target - self.omega) * 0.012).clamp(0., 0.3);
         let limiter = ((self.maximum - self.omega) / (self.maximum * 0.035).max(1.)).clamp(0., 1.);
         let combustion = available * self.throttle.max(idle_throttle) * limiter;
         let free_engine = self.omega + (combustion - drag) / c.inertia * STEP;

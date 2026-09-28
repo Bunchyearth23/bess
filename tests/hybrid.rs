@@ -41,8 +41,14 @@ fn textured_fixture() -> Arc<Bank> {
     BANK.get_or_init(|| build_fixture(true)).clone()
 }
 fn build_fixture(textured: bool) -> Arc<Bank> {
+    let path = fixture_zip(textured, false);
+    let bank = Arc::new(Bank::load(&path, None).unwrap());
+    // Keep the source for the replacement-mod roundtrip test.
+    bank
+}
+fn fixture_zip(textured: bool, silent_knot: bool) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "bess-fixture-{textured}-{}.zip",
+        "bess-fixture-{textured}-{silent_knot}-{}.zip",
         std::process::id()
     ));
     let file = std::fs::File::create(&path).unwrap();
@@ -77,8 +83,13 @@ fn build_fixture(textured: bool) -> Arc<Bank> {
                         seed ^= seed << 5;
                         sample += (seed as f32 / u32::MAX as f32 * 2. - 1.) * 0.012;
                     }
-                    wav.write_sample(sample * (0.6 + 0.4 * layer as f32))
-                        .unwrap();
+                    let silent = silent_knot && layer == 0 && rpm == 1600;
+                    wav.write_sample(if silent {
+                        0.
+                    } else {
+                        sample * (0.6 + 0.4 * layer as f32)
+                    })
+                    .unwrap();
                 }
                 wav.finalize().unwrap();
             }
@@ -99,9 +110,7 @@ fn build_fixture(textured: bool) -> Arc<Bank> {
     zip.write_all(b"{\"Name\":\"Test Vehicle\",\"paints\":{\"Blue\":1,\"Blue\":2}}")
         .unwrap();
     zip.finish().unwrap();
-    let bank = Arc::new(Bank::load(&path, None).unwrap());
-    // Keep the source for the replacement-mod roundtrip test.
-    bank
+    path
 }
 fn params() -> Parameters {
     Parameters {
@@ -225,6 +234,7 @@ fn source_timbre_and_named_profile_validate_and_round_trip() {
         source: None,
         driving: Default::default(),
         profile_name: "My raw tune".into(),
+        scratch: None,
     };
     let path = std::env::temp_dir().join(format!("bess-profile-{}.json", std::process::id()));
     project::save_project(&path, &p).unwrap();
@@ -447,6 +457,7 @@ fn imported_bank_and_project_retain_provenance() {
             ..Default::default()
         },
         profile_name: "Test profile".into(),
+        scratch: None,
     };
     project::save_project(&path, &p).unwrap();
     let read = project::load_project(&path).unwrap();
@@ -713,6 +724,7 @@ fn timbre_maps_change_selected_regions_and_roundtrip() {
         source: Some(bank.source.clone()),
         driving: Default::default(),
         profile_name: project::default_profile_name(),
+        scratch: None,
     };
     project::save_project(&path, &project).unwrap();
     assert_eq!(project::load_project(&path).unwrap().hybrid.maps, h.maps);
@@ -721,6 +733,10 @@ fn timbre_maps_change_selected_regions_and_roundtrip() {
 #[test]
 fn invalid_waveforms_and_settings_are_rejected() {
     assert!(bess::bank::decode_wav(b"not a wav").is_err());
+    let silent = Bank::load(&fixture_zip(false, true), None)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(silent.contains("Silent WAV at 1600 rpm"), "{silent}");
     assert!(
         Settings {
             response: f32::NAN,

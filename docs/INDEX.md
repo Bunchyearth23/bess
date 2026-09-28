@@ -4,6 +4,8 @@ Identifiers are stable. W states change only on explicit user instruction; check
 
 ## Resume
 
+- 2026-09-28 session (uncommitted): audit fixes, then a bank-free **scratch engine** (W-005) with an Automation-style builder, free crank/firing design, research-driven idle/overrun realism and a physical exhaust network. Next level agreed by the user: one mode only, driven by a real-time physical engine simulation (W-006). Research: [realism report](../reports/Synthèse%20réaliste%20moteur%20thermique.md) and [physical-simulation report](../reports/Simulation%20physique%20moteur%20temps%20réel.md) with notes in `../research_notes/`.
+- The user's remaining "lift-off delay" is mostly Bluetooth AAC output latency (~240 ms measured), not BESS (X-013).
 - User priority: replace the generic bench with hybrid synthesis based on Automation audio, then improve realism and dynamics; see [engine sound research](ENGINE-SOUND-RESEARCH.md).
 - Current 0.11.1 source adds in-bench BeamNG camera perspective previews (Cockpit, Hood, Tailpipe, Orbit), an idle gain control, offline level estimates by camera, and interface ergonomics improvements. See the [0.11.1 release notes](../RELEASE_NOTES_0.11.1.md), [0.11.0 notes](../RELEASE_NOTES_0.11.0.md), [0.10.1 correction report](reports/BESS-0.10.1-STANDARD-FLEET-2026-09-23.md) and [0.10.0 history](reports/BESS-0.10.0-FLEET-2026-09-23.md).
 - New recording-free track: the [standalone mission](standalone-mission.md) now has a versioned four-stroke event synth, three JSON presets, four WAV scenarios and minimal CPAL live controls. See [design](design.md) and [validation](validation.md). It has not been integrated into the main BESS GUI or BeamNG export.
@@ -42,6 +44,14 @@ Identifiers are stable. W states change only on explicit user instruction; check
 | D-023 | accepted | User correction for 0.10.1: the descriptor-guided generator remains available only for experimental listening and comparisons in the interface. New imports, selectable BeamNG add-ons, legacy full replacements, BeamNG preview and export level estimates use the standard source-guided mode. Existing projects retain their saved listening mode. |
 | D-024 | accepted | Develop the experimental live model against all twelve local Automation vehicles from the start; previously saved experimental projects may change sound. Keep the experimental mode in the interface and the standard source-guided sound in every BeamNG export. |
 | D-025 | accepted | Implement the new recording-free mission as an additive standalone four-stroke instrument with its own versioned JSON, WAV and live controls; preserve D-023's standard source-guided BeamNG export until sound and integration are separately validated. |
+| D-026 | accepted | At user request, a bank-free "scratch engine" in the GUI (`src/scratch.rs`): WAV export only for now; imported banks, the standard mode and BeamNG exports stay unchanged (all scratch behaviour is gated). Saved in projects as `scratch`. |
+| D-027 | accepted | Scratch engines are designed Automation-style (`src/engine_build.rs`): block, head/valvetrain, bottom end, aspiration/blow-off, fuel/intake, exhaust parts derive sound, performance and bench torque/inertia. Bore/stroke are free (any positive size); block material only shades mechanical noise. |
+| D-028 | accepted | Engine design is free: per-cylinder crankpin angle and bank, V angle, and any firing order (repeats fire twice, omitted cylinders never fire). Events take whichever of the two TDCs is nearest even spacing. Engines that "don't work" are allowed; validation is numeric only. |
+| D-029 | accepted | Afterfire (pops) is an explicit scratch parameter, default 0; the builder never enables it. |
+| D-030 | accepted | Scratch output has no automatic level matching (it pumped ~1 s after lift-off): a fixed gain (`SCRATCH_GAIN`) calibrated so an open-exhaust V12 at the tailpipe, full volume, peaks ≈ −1.4 dBFS, plus a −1 dBFS peak limiter. The exhaust network sets open-vs-muffled loudness (≈16 dB). |
+| D-031 | accepted | Scratch exhaust is a parts-built waveguide network (header → downpipe → catalyst → pipe → parallel muffler chambers → tail, Levine–Schwinger open end, per-segment temperature), damped to T60 ≈ 0.12 s; nothing bypasses it. |
+| D-032 | accepted | User direction: keep a single scratch mode and take it "to the next level" with a real-time physical engine simulation (cylinder thermodynamics, cam-driven valve flow, gas dynamics, crank dynamics) that produces the sound; replaces the descriptor voice and the explicit-event synth once it sounds better. See W-006. |
+| D-033 | accepted | UI at user request: no collapsing sections or drop-down lists; all controls shown at once. Spectrum analyser replaces the waveform scope; meters use peak-hold ballistics. |
 
 ## Work items
 
@@ -51,6 +61,8 @@ Identifiers are stable. W states change only on explicit user instruction; check
 | W-002 | planned | Integration | Automation import and BeamNG export | Real ZIP | Audible vehicle and in-game transitions validated |
 | W-003 | building | Hybrid audio | Read bank, enrich dynamics, compare source/enhanced | D-005 | Audible import, continuity/control tests and user listening preference |
 | W-004 | building | Driving | Simulate throttle, gearbox and output load for playback | D-007, D-008 | Working controls, sound effect, explicit WAV behavior and user validation |
+| W-005 | building | Scratch engine | Bank-free engine designed from scratch: builder, free design, realism chain, exhaust network | D-026–D-031 | User listening accepts idle, rev drop and lift-off as not artificial |
+| W-006 | planned | Physical engine | Real-time physically simulated engine as the single scratch mode | D-032, W-005 | Blind 2AFC listening (≥ 12/16) cannot reliably tell it from a recording at idle and lift-off; real-time at 8–12 cylinders |
 
 ## Tasks
 
@@ -129,6 +141,38 @@ Identifiers are stable. W states change only on explicit user instruction; check
 - [x] W-004.6 At user request, driving moved to a top button and dedicated window; build, strict linting and 0.4.1 capture checked.
 - [x] W-004.7 User sketch applied in 0.5.1: integrated driving at upper right, graph beneath; replaces W-004.6's floating window. Build, strict linting and capture checked; see [dock report](reports/DRIVE-DOCK-0.5.1.md).
 
+### W-005 — scratch engine
+
+Evidence: `cargo test --release` 120 passed, strict Clippy clean (2026-09-28); tests in `tests/scratch.rs`, `src/acoustics.rs`, `src/engine_build.rs`, `src/spectrum.rs`. No user listening acceptance yet.
+
+- [x] W-005.1 Audit fixes: silent-WAV import rejection, vehicle-folder name check, NaN output guard, `error.txt` never overwrites, standalone_live non-blocking send, Cerberus test skips without local cars.
+- [x] W-005.2 Scratch engine in GUI with live click-free rebuilds (off-thread model build, audio-thread swap, dropped voices returned to UI thread); project round-trip; WAV export.
+- [x] W-005.3 Automation-style builder + summary (displacement, redline, torque, power); free bore/stroke; free pins/banks/firing order incl. nonsense engines.
+- [x] W-005.4 Realism report ranks 1–3: skewed per-event combustion scatter (idle COV 6–12 %), per-engine cylinder imbalance from a build seed, crank-speed ripple and idle hunting (descriptor voice only).
+- [x] W-005.5 Rank 5: fuel-cut state machine with source change (pump pulses, flow noise ∝ U³); ramps 50 ms retard + 2 engine cycles (≥ 40 ms); manifold load falls in ~3 revolutions.
+- [x] W-005.6 Ranks 6–10: pulse-multiplied flow noise, Levine–Schwinger open end, exhaust temperature state with thermal lag, DI injector/pump ticks, probabilistic opt-in afterfire.
+- [x] W-005.7 Rank 11 partial: parts-built exhaust network with parallel incommensurate muffler chambers and catalyst; per-cylinder offsets stand in for per-cylinder primaries.
+- [x] W-005.8 Rank 12 partial: load-dependent pulse width; listening positions (outside with ground reflection, tailpipe, engine bay, cabin); turbo blow-off/flutter; idle-return dashpot in the simulator.
+- [x] W-005.9 Intake/exhaust valve events distinct from combustion: suction by manifold pressure, overlap reversion puffs by cam, closed-throttle hiss.
+- [x] W-005.10 Level: fixed gain + −1 dBFS limiter (D-030); network damped to T60 0.12 s; lift-off completes ≈150 ms after pedal release (offline probe).
+- [ ] W-005.11 Rank 11 remainder: true per-cylinder primaries and N-port collectors, X/H crossover between banks.
+- [ ] W-005.12 Rank 4 remainder: accessory load steps at idle (A/C ≈16 N·m, steering ≈22 N·m) and delayed PI idle control.
+- [ ] W-005.13 Explicit-event voice still has its own clock: crank ripple, idle hunting and combustion scatter do not move its pulses (superseded by W-006 if adopted).
+- [ ] W-005.14 User listening acceptance of idle, rev drop and lift-off on a wired output (see X-013); blind test protocol in the realism report.
+
+### W-006 — real-time physical engine (next level)
+
+Plan source: [physical-simulation report](../reports/Simulation%20physique%20moteur%20temps%20réel.md); notes in `../research_notes/Simulation physique moteur temps réel/`.
+
+- [ ] W-006.1 0D cylinder per cylinder: slider-crank volume, first-law open system, γ(T), Wiebe heat release with spark timing (MBT default), heat loss; seeded burn scatter for COV.
+- [ ] W-006.2 Valve gas exchange: cam lobe lift profiles (duration, lift, LSA, overlap from the builder), curtain area, Cd(L/D), choked/subsonic orifice flow with engine-sim-style flow clamps; throttle area vs angle.
+- [ ] W-006.3 Crank dynamics from gas and reciprocating torque, friction (Chen–Flynn), inertia from the builder; replaces the sine-shaped bench torque.
+- [ ] W-006.4 Intake/exhaust: couple each exhaust port to the existing waveguide network through a nonlinear valve boundary (hybrid 0D + linear waveguides, not full 1D FV); intake runners/plenum similarly.
+- [ ] W-006.5 Real-time architecture: physics thread at 48–96 kHz with rpm-dependent substeps, `rtrb` ring buffer to the cpal callback, FTZ, crossfaded geometry swaps; measure CPU at 8–12 cylinders × 9000 rpm.
+- [ ] W-006.6 Realism layers kept on top: pulse-gated noise, mechanical/DI ticks, radiation p ∝ dṁ/dt, listening positions, optional FFT convolution IR.
+- [ ] W-006.7 Remove the descriptor voice and explicit-event synth from scratch mode once W-006 sounds better (D-032); keep imported-bank paths.
+- [ ] W-006.8 Validation: engines that don't work still render finite audio; knock/misfire behave; blind 2AFC protocol from the realism report.
+
 ## Risks and questions
 
 | ID | State | Priority | Topic | Resolution condition |
@@ -146,3 +190,7 @@ Identifiers are stable. W states change only on explicit user instruction; check
 | X-004 | open | P1 | Thunderhawk stops at 4,989 rpm; 0.5 corpus limits vary from 3,557 to 7,487. JBeam damage threshold is not a rev limiter | Respect each bank's range; extend only with source evidence |
 | X-005 | open | P1 | Declared cylinders/layout recovered from twelve `.car` files, but firing order, bank phasing, headers and active parts remain unknown; header acoustics are aggregated | Reliable engine data and in-game test; see 0.8.2 report |
 | X-006 | open | P2 | Version 0.4 bench performance uses generic torque/mass/ratios and does not predict the real vehicle | Identify active parts and engine/transmission data |
+| X-013 | open | P1 | The user's default output is a Bluetooth A2DP sink (AAC): measured ≈240 ms playback latency regardless of cpal buffer, PipeWire latency or device choice. Every control reaction (lift-off, throttle) is heard that late; BESS adds ≈150 ms at most. | User judges timing on the wired analog output; optionally show output latency in the GUI |
+| X-014 | open | P1 | A physical engine at audio rate may exceed real time for V8–V12 (research estimate: full 1D FV ≈ 0.4–3.6 core-s per audio-s; engine-sim runs 5–40 kHz with 8 gas substeps) | Prototype W-006 with 0D + waveguides, measure µs/step before committing |
+| X-015 | open | P2 | Scratch loudness now follows the network: a stock muffled I4 peaks ≈ −24 dBFS at full listening volume vs ≈ −6 dBFS open | User confirms levels; otherwise raise muffled output without breaking D-030's ceiling |
+| X-016 | open | P1 | Scratch realism is measured, not heard: half-orders, lift-off timing and level targets come from research estimates, with no user listening acceptance yet | W-005.14 listening; W-006.8 blind test |

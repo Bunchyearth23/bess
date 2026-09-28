@@ -118,6 +118,9 @@ impl Sample {
         for x in &mut raw {
             *x -= mean as f32;
         }
+        if raw.iter().all(|x| x.abs() < 1e-6) {
+            return Err(format!("Silent WAV at {rpm} rpm"));
+        }
         let period = rate as f64 * 120. / rpm as f64;
         let analysis = crate::period::estimate(&raw, period);
         let legacy = Self::prepare_at(rpm, rate, &raw, period, analysis)?;

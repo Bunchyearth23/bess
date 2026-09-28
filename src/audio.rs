@@ -4,12 +4,13 @@ use bess::{
     drive::Controls,
     hybrid::Settings,
     project::Parameters,
+    scratch::{Scratch, ScratchModel, ScratchVoice},
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// Prefer a 48 kHz stream over a higher-rate device default.
@@ -49,7 +50,10 @@ pub struct Meter {
     pub blocks: AtomicU32,
     pub peak: AtomicU32,
     pub failed: AtomicBool,
-    pub samples: [AtomicU32; 256],
+    /// Contiguous recent output (f32 bits) for the spectrum; `scope_end` is
+    /// the index one past the newest sample.
+    pub scope: Box<[AtomicU32; crate::spectrum::WINDOW]>,
+    pub scope_end: AtomicUsize,
 }
 impl Default for Meter {
     fn default() -> Self {
@@ -66,7 +70,8 @@ impl Default for Meter {
             blocks: AtomicU32::new(0),
             peak: AtomicU32::new(0),
             failed: AtomicBool::new(false),
-            samples: std::array::from_fn(|_| AtomicU32::new(0)),
+            scope: Box::new(std::array::from_fn(|_| AtomicU32::new(0))),
+            scope_end: AtomicUsize::new(0),
         }
     }
 }
@@ -75,6 +80,11 @@ pub struct Audio {
     pub tx: Sender<Command>,
     pub meter: Arc<Meter>,
     pub description: String,
+    pub rate: u32,
+    /// Rebuilt scratch voices, prepared off the callback at `rate`.
+    pub swap: Sender<ScratchModel>,
+    /// Voices displaced by a swap; drain and drop them on the UI thread.
+    pub trash: Receiver<ScratchVoice>,
 }
 impl Audio {
     pub fn start(params: Parameters) -> Result<Self, String> {
@@ -86,6 +96,20 @@ impl Audio {
         bank: Option<Arc<Bank>>,
         driving: Controls,
     ) -> Result<Self, String> {
+        Self::open(|rate| Ok(Bench::new(rate, params, settings, driving, bank)))
+    }
+    pub fn with_scratch(
+        params: Parameters,
+        settings: Settings,
+        scratch: &Scratch,
+        driving: Controls,
+    ) -> Result<Self, String> {
+        Self::open(|rate| {
+            let model = ScratchModel::build(scratch, rate)?;
+            Ok(Bench::from_scratch(rate, params, settings, driving, model))
+        })
+    }
+    fn open(make: impl FnOnce(u32) -> Result<Bench, String>) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -119,7 +143,9 @@ impl Audio {
         let mut playing = false;
         // Build typed streams so the default device need not accept f32.
         // Command handling belongs at the block boundary; engine is owned by callback.
-        let mut engine = Bench::new(rate, params, settings, driving, bank);
+        let mut engine = make(rate)?;
+        let (swap, swap_rx) = bounded::<ScratchModel>(1);
+        let (trash_tx, trash) = bounded::<ScratchVoice>(8);
         let callback_meter = meter.clone();
         let mut scope_index = 0usize;
         macro_rules! stream {
@@ -140,19 +166,28 @@ impl Audio {
                             );
                             playing = command.playing;
                         }
+                        if let Ok(model) = swap_rx.try_recv()
+                            && let Some(old) = engine.swap_scratch(model)
+                        {
+                            let _ = trash_tx.try_send(old);
+                        }
                         let mut peak = 0.0f32;
                         for frame in data.chunks_mut(channels) {
                             let sample = engine.next(playing);
+                            // Never hand NaN/inf to the device; silence until Reconnect audio.
+                            let sample = if sample.is_finite() { sample } else { 0. };
                             peak = peak.max(sample.abs());
-                            if scope_index.is_multiple_of(8) {
-                                callback_meter.samples[(scope_index / 8) % 256]
-                                    .store(sample.to_bits(), Ordering::Relaxed);
-                            }
-                            scope_index = scope_index.wrapping_add(1);
+                            callback_meter.scope[scope_index % crate::spectrum::WINDOW]
+                                .store(sample.to_bits(), Ordering::Relaxed);
+                            scope_index = (scope_index + 1) % crate::spectrum::WINDOW;
                             for slot in frame {
                                 *slot = ($convert)(sample);
                             }
                         }
+                        while let Some(old) = engine.take_retired() {
+                            let _ = trash_tx.try_send(old);
+                        }
+                        callback_meter.scope_end.store(scope_index, Ordering::Release);
                         callback_meter.peak.store(peak.to_bits(), Ordering::Relaxed);
                         callback_meter.blocks.fetch_add(1, Ordering::Relaxed);
                         let state = engine.state();
@@ -208,6 +243,9 @@ impl Audio {
             tx,
             meter,
             description,
+            rate,
+            swap,
+            trash,
         })
     }
 }

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod audio;
+mod spectrum;
 use bess::{
     bank::Bank,
     beamng, beamng_level,
@@ -8,6 +9,8 @@ use bess::{
     hybrid::Settings,
     project::{self, Parameters, Project},
     render,
+    engine_build::EngineBuild,
+    scratch::{EngineDesign, Layout, Scratch, ScratchEngine, ScratchModel},
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -79,7 +82,46 @@ struct App {
     level_error: Option<String>,
     level_rpm: f32,
     profile_name: String,
-    show_advanced_sound: bool,
+    /// Engine designed from scratch; mutually exclusive with `bank`.
+    scratch: Option<Scratch>,
+    /// Scratch settings the live voice was last built from.
+    scratch_built: Option<Scratch>,
+    scratch_builder: Option<mpsc::Receiver<Result<ScratchModel, String>>>,
+    /// Firing-order text being edited, e.g. "1-3-4-2".
+    firing_text: String,
+    readout: Readout,
+}
+
+/// Smoothed display values: instantaneous meters are unreadable.
+struct Readout {
+    spectrum: spectrum::Spectrum,
+    block: Box<[f32; spectrum::WINDOW]>,
+    peak_db: f32,
+    rpm: f32,
+}
+impl Readout {
+    fn new() -> Self {
+        Self {
+            spectrum: spectrum::Spectrum::new(48_000.),
+            block: Box::new([0.; spectrum::WINDOW]),
+            peak_db: -100.,
+            rpm: 0.,
+        }
+    }
+    fn update(&mut self, audio: &audio::Audio, dt: f32) {
+        let meter = &audio.meter;
+        let end = meter.scope_end.load(Ordering::Acquire);
+        for (i, sample) in self.block.iter_mut().enumerate() {
+            let index = (end + i) % spectrum::WINDOW;
+            *sample = f32::from_bits(meter.scope[index].load(Ordering::Relaxed));
+        }
+        self.spectrum.update(&self.block);
+        // Peak meter ballistics: instant rise, 20 dB/s fall.
+        let peak = 20. * f32::from_bits(meter.peak.load(Ordering::Relaxed)).max(1e-5).log10();
+        self.peak_db = peak.max(self.peak_db - 20. * dt);
+        let rpm = f32::from_bits(meter.rpm.load(Ordering::Relaxed));
+        self.rpm += (rpm - self.rpm) * (dt / 0.15).min(1.);
+    }
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
@@ -119,10 +161,18 @@ impl App {
             level_error: None,
             level_rpm: 900.,
             profile_name: "Natural".into(),
-            show_advanced_sound: false,
+            scratch: None,
+            scratch_built: None,
+            scratch_builder: None,
+            firing_text: String::new(),
+            readout: Readout::new(),
         };
         if let Some(path) = initial {
-            app.import(path, None);
+            if path.extension().is_some_and(|e| e == "json") {
+                app.open_project(&path);
+            } else {
+                app.import(path, None);
+            }
         }
         app
     }
@@ -130,8 +180,20 @@ impl App {
         self.audio = None;
         self.playing = false;
         self.sent = None;
-        match audio::Audio::with_bank(self.params, self.settings, self.bank.clone(), self.driving) {
-            Ok(a) => self.audio = Some(a),
+        let audio = match &self.scratch {
+            Some(scratch) => {
+                self.params.cylinders = scratch.cylinders();
+                self.scratch_built = Some(scratch.clone());
+                self.scratch_builder = None;
+                audio::Audio::with_scratch(self.params, self.settings, scratch, self.driving)
+            }
+            None => audio::Audio::with_bank(self.params, self.settings, self.bank.clone(), self.driving),
+        };
+        match audio {
+            Ok(a) => {
+                self.readout.spectrum.set_rate(a.rate as f32);
+                self.audio = Some(a);
+            }
             Err(e) => self.status = format!("Audio unavailable: {e}. Export is still available."),
         }
     }
@@ -204,6 +266,7 @@ impl App {
             source: self.bank.as_ref().map(|b| b.source.clone()),
             driving: self.driving,
             profile_name: self.profile_name.clone(),
+            scratch: self.scratch.clone(),
         }
     }
     fn level_key(&self) -> Option<LevelKey> {
@@ -229,7 +292,13 @@ impl App {
     fn open_project(&mut self, path: &Path) {
         match project::load_project(path) {
             Ok(p) => {
-                if let Some(source) = &p.source {
+                if let Some(scratch) = p.scratch {
+                    self.params = p.parameters;
+                    self.settings = p.hybrid;
+                    self.driving = p.driving;
+                    self.profile_name = p.profile_name;
+                    self.start_scratch(scratch, false);
+                } else if let Some(source) = &p.source {
                     let source_path = PathBuf::from(&source.archive);
                     let resolved = if source_path.is_absolute() {
                         source_path
@@ -255,8 +324,218 @@ impl App {
     }
 }
 impl App {
+    /// Leave any imported bank and play an engine designed from scratch.
+    /// `fresh` resets sound settings; a loaded project keeps its own.
+    fn start_scratch(&mut self, scratch: Scratch, fresh: bool) {
+        self.bank = None;
+        if fresh {
+            // Fresh start: generic acoustic defaults, an open outlet and B only.
+            self.settings = Settings::default();
+            self.params = Parameters {
+                brightness: 10000.,
+                exhaust: 1.,
+                intake: 0.25,
+                mechanical: 0.12,
+                volume: self.params.volume,
+                ..Parameters::default()
+            };
+        }
+        let mut scratch = scratch;
+        if fresh {
+            scratch.derive_from_build(&mut self.settings, &mut self.params, &mut self.driving);
+        }
+        self.vehicle = None;
+        self.level_report = None;
+        self.audition_mix = AuditionMix::Live;
+        self.camera = BeamNgCamera::Orbit;
+        (self.settings.enhanced, self.settings.procedural) = (true, false);
+        self.params.rpm = self.params.rpm.clamp(scratch.idle_rpm, scratch.redline_rpm);
+        self.status = "Scratch engine: shape it with the controls on the left. No Automation ZIP is used.".into();
+        self.firing_text = firing_text(&scratch.design);
+        self.scratch = Some(scratch);
+        self.reconnect();
+    }
+    /// Rebuild the scratch voice off the UI thread when its design changes,
+    /// then hand it to the callback, which crossfades to it.
+    fn sync_scratch(&mut self) {
+        let Some(audio) = &self.audio else { return };
+        for old in audio.trash.try_iter() {
+            drop(old);
+        }
+        if let Some(rx) = &self.scratch_builder {
+            match rx.try_recv() {
+                Ok(Ok(model)) => {
+                    // A full slot means the callback has not taken the last one yet.
+                    if let Err(error) = audio.swap.try_send(model) {
+                        drop(error.into_inner());
+                        self.scratch_built = None;
+                    }
+                    self.scratch_builder = None;
+                }
+                Ok(Err(error)) => {
+                    self.status = format!("Scratch engine: {error}");
+                    self.scratch_builder = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => self.scratch_builder = None,
+            }
+        }
+        let Some(scratch) = &self.scratch else { return };
+        if self.scratch_built.as_ref() == Some(scratch) || scratch.validate().is_err() {
+            return;
+        }
+        if self.scratch_built.as_ref().map(|b| b.engine) != Some(scratch.engine) {
+            // A different voice type needs a new chain.
+            let playing = self.playing;
+            self.reconnect();
+            self.playing = playing && self.audio.is_some();
+            return;
+        }
+        self.params.cylinders = scratch.cylinders();
+        let (scratch, rate) = (scratch.clone(), audio.rate);
+        self.scratch_built = Some(scratch.clone());
+        let (tx, rx) = mpsc::channel();
+        self.scratch_builder = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(ScratchModel::build(&scratch, rate));
+        });
+    }
+    fn scratch_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(scratch) = &mut self.scratch else { return };
+        let perf = scratch.build.performance(scratch.design.cylinders);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong(format!(
+                "{:.2} L {} · {:.1} × {:.1} mm",
+                perf.displacement_l,
+                layout_name(&scratch.design),
+                scratch.build.bore_mm,
+                scratch.build.stroke_mm
+            ));
+            ui.label(format!(
+                "≈ {:.0} Nm · {:.0} kW ({:.0} hp) · idle {:.0} / redline {:.0} rpm",
+                perf.peak_torque_nm,
+                perf.peak_power_kw,
+                perf.peak_power_kw * 1.341,
+                perf.idle_rpm,
+                perf.redline_rpm
+            ));
+            ui.small("Bench estimates from the parts; they set the driving bench's torque and inertia.");
+        });
+        let before = (scratch.design, scratch.build);
+        section(ui, "Block", |ui| {
+            engine_design(ui, &mut scratch.design, &mut self.firing_text);
+            engine_block(ui, &mut scratch.build);
+        });
+        engine_parts(ui, &mut scratch.build);
+        percent_slider(ui, "Afterfire (lift-off pops)", &mut scratch.experimental.afterfire);
+        ui.small("Off by default: pop-and-bang style overrun, independent of the parts.");
+        if (scratch.design, scratch.build) != before
+            && scratch.design.validate().is_ok()
+            && scratch.build.validate().is_ok()
+        {
+            scratch.derive_from_build(&mut self.settings, &mut self.params, &mut self.driving);
+        }
+        section(ui, "Sound fine-tuning", |ui| {
+        ui.small("Part changes above overwrite these.");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut scratch.engine, ScratchEngine::Experimental, "Descriptor voice");
+            ui.selectable_value(&mut scratch.engine, ScratchEngine::Standalone, "Explicit cylinder events");
+        });
+        slider(ui, "Idle (rpm)", &mut scratch.idle_rpm, 300.0..=2000.0);
+        let floor = scratch.idle_rpm + 1000.;
+        scratch.redline_rpm = scratch.redline_rpm.max(floor);
+        slider(ui, "Redline (rpm)", &mut scratch.redline_rpm, floor..=12_000.0);
+        match scratch.engine {
+            ScratchEngine::Experimental => {
+                let e = &mut scratch.experimental;
+                slider(ui, "Level", &mut e.level, 0.01..=0.3);
+                slider(ui, "Level rise to redline (dB)", &mut e.rpm_rise_db, -6.0..=12.0);
+                slider(ui, "Level rise at full load (dB)", &mut e.load_rise_db, 0.0..=12.0);
+                percent_slider(ui, "Body", &mut e.body);
+                percent_slider(ui, "Pulse sharpness", &mut e.sharpness);
+                slider(ui, "Brightness", &mut e.brightness, -1.0..=1.0);
+                percent_slider(ui, "Load rasp", &mut e.rasp);
+                slider(ui, "Pulse share of level", &mut e.tonal, 0.25..=1.0);
+                percent_slider(ui, "Exhaust flow noise", &mut e.flow);
+                percent_slider(ui, "Combustion crackle", &mut e.crackle);
+                slider(ui, "Cycle variation", &mut e.variation, 0.0..=0.25);
+                section(ui, "Advanced: band offsets (dB)", |ui| {
+                    for (title, bands) in [("Pulse tone", &mut e.tone_db), ("Flow noise", &mut e.noise_db)] {
+                        for (row, load) in bands.iter_mut().zip(["off-load", "full load"]) {
+                            ui.small(format!("{title} · {load}"));
+                            for (value, label) in row.iter_mut().zip(bess::scratch::BAND_LABELS) {
+                                slider(ui, &format!("{label} Hz"), value, -12.0..=12.0);
+                            }
+                        }
+                    }
+                });
+            }
+            ScratchEngine::Standalone => {
+                ui.horizontal(|ui| {
+                    if ui.button("Load standalone JSON…").clicked()
+                        && let Some(path) = rfd::FileDialog::new().add_filter("Preset", &["json"]).pick_file()
+                    {
+                        let loaded = std::fs::read_to_string(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|json| serde_json::from_str::<bess::standalone::Config>(&json).map_err(|e| e.to_string()))
+                            .and_then(|config| config.validate().map(|()| config));
+                        match loaded {
+                            Ok(config) => {
+                                // Keep the file's own angles; the design only records the count.
+                                scratch.design.set_cylinders(config.cylinders.len() as u32);
+                                self.firing_text = firing_text(&scratch.design);
+                                scratch.standalone = config;
+                            }
+                            Err(e) => self.status = format!("Preset: {e}"),
+                        }
+                    }
+                });
+                let c = &mut scratch.standalone;
+                slider(ui, "Pulse width (ms)", &mut c.calibration.pulse_ms, 0.5..=5.0);
+                slider(ui, "Event variation", &mut c.calibration.event_variation, 0.0..=0.25);
+                slider(ui, "Exhaust roughness", &mut c.calibration.residual, 0.0..=0.5);
+                percent_slider(ui, "Exhaust level", &mut c.calibration.exhaust_level);
+                percent_slider(ui, "Intake level", &mut c.calibration.intake_level);
+                percent_slider(ui, "Block level", &mut c.calibration.block_level);
+                slider(ui, "Block resonance (Hz)", &mut c.calibration.block_hz, 50.0..=2000.0);
+                slider(ui, "Block decay (ms)", &mut c.calibration.block_decay_ms, 10.0..=300.0);
+                slider(ui, "Exhaust opens (° after firing)", &mut c.exhaust_open_after_deg, 0.0..=719.0);
+                slider(ui, "Intake opens (° after firing)", &mut c.intake_open_after_deg, 0.0..=719.0);
+                for (i, bank) in c.banks.iter_mut().enumerate() {
+                    section(ui, format!("Bank {} ducts", i + 1), |ui| {
+                        slider(ui, "Exhaust length (m)", &mut bank.exhaust_length_m, 0.1..=6.0);
+                        slider(ui, "Intake length (m)", &mut bank.intake_length_m, 0.1..=6.0);
+                        slider(ui, "Speed of sound (m/s)", &mut bank.sound_speed_m_s, 250.0..=700.0);
+                        slider(ui, "Exhaust reflection", &mut bank.exhaust_reflection, -0.8..=0.8);
+                        slider(ui, "Intake reflection", &mut bank.intake_reflection, -0.8..=0.8);
+                        slider(ui, "Loss", &mut bank.loss, 0.0..=0.85);
+                    });
+                }
+                let banks = c.banks.len();
+                section(ui, "Fine-tune firing angles and routing", |ui| {
+                    ui.small("Crank degrees over 720°. Changing the engine design above rewrites these.");
+                    for cylinder in &mut c.cylinders {
+                        ui.horizontal(|ui| {
+                            ui.label(&cylinder.name);
+                            ui.add(egui::DragValue::new(&mut cylinder.firing_deg).range(0.0..=719.9).suffix("°"));
+                            ui.add(egui::DragValue::new(&mut cylinder.strength).range(0.1..=2.0).speed(0.01).prefix("× "));
+                            if banks > 1 {
+                                ui.add(egui::DragValue::new(&mut cylinder.bank).range(0..=banks - 1).prefix("bank "));
+                            }
+                        });
+                    }
+                });
+            }
+        }
+        });
+        if let Err(e) = scratch.validate() {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+    }
     fn listen_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Sound comparison bench");
+        let scratch = self.scratch.as_ref().map(|s| s.engine);
+        if scratch != Some(ScratchEngine::Standalone) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Character:");
             for (i, (name, description)) in [
@@ -277,6 +556,7 @@ impl App {
                 }
             }
         });
+        }
         ui.small(
             "Six adjustable characters for the same imported engine. Presets keep engine timing and driving response.",
         );
@@ -284,7 +564,7 @@ impl App {
             .audio
             .as_ref()
             .filter(|_| self.playing)
-            .map(|a| f32::from_bits(a.meter.rpm.load(Ordering::Relaxed)))
+            .map(|_| self.readout.rpm)
             .unwrap_or(self.params.rpm);
         ui.label(
             RichText::new(format!("{:05.0} rpm", rpm))
@@ -329,10 +609,25 @@ impl App {
                 );
             }
         }
+        if scratch.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Listening position:");
+                for (camera, label) in [
+                    (BeamNgCamera::Orbit, "Outside"),
+                    (BeamNgCamera::Tailpipe, "Tailpipe"),
+                    (BeamNgCamera::Hood, "Engine bay"),
+                    (BeamNgCamera::Cockpit, "Cabin"),
+                ] {
+                    ui.selectable_value(&mut self.camera, camera, label);
+                }
+            });
+            ui.small("Scratch engine: there is no Automation source A, only the designed sound.");
+        } else {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.settings.enhanced, false, "A · Source Automation");
             ui.selectable_value(&mut self.settings.enhanced, true, "B · BESS resynthesis");
         });
+        }
         if self.bank.is_some()
             && ui
                 .checkbox(
@@ -343,6 +638,7 @@ impl App {
         {
             self.reconnect();
         }
+        if scratch.is_none() {
         ui.add_enabled(
             self.audition_mix == AuditionMix::Live,
             egui::Checkbox::new(
@@ -395,6 +691,7 @@ impl App {
                 }
             }
         });
+        }
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -411,7 +708,10 @@ impl App {
                 self.playing = !self.playing;
             }
             if ui
-                .add_enabled(self.bank.is_some(), egui::Button::new("Reconnect audio"))
+                .add_enabled(
+                    self.bank.is_some() || self.scratch.is_some(),
+                    egui::Button::new("Reconnect audio"),
+                )
                 .clicked()
             {
                 self.reconnect();
@@ -441,7 +741,7 @@ impl App {
             self.playing = !self.playing;
         }
         if let Some(audio) = &self.audio {
-            let rpm = f32::from_bits(audio.meter.rpm.load(Ordering::Relaxed));
+            let rpm = self.readout.rpm;
             let load = f32::from_bits(audio.meter.load.load(Ordering::Relaxed));
             ui.label(format!("{rpm:.0} rpm · engine load {:.0} %", load * 100.));
             if self.driving.mode == Mode::Simulated {
@@ -460,18 +760,15 @@ impl App {
         ui.separator();
         self.drive_controls(ui);
         if self.driving.mode == Mode::Direct {
-            if let Some(bank) = &self.bank {
-                self.params.rpm = self.params.rpm.clamp(bank.min_rpm, bank.max_rpm);
-                slider(
-                    ui,
-                    "Requested RPM",
-                    &mut self.params.rpm,
-                    bank.min_rpm..=bank.max_rpm,
-                );
-                ui.small(format!(
-                    "Exported range: {:.0}–{:.0} rpm",
-                    bank.min_rpm, bank.max_rpm
-                ));
+            let range = self
+                .bank
+                .as_ref()
+                .map(|bank| (bank.min_rpm, bank.max_rpm))
+                .or(self.scratch.as_ref().map(|s| (s.idle_rpm, s.redline_rpm)));
+            if let Some((min, max)) = range {
+                self.params.rpm = self.params.rpm.clamp(min, max);
+                slider(ui, "Requested RPM", &mut self.params.rpm, min..=max);
+                ui.small(format!("Range: {min:.0}–{max:.0} rpm"));
             } else {
                 ui.small("Import a vehicle to adjust RPM.");
             }
@@ -485,17 +782,11 @@ impl App {
         }
     }
     fn drive_controls(&mut self, ui: &mut egui::Ui) {
-        egui::ComboBox::from_id_salt("drive-mode")
-            .selected_text(match self.driving.mode {
-                Mode::Direct => "Direct RPM / load",
-                Mode::Simulated => "Simulated driving",
-                Mode::Cycle => "Comparison cycle",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.driving.mode, Mode::Simulated, "Simulated driving");
-                ui.selectable_value(&mut self.driving.mode, Mode::Direct, "Direct RPM / load");
-                ui.selectable_value(&mut self.driving.mode, Mode::Cycle, "Comparison cycle");
-            });
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.driving.mode, Mode::Simulated, "Simulated driving");
+            ui.selectable_value(&mut self.driving.mode, Mode::Direct, "Direct RPM / load");
+            ui.selectable_value(&mut self.driving.mode, Mode::Cycle, "Comparison cycle");
+        });
         if self.driving.mode == Mode::Simulated {
             percent_slider(ui, "Throttle", &mut self.driving.throttle);
             percent_slider(ui, "Brake", &mut self.driving.brake);
@@ -542,7 +833,7 @@ impl App {
             if ui.button("Restart from standstill").clicked() {
                 self.restart = self.restart.wrapping_add(1);
             }
-            egui::CollapsingHeader::new("Test bench vehicle and gearing").show(ui, |ui| {
+            section(ui, "Test bench vehicle and gearing", |ui| {
                 ui.small("Adjustable simulation values; these are not identified in the ZIP.");
                 slider(ui, "Mass (kg)", &mut self.driving.mass_kg, 300.0..=6000.0);
                 slider(
@@ -631,6 +922,204 @@ fn wheel_adjust(
             response.mark_changed();
         }
     }
+}
+/// Log-frequency analyser: 20 Hz–20 kHz, −100 to 0 dBFS, with a light grid.
+fn spectrum_plot(ui: &mut egui::Ui, spectrum: &spectrum::Spectrum) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 140.), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8., Color32::from_rgb(9, 15, 21));
+    let span = (spectrum::HIGH_HZ / spectrum::LOW_HZ).ln();
+    let x = |hz: f32| rect.left() + (hz / spectrum::LOW_HZ).ln() / span * rect.width();
+    let y = |db: f32| rect.top() + (db / spectrum::FLOOR_DB).clamp(0., 1.) * rect.height();
+    let grid = Color32::from_rgb(28, 38, 48);
+    for (hz, label) in [(50., "50"), (100., "100"), (200., "200"), (500., "500"), (1000., "1k"), (2000., "2k"), (5000., "5k"), (10_000., "10k")] {
+        painter.vline(x(hz), rect.y_range(), egui::Stroke::new(1_f32, grid));
+        painter.text(egui::pos2(x(hz) + 3., rect.bottom() - 3.), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(10.), Color32::GRAY);
+    }
+    for db in [-20., -40., -60., -80.] {
+        painter.hline(rect.x_range(), y(db), egui::Stroke::new(1_f32, grid));
+        painter.text(egui::pos2(rect.left() + 3., y(db) - 1.), egui::Align2::LEFT_BOTTOM, format!("{db:.0} dB"), egui::FontId::proportional(10.), Color32::GRAY);
+    }
+    let points: Vec<_> = (0..spectrum::BINS)
+        .map(|bin| egui::pos2(x(spectrum::bin_hz(bin)), y(spectrum.db[bin])))
+        .collect();
+    let accent = Color32::from_rgb(75, 222, 195);
+    for pair in points.windows(2) {
+        // Fill each column to the floor; the curve is not convex as a whole.
+        painter.add(egui::Shape::convex_polygon(
+            vec![pair[0], pair[1], egui::pos2(pair[1].x, rect.bottom()), egui::pos2(pair[0].x, rect.bottom())],
+            accent.gamma_multiply(0.18),
+            egui::Stroke::NONE,
+        ));
+    }
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.5_f32, accent)));
+}
+/// A titled block, always shown (no collapsing menus).
+fn section<R>(ui: &mut egui::Ui, title: impl Into<String>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.add_space(6.);
+    ui.separator();
+    ui.strong(title.into());
+    add(ui)
+}
+fn layout_name(design: &EngineDesign) -> String {
+    let n = design.cylinders;
+    match design.layout {
+        Layout::Inline => format!("I{n}"),
+        Layout::V => format!("V{n} {:.0}°", design.bank_angle),
+        Layout::Flat => format!("Flat-{n}"),
+    }
+}
+fn choice<T: PartialEq + Copy>(ui: &mut egui::Ui, label: &str, value: &mut T, options: &[(T, &str)]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        for (option, name) in options {
+            ui.selectable_value(value, *option, *name);
+        }
+    });
+}
+fn engine_block(ui: &mut egui::Ui, b: &mut EngineBuild) {
+    use bess::engine_build::BlockMaterial;
+    // Free sizes: drag or type any positive value.
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut b.bore_mm).range(0.1..=f32::MAX).speed(0.5).suffix(" mm"));
+        ui.label("Bore");
+        ui.add(egui::DragValue::new(&mut b.stroke_mm).range(0.1..=f32::MAX).speed(0.5).suffix(" mm"));
+        ui.label("Stroke");
+    });
+    choice(ui, "Block", &mut b.block, &[(BlockMaterial::CastIron, "Cast iron"), (BlockMaterial::Aluminium, "Aluminium")]);
+    ui.small("Block material only shades mechanical noise: iron is heavier and better damped.");
+}
+/// Automation-style part sections below the block.
+fn engine_parts(ui: &mut egui::Ui, b: &mut EngineBuild) {
+    use bess::engine_build::{Aspiration, BlowOff, Catalyst, Crankshaft, Fuel, Head, Headers, Muffler, Throttle};
+    section(ui, "Head and valvetrain", |ui| {
+        choice(ui, "Head", &mut b.head, &[(Head::Pushrod, "Pushrod (OHV)"), (Head::Sohc, "SOHC"), (Head::Dohc, "DOHC")]);
+        let mut valves = b.valves as u32;
+        ui.add(egui::Slider::new(&mut valves, 2..=5).text("Valves per cylinder"));
+        b.valves = valves as u8;
+        percent_slider(ui, "Cam profile (mild → race)", &mut b.cam);
+        ui.small("More overlap: stronger top end, lumpier and less stable idle.");
+        ui.checkbox(&mut b.vvt, "Variable valve timing");
+    });
+    section(ui, "Bottom end", |ui| {
+        choice(ui, "Crankshaft", &mut b.crank, &[(Crankshaft::Cast, "Cast"), (Crankshaft::Forged, "Forged"), (Crankshaft::Billet, "Billet")]);
+        slider(ui, "Compression ratio", &mut b.compression, 7.0..=14.0);
+    });
+    section(ui, "Aspiration", |ui| {
+        choice(ui, "Induction", &mut b.aspiration, &[(Aspiration::Natural, "Natural"), (Aspiration::Turbo, "Turbo"), (Aspiration::TwinTurbo, "Twin turbo")]);
+        if b.aspiration != Aspiration::Natural {
+            slider(ui, "Boost (bar)", &mut b.boost_bar, 0.2..=2.5);
+            choice(ui, "Blow-off", &mut b.blow_off, &[(BlowOff::Recirculating, "Recirculating"), (BlowOff::Atmospheric, "Atmospheric"), (BlowOff::None, "None (flutter)")]);
+        }
+    });
+    section(ui, "Fuel and intake", |ui| {
+        choice(ui, "Fuel system", &mut b.fuel, &[(Fuel::Carburettor, "Carburettor"), (Fuel::PortInjection, "Port injection"), (Fuel::DirectInjection, "Direct injection")]);
+        choice(ui, "Throttle", &mut b.throttle, &[(Throttle::Single, "Single body"), (Throttle::Individual, "Individual throttle bodies")]);
+    });
+    section(ui, "Exhaust", |ui| {
+        choice(ui, "Headers", &mut b.headers, &[(Headers::CastManifold, "Cast manifold"), (Headers::Tubular, "Tubular"), (Headers::EqualLength, "Equal-length")]);
+        slider(ui, "Pipe diameter (mm)", &mut b.exhaust_mm, 35.0..=100.0);
+        choice(ui, "Catalyst", &mut b.catalyst, &[(Catalyst::None, "None"), (Catalyst::Standard, "Standard"), (Catalyst::HighFlow, "High-flow")]);
+        choice(ui, "Muffler", &mut b.muffler, &[(Muffler::None, "None"), (Muffler::StraightThrough, "Straight-through"), (Muffler::Baffled, "Baffled"), (Muffler::ReverseFlow, "Reverse-flow")]);
+    });
+}
+fn firing_text(design: &EngineDesign) -> String {
+    design.order().iter().map(u8::to_string).collect::<Vec<_>>().join("-")
+}
+/// Layout, cylinders, crankpins, banks and a free firing order, shared by
+/// both scratch voices. Any combination is allowed, working engine or not.
+fn engine_design(ui: &mut egui::Ui, design: &mut EngineDesign, text: &mut String) {
+    ui.strong("Engine design");
+    ui.horizontal_wrapped(|ui| {
+        for (name, preset) in bess::scratch::PRESETS {
+            if ui.selectable_label(*design == preset, name).clicked() {
+                *design = preset;
+                *text = firing_text(design);
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Layout");
+        let before = design.layout;
+        ui.selectable_value(&mut design.layout, Layout::Inline, "Inline");
+        ui.selectable_value(&mut design.layout, Layout::V, "V");
+        ui.selectable_value(&mut design.layout, Layout::Flat, "Flat / boxer");
+        if design.layout != before {
+            // The layout only proposes banks and an angle; everything stays editable.
+            design.bank_angle = match design.layout {
+                Layout::Inline => 0.,
+                Layout::V => 90.,
+                Layout::Flat => 180.,
+            };
+            for (i, bank) in design.banks.iter_mut().enumerate() {
+                *bank = u8::from(design.layout != Layout::Inline && i % 2 == 1);
+            }
+        }
+    });
+    let mut cylinders = design.cylinders;
+    ui.add(egui::Slider::new(&mut cylinders, 1..=12).text("Cylinders"));
+    if cylinders != design.cylinders {
+        design.set_cylinders(cylinders);
+        *text = firing_text(design);
+    }
+    slider(ui, "Bank angle (°)", &mut design.bank_angle, 0.0..=180.0);
+    ui.horizontal(|ui| {
+        ui.label("Firing order");
+        if ui.text_edit_singleline(text).changed() {
+            let numbers: Vec<u8> = text
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|n| n.parse().ok())
+                .take(12)
+                .collect();
+            let mut candidate = *design;
+            candidate.order_len = numbers.len() as u8;
+            candidate.firing_order[..numbers.len()].copy_from_slice(&numbers);
+            if candidate.validate().is_ok() {
+                *design = candidate;
+            }
+        }
+    });
+    if firing_text(design) != *text {
+        ui.colored_label(
+            Color32::YELLOW,
+            format!("Use cylinder numbers 1–{} (repeats allowed); playing {}", design.cylinders, firing_text(design)),
+        );
+    }
+    ui.small("Any order: repeated cylinders fire twice, missing ones never fire.");
+    section(ui, "Crankpins and banks", |ui| {
+        ui.small("Pin angle on the crank (0–360°). Bank-2 pistons reach top dead centre one bank angle later.");
+        egui::Grid::new("cylinders").num_columns(3).show(ui, |ui| {
+            for i in 0..design.cylinders as usize {
+                ui.label(format!("Cylinder {}", i + 1));
+                ui.add(egui::DragValue::new(&mut design.pins[i]).range(0.0..=359.9).speed(1.).suffix("°"));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut design.banks[i], 0, "Bank 1");
+                    ui.selectable_value(&mut design.banks[i], 1, "Bank 2");
+                });
+                ui.end_row();
+            }
+        });
+    });
+    if design.banks[..design.cylinders as usize].contains(&1) {
+        slider(ui, "Bank 2 level (dB)", &mut design.bank_gain_db, -12.0..=12.0);
+        slider(ui, "Bank 2 header delay (ms)", &mut design.bank_delay_ms, 0.0..=5.0);
+    }
+    let firing = design.firing();
+    let mut events: Vec<(f32, u8)> = (0..firing.events).map(|k| (firing.angles[k], firing.cylinder[k])).collect();
+    events.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let gaps: Vec<String> = events
+        .iter()
+        .enumerate()
+        .map(|(k, e)| {
+            let next = events.get(k + 1).map_or(events[0].0 + 720., |n| n.0);
+            format!("{:.0}", next - e.0)
+        })
+        .collect();
+    ui.small(format!(
+        "Fires at: {}",
+        events.iter().map(|(a, c)| format!("{}@{a:.0}°", c + 1)).collect::<Vec<_>>().join("  ")
+    ));
+    ui.small(format!("Intervals: {}°", gaps.join(" / ")));
 }
 fn percent_slider(ui: &mut egui::Ui, label: &str, value: &mut f32) {
     let mut percent = *value * 100.;
@@ -764,7 +1253,7 @@ fn show_level_report(ui: &mut egui::Ui, report: &beamng_level::Report, rpm: f32)
                 ui.end_row();
             }
         });
-    ui.collapsing("WAV level details", |ui| {
+    section(ui, "WAV level details", |ui| {
         egui::Grid::new("beamng-export-level-details")
             .striped(true)
             .show(ui, |ui| {
@@ -885,7 +1374,7 @@ impl eframe::App for App {
                 .level_report
                 .as_ref()
                 .is_some_and(|(key, _)| self.level_key().as_ref() == Some(key));
-            if self.bank.is_some()
+            if (self.bank.is_some() || self.scratch.is_some())
                 && self.frames > 20
                 && !self.capture_requested
                 && (!self.capture_level || level_ready)
@@ -928,6 +1417,11 @@ impl eframe::App for App {
         {
             self.playing = !self.playing;
         }
+        self.sync_scratch();
+        if let Some(audio) = &self.audio {
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.2);
+            self.readout.update(audio, dt);
+        }
         if let Some(rx) = &self.importer
             && let Ok(result) = rx.try_recv()
         {
@@ -940,6 +1434,7 @@ impl eframe::App for App {
                     self.profile_name = v.profile_name;
                     self.bank = Some(v.bank);
                     self.vehicle = v.vehicle;
+                    self.scratch = None;
                     self.status =
                         "Sound bank ready. Compare the Automation source and BESS resynthesis."
                             .into();
@@ -1032,6 +1527,16 @@ impl eframe::App for App {
                     {
                         self.import(path, None);
                     }
+                    if ui
+                        .add_enabled(self.importer.is_none(), egui::Button::new("New engine from scratch"))
+                        .on_hover_text("Design an engine sound without an Automation ZIP.")
+                        .clicked()
+                    {
+                        self.start_scratch(Scratch::default(), true);
+                    }
+                    if self.scratch.is_some() {
+                        self.scratch_panel(ui);
+                    }
                     if let Some(bank) = &self.bank {
                         ui.label(
                             self.vehicle
@@ -1065,7 +1570,9 @@ impl eframe::App for App {
                     }
                     ui.separator();
                     ui.heading("02 / Character and dynamics");
-                    if self.settings.procedural {
+                    if self.scratch.as_ref().is_some_and(|s| s.engine == ScratchEngine::Standalone) {
+                        ui.small("The four-stroke event voice uses only the scratch controls above.");
+                    } else if self.settings.procedural && self.scratch.is_none() {
                         if let Some(cylinders) = self.bank.as_ref().and_then(|bank| bank.engine_meta.as_ref().map(|meta| meta.cylinders)) {
                             ui.small(format!("Generated pulse timing uses {cylinders} cylinders verified in the vehicle ZIP. Firing order is not identified."));
                         } else {
@@ -1084,23 +1591,26 @@ impl eframe::App for App {
                         slider(ui, "Idle gain", &mut self.settings.idle_gain, 0.0..=2.0);
                         ui.small("This is an experimental exhaust-guided model. Its intake and mechanical sound are estimates, not separate recordings.");
                     } else {
+                    if self.scratch.is_none() {
                     slider(ui,"Automation timbre retained",&mut self.settings.source_timbre,0.0..=1.0);
                     ui.small("0 builds a new tone from the ZIP analysis. 100% retains its timbre while BESS processing stays active.");
                     slider(ui,"Resynthesis amount",&mut self.settings.coloration,0.0..=1.0);
+                    } else {
+                        ui.small("The designed pulses and noise excite the exhaust, intake and mechanical models below.");
+                    }
                     slider(ui,"Exhaust level",&mut self.params.exhaust,0.0..=1.0);
                     slider(ui,"Intake level",&mut self.params.intake,0.0..=1.0);
                     slider(ui,"Mechanical level",&mut self.params.mechanical,0.0..=1.0);
                     slider(ui, "Idle gain", &mut self.settings.idle_gain, 0.0..=2.0);
-                    if ui.add_enabled(self.bank.is_some(),egui::Button::new("Fit vehicle / natural background")).clicked()
+                    if self.bank.is_some() && ui.button("Fit vehicle / natural background").clicked()
                         && let Some(bank)=&self.bank {
                             let enhanced=self.settings.enhanced;let level_match=self.settings.level_match;
                             let procedural=self.settings.procedural;
                             let combustion=self.settings.combustion;
                             self.settings=Settings{enhanced,procedural,level_match,combustion,..Settings::calibrated(bank)};
                     }
-                    ui.checkbox(&mut self.show_advanced_sound,"Advanced sound controls");
-                    if self.show_advanced_sound {
-                    ui.collapsing("Engine and combustion (optional)", |ui| {
+                    {
+                    section(ui, "Engine and combustion (optional)", |ui| {
                         ui.small("Automation engine data may provide the layout, but not the firing order. Combustion events are optional: the WAV files already contain pulses.");
                         let mut enabled=self.settings.combustion.cylinders>0;
                         if ui.checkbox(&mut enabled,"Enable combustion events").changed() {
@@ -1123,7 +1633,7 @@ impl eframe::App for App {
                             slider(ui,"Pressure duration (ms)",&mut self.settings.combustion.width_ms,0.5..=8.0);
                             slider(ui,"Exhaust opening (° after ignition)",&mut self.settings.combustion.exhaust_delay,60.0..=240.0);
                             ui.small("Even spacing is suggested, not a manufacturer firing order. Resynthesis amount also scales these events.");
-                            ui.collapsing("Ignition angles over 720°", |ui| {
+                            section(ui, "Ignition angles over 720°", |ui| {
                                 for i in 0..self.settings.combustion.cylinders as usize {slider(ui,&format!("Cylinder {} (°)",i+1),&mut self.settings.combustion.angles[i],0.0..=719.9);}
                             });
                         }
@@ -1336,14 +1846,14 @@ impl eframe::App for App {
             ui.add_space(10.);
             if let Some(audio)=&self.audio {
                 ui.small(&audio.description);if audio.meter.failed.load(Ordering::Relaxed){ui.colored_label(Color32::LIGHT_RED,"Audio stream interrupted. Reconnect audio.");}
-                let peak=f32::from_bits(audio.meter.peak.load(Ordering::Relaxed));
-                ui.add(egui::ProgressBar::new(peak).text(format!("Peak {:.1} dBFS",20.*peak.max(0.00001).log10())));
-                let (rect,_)=ui.allocate_exact_size(egui::vec2(ui.available_width(),120.),egui::Sense::hover());
-                ui.painter().rect_filled(rect,8.,Color32::from_rgb(9,15,21));
-                let points:Vec<_>=audio.meter.samples.iter().enumerate().map(|(i,s)|egui::pos2(rect.left()+i as f32/255.*rect.width(),rect.center().y-f32::from_bits(s.load(Ordering::Relaxed))*rect.height()*0.8)).collect();
-                ui.painter().add(egui::Shape::line(points,egui::Stroke::new(1.5_f32,Color32::from_rgb(75,222,195))));
+                let peak_db=self.readout.peak_db;
+                ui.add(egui::ProgressBar::new(((peak_db+60.)/60.).clamp(0.,1.)).text(format!("Peak {peak_db:.0} dBFS")));
+                spectrum_plot(ui,&self.readout.spectrum);
             }
             ui.separator();ui.heading("Export BeamNG");
+            if self.scratch.is_some() {
+                ui.colored_label(Color32::YELLOW, "Scratch engines export WAV only for now. BeamNG export needs an imported Automation vehicle.");
+            }
             ui.small("Adds a BESS configuration to the original Automation vehicle. Keep the original mod enabled.");
             ui.small("BeamNG always receives the standard source-guided sound. Experimental synthesis stays in the listening interface.");
             ui.small("Game afterfire, turbo, and startup sounds are preserved; BESS transient effects are not transferred.");
@@ -1420,11 +1930,17 @@ impl eframe::App for App {
                 Mode::Cycle=>"WAV: complete comparison cycle fitted to the selected duration."
             });
             ui.small("Mono 48 kHz / 24-bit. Rendering does not record earlier control changes.");
-            if ui.add_enabled(self.bank.is_some()&&self.worker.is_none(),egui::Button::new("Export selected mode…")).clicked()
-                &&let Some(path)=rfd::FileDialog::new().add_filter("Audio",&["wav"]).set_file_name("hybrid-engine.wav").save_file(){
-                let bank=self.bank.clone().unwrap();let p=self.params;let h=self.settings;let seconds=self.seconds;let driving=self.driving;
+            if ui.add_enabled((self.bank.is_some()||self.scratch.is_some())&&self.worker.is_none(),egui::Button::new("Export selected mode…")).clicked()
+                &&let Some(path)=rfd::FileDialog::new().add_filter("Audio",&["wav"]).set_file_name(if self.scratch.is_some(){"scratch-engine.wav"}else{"hybrid-engine.wav"}).save_file(){
+                let bank=self.bank.clone();let scratch=self.scratch.clone();let p=self.params;let h=self.settings;let seconds=self.seconds;let driving=self.driving;
                 let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Rendering audio…".into();
-                std::thread::spawn(move||{let _=tx.send(render::bench_wav(&path,p,h,bank,seconds,driving).map(|()|format!("WAV : {}",path.display())));});
+                std::thread::spawn(move||{
+                    let result=match (scratch,bank) {
+                        (Some(scratch),_)=>render::scratch_wav(&path,p,h,&scratch,seconds,driving),
+                        (None,Some(bank))=>render::bench_wav(&path,p,h,bank,seconds,driving),
+                        (None,None)=>Err("Import a vehicle or start a scratch engine".into()),
+                    };
+                    let _=tx.send(result.map(|()|format!("WAV : {}",path.display())));});
             }
             if ui.add_enabled(self.bank.is_some()&&self.worker.is_none(),egui::Button::new("Export A/B comparison (16 s)…")).clicked()
                 &&let Some(dir)=rfd::FileDialog::new().pick_folder(){
@@ -1585,8 +2101,12 @@ fn main() -> eframe::Result {
         })();
         if let Err(e) = result {
             if let Some(dir) = args.get(3) {
+                eprintln!("{e}");
+                // Windows GUI builds have no console, so keep error.txt, but never overwrite a user's file.
                 let _ = std::fs::create_dir_all(dir);
-                let _ = std::fs::write(Path::new(dir).join("error.txt"), e);
+                if let Ok(mut file) = std::fs::File::create_new(Path::new(dir).join("error.txt")) {
+                    let _ = std::io::Write::write_all(&mut file, e.as_bytes());
+                }
             }
             std::process::exit(1);
         }

@@ -1,7 +1,7 @@
 //! Minimal real-time control surface for the recording-free instrument.
 use bess::standalone::{CombustionState, Commands, Config, Levels, Synth};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::bounded;
+use crossbeam_channel::{TrySendError, bounded};
 use std::{
     io::{self, BufRead},
     sync::{
@@ -181,7 +181,10 @@ fn run() -> Result<(), String> {
                 Ok(false) => break,
                 Ok(true) => {
                     message = candidate;
-                    tx.send(message).map_err(|e| e.to_string())?;
+                    // Never block stdin on a dead stream; a full queue only drops a stale snapshot.
+                    if let Err(TrySendError::Disconnected(_)) = tx.try_send(message) {
+                        return Err("Audio stream stopped".into());
+                    }
                 }
                 Err(error) => eprintln!("{error}"),
             }

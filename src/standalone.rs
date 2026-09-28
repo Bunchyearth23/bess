@@ -364,6 +364,9 @@ pub struct Synth {
     cylinders: Vec<CylinderState>,
     banks: Vec<BankState>,
     block: Resonator,
+    /// The unnormalized resonator's gain and the pulse width in samples both
+    /// grow with the rate; this keeps the block level of the 48 kHz tuning.
+    block_scale: f32,
     residual_lp: f32,
     dc_input: f32,
     dc_output: f32,
@@ -430,6 +433,7 @@ impl Synth {
             cylinders,
             banks,
             block,
+            block_scale: (DEFAULT_RATE as f32 / rate as f32).powi(2),
             residual_lp: 0.,
             dc_input: 0.,
             dc_output: 0.,
@@ -553,7 +557,7 @@ impl Synth {
             exhaust += bank.exhaust.next(bank_exhaust[i] * (1. + roughness));
             intake += bank.intake.next(bank_intake[i]);
         }
-        let block = self.block.next(block_input);
+        let block = self.block.next(block_input * self.block_scale);
         let mixed =
             self.levels.exhaust * exhaust + self.levels.intake * intake + self.levels.block * block;
         let ac = mixed - self.dc_input + self.dc_radius * self.dc_output;

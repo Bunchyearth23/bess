@@ -235,3 +235,24 @@ fn json_validation_and_range_stability() {
         assert!(sample.is_finite() && sample.abs() <= 0.98);
     }
 }
+
+#[test]
+fn block_resonance_level_does_not_depend_on_device_rate() {
+    let rms = |rate: u32| {
+        let mut config = Config::even(4);
+        config.calibration.exhaust_level = 0.;
+        config.calibration.intake_level = 0.;
+        config.calibration.block_level = 1.;
+        config.calibration.block_decay_ms = 300.;
+        config.calibration.block_hz = 50.;
+        let mut synth = Synth::new(rate, config, Commands::default()).unwrap();
+        let samples: Vec<f32> = (0..rate).map(|_| synth.next_sample()).collect();
+        let tail = &samples[rate as usize / 2..];
+        (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt()
+    };
+    let base = rms(48_000);
+    for rate in [44_100, 96_000, 192_000] {
+        let db = 20. * (rms(rate) / base).log10();
+        assert!(db.abs() < 1.5, "{rate} Hz differs by {db:.1} dB");
+    }
+}

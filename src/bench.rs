@@ -5,6 +5,7 @@ use crate::{
     export::{exhaust_level_gain, exhaust_level_gain_with_floor},
     hybrid::{Hybrid, HybridStems, Settings, audition},
     project::Parameters,
+    scratch::{ScratchModel, ScratchVoice},
 };
 use bdsp::svf::{StateVariableFilter, SvfMode};
 use std::sync::Arc;
@@ -244,8 +245,79 @@ impl TwoEmitterPreview {
     }
 }
 
+/// Where a scratch engine is heard from. Imported banks keep the BeamNG
+/// two-emitter preview instead; this is a physical listening chain.
+struct Listener {
+    cabin_low: StateVariableFilter,
+    cabin_mode: StateVariableFilter,
+    air: StateVariableFilter,
+    ground: [f32; 64],
+    ground_index: usize,
+    ground_delay: usize,
+    /// Smoothed exhaust gain, engine gain, cabin, outside and overall weights.
+    weights: [f32; 5],
+    slew: f32,
+    /// Peak limiter: held envelope and its release coefficient.
+    limit_envelope: f32,
+    limit_release: f32,
+}
+impl Listener {
+    fn new(rate: u32) -> Self {
+        let rate = rate as f32;
+        Self {
+            cabin_low: StateVariableFilter::new(rate, 350., 0.8, SvfMode::Lowpass),
+            cabin_mode: StateVariableFilter::new(rate, 60., 3., SvfMode::Bandpass),
+            air: StateVariableFilter::new(rate, 9000., 0.707, SvfMode::Lowpass),
+            ground: [0.; 64],
+            ground_index: 0,
+            // Tailpipe 0.3 m and ear 1.2 m high, 7.5 m away: ~0.28 ms, first notch ~1.8 kHz.
+            ground_delay: ((0.00028 * rate).round() as usize).clamp(1, 63),
+            weights: [1., 0.16, 0., 0., 1.],
+            slew: 1. / (rate * 0.05),
+            limit_envelope: 0.,
+            limit_release: (-1. / (rate * 0.15)).exp(),
+        }
+    }
+    fn next(&mut self, camera: BeamNgCamera, stems: HybridStems) -> f32 {
+        let target = match camera {
+            BeamNgCamera::Tailpipe => [1., 0.16, 0., 0., 1.],
+            BeamNgCamera::Orbit => [1., 0.4, 0., 1., 0.6],
+            BeamNgCamera::Hood => [0.25, 1., 0., 0., 0.95],
+            // Firewall and floor carry the engine; glass and seals pass lows only.
+            BeamNgCamera::Cockpit => [0.5, 0.9, 1., 0., 0.7],
+        };
+        for (w, t) in self.weights.iter_mut().zip(target) {
+            *w += (t - *w) * self.slew;
+        }
+        let [exhaust_gain, engine_gain, cabin, outside, overall] = self.weights;
+        let exhaust = stems.mixed - stems.engine * 0.25;
+        let x = exhaust * exhaust_gain + stems.engine * engine_gain;
+        let muffled = self.cabin_low.next_sample(x);
+        let inside = muffled + self.cabin_mode.next_sample(muffled) * 0.5;
+        self.ground[self.ground_index] = x;
+        let reflected =
+            self.ground[(self.ground_index + 64 - self.ground_delay) % 64];
+        self.ground_index = (self.ground_index + 1) % 64;
+        let far = self.air.next_sample(x + 0.7 * reflected) * 0.6;
+        let near = x * (1. - cabin - outside) + inside * cabin + far * outside;
+        self.limit(near * overall)
+    }
+    /// Never exceed −1 dBFS: instant attack (the envelope already holds this
+    /// sample's peak), 150 ms release. Calibrated levels rarely engage it.
+    fn limit(&mut self, x: f32) -> f32 {
+        const CEILING: f32 = 0.891;
+        self.limit_envelope = (self.limit_envelope * self.limit_release).max(x.abs());
+        if self.limit_envelope > CEILING {
+            x * CEILING / self.limit_envelope
+        } else {
+            x
+        }
+    }
+}
+
 pub struct Bench {
     engine: Hybrid,
+    listener: Option<Listener>,
     sim: Simulator,
     params: Parameters,
     settings: Settings,
@@ -286,8 +358,49 @@ impl Bench {
             params.rpm = min;
             params.load = 0.1;
         }
+        let engine = Hybrid::new(rate, params, settings, bank);
+        Self::with_engine(engine, rate, params, settings, controls, (min, max))
+    }
+    /// A bench around an engine designed from scratch, built by `ScratchModel::build`.
+    pub fn from_scratch(
+        rate: u32,
+        mut params: Parameters,
+        settings: Settings,
+        controls: Controls,
+        model: ScratchModel,
+    ) -> Self {
+        let rate = rate.max(8000);
+        let range = (model.idle_rpm, model.redline_rpm);
+        if controls.mode == Mode::Simulated {
+            params.rpm = range.0;
+            params.load = 0.1;
+        }
+        let engine = Hybrid::from_scratch(rate, params, settings, model);
+        let mut bench = Self::with_engine(engine, rate, params, settings, controls, range);
+        bench.listener = Some(Listener::new(rate));
+        bench.beamng_camera = BeamNgCamera::Orbit;
+        bench
+    }
+    /// See `Hybrid::swap_scratch`; also moves the simulator's RPM limits.
+    pub fn swap_scratch(&mut self, model: ScratchModel) -> Option<ScratchVoice> {
+        self.sim.set_range(model.idle_rpm, model.redline_rpm);
+        self.max = model.redline_rpm;
+        self.engine.swap_scratch(model)
+    }
+    pub fn take_retired(&mut self) -> Option<ScratchVoice> {
+        self.engine.take_retired()
+    }
+    fn with_engine(
+        engine: Hybrid,
+        rate: u32,
+        params: Parameters,
+        settings: Settings,
+        controls: Controls,
+        (min, max): (f32, f32),
+    ) -> Self {
         Self {
-            engine: Hybrid::new(rate, params, settings, bank),
+            engine,
+            listener: None,
             sim: Simulator::new(min, max, controls),
             params,
             settings,
@@ -358,6 +471,9 @@ impl Bench {
             self.frames += 1;
         }
         let stems = self.engine.next_stems(playing);
+        if let Some(listener) = &mut self.listener {
+            return listener.next(self.beamng_camera, stems);
+        }
         self.two_emitter_preview.next(
             stems,
             self.engine.load(),
