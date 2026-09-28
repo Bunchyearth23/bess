@@ -1,10 +1,10 @@
+use crate::project::Parameters;
 use crate::{
     bank::Bank,
     bench::Bench,
     drive::{Controls, Mode},
     hybrid::Settings,
 };
-use crate::{engine::Engine, project::Parameters};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -93,6 +93,9 @@ pub fn scratch_samples(
     let mut samples = Vec::with_capacity(frames);
     for i in 0..frames {
         samples.push(engine.next_sample(true) * ((frames - i) as f32 / 2400.).min(1.));
+        if engine.bench.failed() {
+            return Err("Physical engine could not render this operating point".into());
+        }
     }
     Ok(samples)
 }
@@ -111,11 +114,19 @@ fn render_bench(
     }
     let frames = (seconds * 48000.) as usize;
     let mut engine = make(params)?;
+    if settings.enhanced
+        && let Some(error) = engine.initialization_error()
+    {
+        return Err(error.to_owned());
+    }
     engine.set_cycle_seconds(seconds);
     let mut samples = Vec::with_capacity(frames);
     for i in 0..frames {
         let fade = ((frames - i) as f32 / 2400.).min(1.);
         samples.push(engine.next(true) * fade);
+        if engine.failed() {
+            return Err("Physical engine could not render this operating point".into());
+        }
     }
     Ok(samples)
 }
@@ -180,11 +191,7 @@ pub fn comparison(
     }
     write_pcm(&dir.join("01-source-automation.wav"), &a)?;
     write_pcm(&dir.join("02-bess-enhanced.wav"), &b)?;
-    let mode = if settings.procedural {
-        "independent procedural synthesis guided by measured characteristics"
-    } else {
-        "source-guided resynthesis"
-    };
+    let mode = "physical engine resynthesis";
     let report = format!(
         "Automation source playback and BESS {mode}, using the same 16-second scenario.\nSource RMS: {:.6}\nBESS RMS: {:.6}\nBESS level adjustment: {:.3} dB\nRMS is not a LUFS measurement. The source is reconstructed from the bank, not recorded from Automation gameplay.\n",
         rms(&a),
@@ -192,156 +199,6 @@ pub fn comparison(
         20. * gain.log10()
     );
     std::fs::write(dir.join("comparison.txt"), &report).map_err(|e| e.to_string())?;
-    Ok(report)
-}
-
-/// Three level-matched direct-mode clips at one operating point for source,
-/// source-guided and independent procedural listening.
-pub fn steady_procedural_comparison(
-    dir: &Path,
-    params: Parameters,
-    bank: Arc<Bank>,
-    seconds: f32,
-) -> Result<String, String> {
-    params.validate()?;
-    if !seconds.is_finite() || !(2.0..=20.0).contains(&seconds) {
-        return Err("Steady comparison duration must be 2–20 seconds".into());
-    }
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let base = Settings {
-        level_match: false,
-        ..Settings::calibrated(&bank)
-    };
-    let variants = [
-        (
-            "01-source-automation.wav",
-            Settings {
-                enhanced: false,
-                ..base
-            },
-        ),
-        ("02-source-guided.wav", base),
-        (
-            "03-generated.wav",
-            Settings {
-                procedural: true,
-                ..base
-            },
-        ),
-    ];
-    let mut rendered = Vec::with_capacity(variants.len());
-    let mut target_rms = 0.;
-    for (name, settings) in variants {
-        let mut samples = hybrid_samples(params, settings, bank.clone(), seconds, false)?;
-        let settled = &samples[(samples.len() / 10).max(1)..];
-        let mean = settled.iter().map(|x| *x as f64).sum::<f64>() / settled.len() as f64;
-        let rms = (settled
-            .iter()
-            .map(|x| (*x as f64 - mean).powi(2))
-            .sum::<f64>()
-            / settled.len() as f64)
-            .sqrt() as f32;
-        if rendered.is_empty() {
-            target_rms = rms;
-        } else {
-            let gain = target_rms / rms.max(1e-9);
-            // A bank with an extreme early-RPM source level can legitimately
-            // need a large audition-only gain after B's level correction.
-            // The shared peak safety factor below still bounds every file.
-            if rms < 1e-5 || gain > 64. {
-                return Err(format!("{name} is too quiet for a reliable level match"));
-            }
-            for sample in &mut samples {
-                *sample *= gain;
-            }
-        }
-        rendered.push((name, samples));
-    }
-    let peak = rendered
-        .iter()
-        .flat_map(|(_, samples)| samples)
-        .fold(0f32, |max, sample| max.max(sample.abs()));
-    let safety = (0.95 / peak.max(1e-9)).min(1.);
-    for (name, mut samples) in rendered {
-        for sample in &mut samples {
-            *sample *= safety;
-        }
-        write_pcm(&dir.join(name), &samples)?;
-    }
-    let report = format!(
-        "Steady comparison at {:.0} rpm and {:.2} load, {:.1} s, 48 kHz / PCM24. Clips were matched by settled AC RMS, then shared the same peak safety gain. Equal level does not establish naturalness. The generated clip uses measured descriptors, not Automation PCM playback.\n",
-        params.rpm, params.load, seconds
-    );
-    std::fs::write(dir.join("comparison.txt"), &report).map_err(|e| e.to_string())?;
-    Ok(report)
-}
-
-/// Same source and trajectory for all characters, matched by integrated RMS.
-pub fn characters(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<String, String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let variants = [
-        (
-            "00-source-automation",
-            Settings {
-                enhanced: false,
-                ..Settings::default()
-            },
-        ),
-        ("01-balanced", Settings::character_for_bank(0, &bank)),
-        ("02-muted", Settings::character_for_bank(1, &bank)),
-        ("03-open", Settings::character_for_bank(2, &bank)),
-        ("04-warm", Settings::character_for_bank(3, &bank)),
-        ("05-mechanical", Settings::character_for_bank(4, &bank)),
-        ("06-grit", Settings::character_for_bank(5, &bank)),
-    ];
-    let mut rendered = Vec::new();
-    let mut reference = 0.;
-    for (name, h) in variants {
-        let mut audio = hybrid_samples(params, h, bank.clone(), 16., true)?;
-        let rms =
-            (audio.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / audio.len() as f64).sqrt();
-        if rendered.is_empty() {
-            reference = rms;
-        }
-        let gain = (reference / rms.max(1e-9)) as f32;
-        for s in &mut audio {
-            *s *= gain;
-        }
-        rendered.push((name, h, audio));
-    }
-    let peak = rendered
-        .iter()
-        .flat_map(|(_, _, a)| a)
-        .fold(0f32, |m, s| m.max(s.abs()));
-    let safety = (0.95 / peak.max(1e-9)).min(1.);
-    for (name, h, mut audio) in rendered {
-        for s in &mut audio {
-            *s *= safety;
-        }
-        write_pcm(&dir.join(format!("{name}.wav")), &audio)?;
-        crate::project::save_project(
-            &dir.join(format!("{name}.bess.json")),
-            &crate::project::Project {
-                version: 2,
-                parameters: params,
-                hybrid: h,
-                source: Some(bank.source.clone()),
-                driving: Controls {
-                    mode: Mode::Cycle,
-                    ..Default::default()
-                },
-                profile_name: crate::project::default_profile_name(),
-                scratch: None,
-            },
-        )?;
-    }
-    let report = format!(
-        "BESS {} — the same vehicle and 16-second cycle, with six generated characters matched to the source by RMS.\nCommon RMS: {:.6}. Common safety gain: {:.6}.\nThe associated projects retain their settings before final WAV RMS matching.\nA is reconstructed from the source bank, not recorded from gameplay. RMS matching is not LUFS matching.\n",
-        env!("CARGO_PKG_VERSION"),
-        reference * safety as f64,
-        safety
-    );
-    std::fs::write(dir.join("listening-notes.txt"), &report).map_err(|e| e.to_string())?;
     Ok(report)
 }
 
@@ -374,11 +231,17 @@ pub fn drive_demo(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
         ),
     ] {
         let mut engine = Bench::new(48000, params, settings, c, Some(bank.clone()));
+        if let Some(error) = engine.initialization_error() {
+            return Err(error.to_owned());
+        }
         let mut audio = Vec::with_capacity(48000 * 16);
         let mut csv =
             "seconds,rpm,load,speed_kmh,gear,wheel_torque_nm,resistance_nm,shifting\n".to_owned();
         for i in 0..48000 * 16 {
             audio.push(engine.next(true) * ((48000 * 16 - i) as f32 / 2400.).min(1.));
+            if engine.failed() {
+                return Err("Physical simulation failed".into());
+            }
             if i % 2400 == 0 {
                 let s = engine.state();
                 writeln!(
@@ -415,28 +278,15 @@ pub fn drive_demo(dir: &Path, params: Parameters, bank: Arc<Bank>) -> Result<Str
 }
 
 pub fn wav(path: &Path, params: Parameters, seconds: f32, sweep: bool) -> Result<(), String> {
-    params.validate()?;
-    if !seconds.is_finite() || !(1.0..=60.0).contains(&seconds) {
-        return Err("Duration: 1 to 60 seconds".into());
-    }
-    let rate = 48000;
-    let frames = (seconds * rate as f32) as usize;
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: rate,
-        bits_per_sample: 24,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
-    let mut engine = Engine::new(rate, params);
-    for i in 0..frames {
-        if sweep && i % 256 == 0 {
-            let rpm = params.rpm + (8000. - params.rpm) * i as f32 / frames as f32;
-            engine.set_parameters(Parameters { rpm, ..params });
-        }
-        let fade = ((frames - i) as f32 / (rate as f32 * 0.05)).min(1.);
-        let sample = (engine.next_sample(true) * fade * 8_388_607.) as i32;
-        writer.write_sample(sample).map_err(|e| e.to_string())?;
-    }
-    writer.finalize().map_err(|e| e.to_string())
+    scratch_wav(
+        path,
+        params,
+        Settings::default(),
+        &crate::scratch::Scratch::default(),
+        seconds,
+        Controls {
+            mode: if sweep { Mode::Cycle } else { Mode::Direct },
+            ..Default::default()
+        },
+    )
 }

@@ -11,8 +11,16 @@ type Field = (&'static str, fn(&mut SoundTuning) -> &mut f32, f32);
 
 // One non-neutral, valid value per public control. Checked against the serialized
 // key set so adding a new control cannot silently escape integration coverage.
-fn fields() -> [Field; 19] {
+fn fields() -> [Field; 27] {
     [
+        ("exhaust_bass_db", |s| &mut s.exhaust_bass_db, 8.0),
+        ("exhaust_body_db", |s| &mut s.exhaust_body_db, 8.0),
+        ("exhaust_body_hz", |s| &mut s.exhaust_body_hz, 700.0),
+        ("exhaust_body_q", |s| &mut s.exhaust_body_q, 5.0),
+        ("exhaust_rasp_db", |s| &mut s.exhaust_rasp_db, -8.0),
+        ("exhaust_low_cut_hz", |s| &mut s.exhaust_low_cut_hz, 180.0),
+        ("exhaust_high_cut_hz", |s| &mut s.exhaust_high_cut_hz, 900.0),
+        ("exhaust_drive", |s| &mut s.exhaust_drive, 0.8),
         ("bass_db", |s| &mut s.bass_db, 8.),
         ("presence_db", |s| &mut s.presence_db, 8.),
         ("treble_db", |s| &mut s.treble_db, -8.),
@@ -181,6 +189,9 @@ fn every_control_changes_a_real_running_engine_stem_in_its_active_conditions() {
         let active_reference = if name == "intake_length_m" {
             tuned.sound.intake_resonance = 1.;
             Some(render(&tuned))
+        } else if name == "exhaust_body_hz" || name == "exhaust_body_q" {
+            tuned.sound.exhaust_body_db = 8.;
+            Some(render(&tuned))
         } else {
             None
         };
@@ -205,6 +216,12 @@ fn every_control_changes_a_real_running_engine_stem_in_its_active_conditions() {
             "{name}: disconnected control, relative difference {}",
             difference / energy
         );
+        if name.starts_with("exhaust_") {
+            assert_eq!(reference.1, changed.1);
+            for (a, b) in reference.0.iter().zip(&changed.0) {
+                assert_eq!(a[1..], b[1..], "{name}: changed another stem");
+            }
+        }
         if matches!(
             name,
             "bass_db"
@@ -225,5 +242,31 @@ fn every_control_changes_a_real_running_engine_stem_in_its_active_conditions() {
                 "{name}: observation control changed combustion"
             );
         }
+    }
+}
+
+#[test]
+fn exhaust_reset_preserves_other_tone_and_geometry_and_settings_roundtrip() {
+    let mut s = SoundTuning::default();
+    for (_, field, value) in fields() {
+        *field(&mut s) = value;
+    }
+    let settings = Settings {
+        physical_sound: s,
+        ..Default::default()
+    };
+    let loaded: Settings =
+        serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+    assert_eq!(loaded.physical_sound, s);
+    let before = s;
+    s.reset_exhaust_tone();
+    let defaults = SoundTuning::default();
+    for (name, field, _) in fields() {
+        let mut expected = if name.starts_with("exhaust_") {
+            defaults
+        } else {
+            before
+        };
+        assert_eq!(*field(&mut s), *field(&mut expected), "{name}");
     }
 }

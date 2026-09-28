@@ -90,7 +90,8 @@ pub struct Engine {
     rpm: f64,
     was_imposed: bool,
     failed: bool,
-    seed: u64,
+    radiation: super::radiation::Radiation,
+    radiation_seed: u64,
     intake_previous: f64,
     intake_ac: f64,
     intake_phase: f64,
@@ -220,7 +221,8 @@ impl Engine {
             bank_gain,
             was_imposed: true,
             failed: false,
-            seed,
+            radiation: super::radiation::Radiation::new(rate, seed),
+            radiation_seed: seed,
             intake_previous: 0.,
             intake_ac: 0.,
             intake_phase: 0.,
@@ -282,6 +284,30 @@ impl Engine {
         self.scratch.sound = sound;
         true
     }
+    /// Live sound-only retune for an imported engine. All DSP state is inline:
+    /// valid controls allocate no memory and preserve crank, gas and thermals.
+    /// Identical settings are a no-op, including an already running crossfade.
+    pub fn set_sound_tuning(&mut self, sound: &crate::scratch::SoundTuning) -> bool {
+        if self.failed || sound.validate().is_err() {
+            return false;
+        }
+        if *sound == self.scratch.sound {
+            return true;
+        }
+        self.previous_tone = Some(std::mem::replace(
+            &mut self.tone,
+            Tone::new(self.rate as u32, sound),
+        ));
+        self.previous_mechanics = Some(self.mechanics.clone());
+        self.mechanics
+            .set_cutoff(sound.mechanical_pitch_hz.min(self.rate as f32 * 0.4));
+        self.mechanics.set_q(sound.mechanical_resonance);
+        self.sound_fade = 0.;
+        self.acoustic.retune(sound);
+        self.scratch.sound = *sound;
+        true
+    }
+
     /// Restore the gas/control state without allocating on the producer.
     /// Existing acoustic tails decay naturally across the restart boundary.
     pub fn reset(&mut self) {
@@ -318,6 +344,7 @@ impl Engine {
             rpm: self.rpm,
             ..Default::default()
         };
+        self.radiation = super::radiation::Radiation::new(self.rate as u32, self.radiation_seed);
         self.intake_previous = 0.;
         self.intake_ac = 0.;
         self.intake_phase = 0.;
@@ -676,18 +703,15 @@ impl Engine {
             exhaust.map(|r| r.pressure_pa),
             afterfire.map(|q| q * self.rate),
         );
-        self.seed ^= self.seed << 13;
-        self.seed ^= self.seed >> 7;
-        self.seed ^= self.seed << 17;
-        let noise = (self.seed >> 40) as f64 / 8388608. - 1.;
         self.intake_ac = intake_flow - self.intake_previous + self.intake_pole * self.intake_ac;
         self.intake_previous = intake_flow;
         // A fixed acoustic calibration, independent of RPM/load/observed RMS.
         const PA_TO_SAMPLE: f32 = 1. / 3000.;
         let exhaust_audio = (bank_pressure[0] + bank_pressure[1] * self.bank_gain) * PA_TO_SAMPLE;
-        let intake_audio =
-            (self.intake_ac * 0.15 + noise * intake_flow.abs().min(0.2).powi(3) * 0.05) as f32;
-        let mut mechanical = self.mechanics.next_sample(impact as f32);
+        let (intake_audio, contact) =
+            self.radiation
+                .next(self.intake_ac as f32, intake_flow as f32, impact as f32);
+        let mut mechanical = self.mechanics.next_sample(contact);
         let normalized_rpm = ((self.rpm as f32 - self.scratch.idle_rpm)
             / (self.scratch.redline_rpm - self.scratch.idle_rpm))
             .clamp(0., 1.);
@@ -707,7 +731,7 @@ impl Engine {
             shaped_exhaust = old.0 + (shaped_exhaust - old.0) * self.sound_fade;
             shaped_intake = old.1 + (shaped_intake - old.1) * self.sound_fade;
             if let Some(previous) = &mut self.previous_mechanics {
-                let old = previous.next_sample(impact as f32);
+                let old = previous.next_sample(contact);
                 mechanical = old + (mechanical - old) * self.sound_fade;
             }
             self.sound_fade = (self.sound_fade + 1. / (self.rate as f32 * 0.03)).min(1.);
@@ -736,7 +760,11 @@ impl Engine {
             fresh_tailpipe_in_kg_s: fresh_tailpipe,
             fuel_injected_kg: injected,
         };
-        if !sample.exhaust.is_finite() || !sample.mechanical.is_finite() || self.rpm > 30000. {
+        if !sample.exhaust.is_finite()
+            || !sample.intake.is_finite()
+            || !sample.mechanical.is_finite()
+            || self.rpm > 30000.
+        {
             return Err(());
         }
         Ok(sample)
@@ -848,5 +876,32 @@ mod retune_tests {
         assert!(running.previous_tone.is_none());
         assert_eq!(gas_signature(&running), gas);
         assert_eq!(running.angle.to_bits(), angle);
+    }
+    #[test]
+    fn live_sound_retune_keeps_gas_crank_and_thermal_state() {
+        let scratch = Scratch::default();
+        let mut engine = Engine::new(&scratch, 96_000).unwrap();
+        for _ in 0..9600 {
+            engine.next(Commands::default());
+        }
+        let gas = gas_signature(&engine);
+        let angle = engine.angle.to_bits();
+        let state = engine.state();
+        let mass = engine.manifolds.total_mass_kg().to_bits();
+        let energy = engine.manifolds.total_internal_energy_j().to_bits();
+        let mut sound = scratch.sound;
+        sound.bass_db = 8.;
+        sound.primary_length_scale = 1.2;
+        assert!(engine.set_sound_tuning(&sound));
+        assert_eq!(gas_signature(&engine), gas);
+        assert_eq!(engine.angle.to_bits(), angle);
+        assert_eq!(engine.state().rpm.to_bits(), state.rpm.to_bits());
+        assert_eq!(engine.manifolds.total_mass_kg().to_bits(), mass);
+        assert_eq!(engine.manifolds.total_internal_energy_j().to_bits(), energy);
+        for _ in 0..3200 {
+            engine.next(Commands::default());
+        }
+        assert!(!engine.failed());
+        assert!(engine.previous_tone.is_none());
     }
 }

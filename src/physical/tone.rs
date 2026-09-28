@@ -64,6 +64,10 @@ pub struct Tone {
     exhaust: Channel,
     intake: Channel,
     intake_resonator: Option<BiquadFilter>,
+    exhaust_eq: [Option<BiquadFilter>; 3],
+    exhaust_low_cut: Option<StateVariableFilter>,
+    exhaust_high_cut: Option<StateVariableFilter>,
+    exhaust_drive: f32,
     drive: f32,
     texture: f32,
     texture_filter: StateVariableFilter,
@@ -92,10 +96,49 @@ impl Tone {
             && tuning.drive == 0.
             && tuning.flow_texture == 0.
             && tuning.intake_resonance == 0.
-            && !dynamic;
+            && !dynamic
+            && tuning.exhaust_bass_db == 0.
+            && tuning.exhaust_body_db == 0.
+            && tuning.exhaust_rasp_db == 0.
+            && tuning.exhaust_low_cut_hz <= 20.
+            && tuning.exhaust_high_cut_hz >= 20000.
+            && tuning.exhaust_drive == 0.;
         Self {
             neutral,
             exhaust: Channel::new(rate, tuning),
+            exhaust_eq: [
+                (tuning.exhaust_bass_db != 0.).then(|| {
+                    BiquadFilter::new_low_shelf(rate, 120., 0.707, tuning.exhaust_bass_db)
+                }),
+                (tuning.exhaust_body_db != 0.).then(|| {
+                    BiquadFilter::new_peaking(
+                        rate,
+                        tuning.exhaust_body_hz.min(rate * 0.35),
+                        tuning.exhaust_body_q,
+                        tuning.exhaust_body_db,
+                    )
+                }),
+                (tuning.exhaust_rasp_db != 0.).then(|| {
+                    BiquadFilter::new_high_shelf(
+                        rate,
+                        3000_f32.min(rate * 0.35),
+                        0.707,
+                        tuning.exhaust_rasp_db,
+                    )
+                }),
+            ],
+            exhaust_low_cut: (tuning.exhaust_low_cut_hz > 20.).then(|| {
+                StateVariableFilter::new(rate, tuning.exhaust_low_cut_hz, 0.707, SvfMode::Highpass)
+            }),
+            exhaust_high_cut: (tuning.exhaust_high_cut_hz < 20000.).then(|| {
+                StateVariableFilter::new(
+                    rate,
+                    tuning.exhaust_high_cut_hz.min(rate * 0.45),
+                    0.707,
+                    SvfMode::Lowpass,
+                )
+            }),
+            exhaust_drive: tuning.exhaust_drive,
             intake: Channel::new(rate, tuning),
             // A quarter-wave observation filter, not a second physical intake.
             // Resonance 0–3 maps to 0–24 dB and Q 0.7–4.9. Length only changes
@@ -181,6 +224,23 @@ impl Tone {
             exhaust = (exhaust * k).tanh() / k;
             intake = (intake * k).tanh() / k;
         }
+        // Shape only the physical exhaust outlet. No parallel excitation or
+        // gain normalization; intake/mechanics and gas state stay untouched.
+        let mut outlet = [exhaust];
+        for filter in self.exhaust_eq.iter_mut().flatten() {
+            filter.process_inplace(&mut outlet);
+        }
+        exhaust = outlet[0];
+        if let Some(filter) = &mut self.exhaust_low_cut {
+            exhaust = filter.next_sample(exhaust);
+        }
+        if let Some(filter) = &mut self.exhaust_high_cut {
+            exhaust = filter.next_sample(exhaust);
+        }
+        if self.exhaust_drive > 0. {
+            let k = 1. + 15. * self.exhaust_drive;
+            exhaust = (exhaust * k).tanh() / k;
+        }
         (exhaust, intake)
     }
 }
@@ -204,6 +264,76 @@ mod tests {
             }
         }
         (power / 12_000.).sqrt()
+    }
+
+    #[test]
+    fn exhaust_bands_filters_and_drive_have_measured_effects_only_on_the_outlet() {
+        let flat = SoundTuning::default();
+        for (band, hz) in [(0, 25.), (1, 250.), (2, 15000.)] {
+            for db in [-6., 6.] {
+                let mut tuned = flat;
+                match band {
+                    0 => tuned.exhaust_bass_db = db,
+                    1 => tuned.exhaust_body_db = db,
+                    _ => tuned.exhaust_rasp_db = db,
+                }
+                let measured = 20.
+                    * (response(tuned, hz, 0., 0., false) / response(flat, hz, 0., 0., false))
+                        .log10();
+                assert!(
+                    (measured - f64::from(db)).abs() < 0.5,
+                    "band {band}: {measured}"
+                );
+                assert_eq!(
+                    response(tuned, hz, 0., 0., true),
+                    response(flat, hz, 0., 0., true)
+                );
+            }
+        }
+        let low = SoundTuning {
+            exhaust_low_cut_hz: 200.,
+            ..flat
+        };
+        let high = SoundTuning {
+            exhaust_high_cut_hz: 800.,
+            ..flat
+        };
+        assert!(response(low, 25., 0., 0., false) < response(flat, 25., 0., 0., false) * 0.03);
+        assert!(response(high, 6000., 0., 0., false) < response(flat, 6000., 0., 0., false) * 0.03);
+        let saturated = SoundTuning {
+            exhaust_drive: 1.,
+            ..flat
+        };
+        assert!(
+            response(saturated, 500., 0., 0., false) < response(flat, 500., 0., 0., false) * 0.9
+        );
+    }
+
+    #[test]
+    fn extreme_exhaust_tone_is_finite_and_cannot_emit_without_input() {
+        for rate in [8000, 44100, 96000, 384000] {
+            let tuning = SoundTuning {
+                exhaust_bass_db: 12.,
+                exhaust_body_db: 12.,
+                exhaust_body_hz: 2000.,
+                exhaust_body_q: 8.,
+                exhaust_rasp_db: 12.,
+                exhaust_low_cut_hz: 300.,
+                exhaust_high_cut_hz: 500.,
+                exhaust_drive: 1.,
+                ..Default::default()
+            };
+            let mut tone = Tone::new(rate, &tuning);
+            for _ in 0..500 {
+                assert_eq!(tone.process(0., 0., 1., 1.), (0., 0.));
+            }
+            for i in 0..24000 {
+                let input = (i as f32 * 0.25).sin() * 4.;
+                let (out, intake) = tone.process(input, input, 1., 1.);
+                assert!(out.is_finite() && out.abs() <= 1. / 16.);
+                assert_eq!(intake.to_bits(), input.to_bits());
+            }
+        }
     }
 
     #[test]

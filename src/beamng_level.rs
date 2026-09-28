@@ -22,7 +22,7 @@ pub struct Report {
     /// Common linear gain applied to every exported exhaust WAV.
     pub safety_gain: f32,
     /// The primary exhaust difference uses an 80 Hz high-pass proxy for the
-    /// procedural path. Detailed AC RMS and peaks always describe raw files.
+    /// physical path. Detailed AC RMS and peaks always describe raw files.
     pub post_low_cut_estimate: bool,
     /// One point per original Automation RPM knot and load row.
     pub points: Vec<Point>,
@@ -39,7 +39,7 @@ pub struct Point {
     pub engine_rms_dbfs: f32,
     pub exhaust_peak_dbfs: f32,
     pub engine_peak_dbfs: f32,
-    /// Exhaust difference against Automation at this knot. In procedural mode
+    /// Exhaust difference against Automation at this knot. In physical mode
     /// this uses an 80 Hz low-cut proxy on exact exported PCM24; otherwise it
     /// uses unfiltered AC RMS. See `Report::post_low_cut_estimate`.
     pub exhaust_vs_source_db: f32,
@@ -156,7 +156,7 @@ struct PendingPoint {
     rpm: f32,
     load: f32,
     source: Stats,
-    source_post_low_cut_rms: Option<f32>,
+    source_post_low_cut_rms: f32,
     exhaust: Vec<f32>,
     engine: Vec<f32>,
 }
@@ -199,15 +199,15 @@ fn dbfs_allow_silence(value: f32) -> Result<f32, String> {
 /// Render every original blend point using the variant export's audio path.
 /// This is CPU-intensive and should be called from a worker thread.
 pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, String> {
+    let h = export::physical_settings(h);
+    crate::automation_model::AutomationModel::from_bank(&bank)?;
     p.validate()?;
     h.validate()?;
     let archive = Path::new(&bank.source.archive);
     // The source might have changed since the UI imported it. Export performs
     // the same fresh-bank check before it writes any output.
     let fresh = Bank::load(archive, Some(&bank.source.blend))?;
-    if fresh.source.fingerprint != bank.source.fingerprint {
-        return Err("Source archive changed since import".into());
-    }
+    export::verify_source_identity(&bank.source, &fresh.source)?;
     drop(fresh);
     let mut zip = zip::ZipArchive::new(File::open(archive).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -248,22 +248,18 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
             // exhaust stem as export::package_exhaust_stem. Apply its per-knot
             // source-level calibration before the bank-wide safety gain.
             let load = layer as f32;
-            let (mut exhaust, engine, _) = export::loop_stems(bank.clone(), p, h, rpm, load);
+            let (mut exhaust, engine, _) = export::loop_stems(bank.clone(), p, h, rpm, load)?;
             let exhaust_stats = Stats::from_samples(&exhaust)?;
             Stats::from_samples(&engine)?;
             if exhaust_stats.rms < 1e-7 || exhaust_stats.peak < 1e-7 {
                 return Err(format!("Silent exhaust stem at {rpm:.0} rpm, load {load}"));
             }
-            let level_gain = if h.procedural {
-                export::procedural_exhaust_level_gain(
-                    &source_samples,
-                    source_rate,
-                    &exhaust,
-                    exhaust_stats.peak,
-                )?
-            } else {
-                export::exhaust_level_gain(source.rms, exhaust_stats.rms, exhaust_stats.peak)
-            };
+            let level_gain = export::physical_exhaust_level_gain(
+                &source_samples,
+                source_rate,
+                &exhaust,
+                exhaust_stats.peak,
+            )?;
             if !level_gain.is_finite() || level_gain <= 0. {
                 return Err(format!(
                     "Invalid exhaust level gain at {rpm:.0} rpm, load {load}"
@@ -279,10 +275,7 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
                 rpm,
                 load,
                 source,
-                source_post_low_cut_rms: h
-                    .procedural
-                    .then(|| export::low_cut_rms(&source_samples, source_rate))
-                    .transpose()?,
+                source_post_low_cut_rms: export::low_cut_rms(&source_samples, source_rate)?,
                 exhaust,
                 engine,
             });
@@ -295,31 +288,24 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
     let mut points = Vec::with_capacity(pending.len());
     pending.sort_by(|a, b| a.load.total_cmp(&b.load).then(a.rpm.total_cmp(&b.rpm)));
     for item in pending {
-        // The procedural comparison follows the same quantization and final
+        // The physical comparison follows the same quantization and final
         // bank-wide gain as the written WAV, then applies the 80 Hz proxy.
-        let exhaust_pcm = h.procedural.then(|| {
+        let exhaust_pcm = {
             item.exhaust
                 .iter()
                 .map(|&sample| {
                     ((sample * safety_gain * PCM24_SCALE) as i32) as f32 / PCM24_DECODE_SCALE
                 })
                 .collect::<Vec<_>>()
-        });
-        let exhaust = match &exhaust_pcm {
-            Some(samples) => Stats::from_samples(samples)?,
-            None => Stats::from_pcm24(&item.exhaust, safety_gain)?,
         };
+        let exhaust = Stats::from_samples(&exhaust_pcm)?;
         let engine_raw = Stats::from_samples(&item.engine)?;
         let engine_gain = variant::engine_stem_gain(
             exhaust.raw_rms,
             engine_raw.raw_rms,
             engine_raw.peak,
             item.load,
-            if h.procedural {
-                1.
-            } else {
-                bank.residual_reliability(item.rpm, item.load)
-            },
+            h.engine_gain,
         );
         // Export refuses samples outside this ceiling before PCM encoding.
         if engine_raw.peak * engine_gain > 0.951 {
@@ -329,14 +315,8 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
         let source_rms_dbfs = dbfs(item.source.rms)?;
         let exhaust_rms_dbfs = dbfs(exhaust.rms)?;
         let engine_rms_dbfs = dbfs_allow_silence(engine.rms)?;
-        let exhaust_vs_source_db = if let Some(samples) = &exhaust_pcm {
-            let source_post_low_cut = item
-                .source_post_low_cut_rms
-                .ok_or("Missing procedural source low-cut level")?;
-            dbfs(export::low_cut_rms(samples, 48_000)?)? - dbfs(source_post_low_cut)?
-        } else {
-            exhaust_rms_dbfs - source_rms_dbfs
-        };
+        let exhaust_vs_source_db =
+            dbfs(export::low_cut_rms(&exhaust_pcm, 48_000)?)? - dbfs(item.source_post_low_cut_rms)?;
         points.push(Point {
             rpm: item.rpm,
             load: item.load,
@@ -351,7 +331,7 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
     }
     Ok(Report {
         safety_gain,
-        post_low_cut_estimate: h.procedural,
+        post_low_cut_estimate: true,
         points,
     })
 }
@@ -409,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn level_report_matches_rendered_exhaust_archive() {
+    fn physical_exports_reject_an_audio_only_bank_without_verified_metadata() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -468,135 +448,27 @@ mod tests {
 
         let bank = Arc::new(Bank::load(&source, None).unwrap());
         let p = Parameters::default();
-        let h = Settings::default();
-        let report = analyze(bank.clone(), p, h).unwrap();
-        assert!(!report.post_low_cut_estimate);
-        assert_eq!(report.points.len(), 2);
-        let output = work.join("rendered");
-        export::package_exhaust_stem(&output, p, h, bank.clone()).unwrap();
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(output.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(
-            report.safety_gain,
-            manifest["gain"].as_f64().unwrap() as f32
-        );
-        let archive = output.join(export::package_name(&bank));
-        let mut rendered = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
-        let mut original = zip::ZipArchive::new(File::open(&source).unwrap()).unwrap();
-        for (layer, point) in report.points.iter().enumerate() {
-            let path = format!("art/sound/engine/test/{layer}.wav");
-            let wav = read_limited(&mut rendered, &path, MAX_WAV_BYTES).unwrap();
-            let (_, samples) = bank::decode_wav(&wav).unwrap();
-            let actual = Stats::from_samples(&samples).unwrap();
-            assert!((point.exhaust_rms_dbfs - dbfs(actual.rms).unwrap()).abs() < 0.00001);
-            assert!((point.exhaust_peak_dbfs - dbfs(actual.peak).unwrap()).abs() < 0.00001);
-
-            let source_wav = read_limited(&mut original, &path, MAX_WAV_BYTES).unwrap();
-            let (_, source_samples) = bank::decode_wav(&source_wav).unwrap();
-            let source_stats = Stats::from_samples(&source_samples).unwrap();
-            assert!(source_stats.raw_rms > source_stats.rms * 1.5);
-            assert!((point.source_rms_dbfs - dbfs(source_stats.rms).unwrap()).abs() < 0.00001);
-            let (raw_exhaust, _, _) = export::loop_stems(bank.clone(), p, h, 800., layer as f32);
-            let raw_stats = Stats::from_samples(&raw_exhaust).unwrap();
-            let expected_gain =
-                export::exhaust_level_gain(source_stats.rms, raw_stats.rms, raw_stats.peak);
-            let documented_gain = manifest["loops"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|loop_info| loop_info["path"] == path)
-                .unwrap()["exhaust_level_gain"]
-                .as_f64()
-                .unwrap() as f32;
-            assert!((documented_gain - expected_gain).abs() < 1e-6);
-            assert!((actual.rms - raw_stats.rms * expected_gain * report.safety_gain).abs() < 1e-6);
-        }
-        drop(rendered);
-
-        // The procedural report uses the same per-knot low-cut calibration as
-        // export and measures the actual quantized PCM24 after safety gain.
-        let mut procedural = h;
-        procedural.procedural = true;
-        let procedural_report = analyze(bank.clone(), p, procedural).unwrap();
-        assert!(procedural_report.post_low_cut_estimate);
-        let procedural_output = work.join("procedural-rendered");
-        export::package_exhaust_stem(&procedural_output, p, procedural, bank.clone()).unwrap();
-        let procedural_manifest: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(procedural_output.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            procedural_report.safety_gain,
-            procedural_manifest["gain"].as_f64().unwrap() as f32
-        );
-        let mut procedural_zip = zip::ZipArchive::new(
-            File::open(procedural_output.join(export::package_name(&bank))).unwrap(),
-        )
-        .unwrap();
-        for (layer, point) in procedural_report.points.iter().enumerate() {
-            let path = format!("art/sound/engine/test/{layer}.wav");
-            let source_wav = read_limited(&mut original, &path, MAX_WAV_BYTES).unwrap();
-            let (source_rate, source_samples) = bank::decode_wav(&source_wav).unwrap();
-            let exported_wav = read_limited(&mut procedural_zip, &path, MAX_WAV_BYTES).unwrap();
-            let (rate, exported_samples) = bank::decode_wav(&exported_wav).unwrap();
-            assert_eq!(rate, 48_000);
-            let actual = Stats::from_samples(&exported_samples).unwrap();
-            assert!((point.exhaust_rms_dbfs - dbfs(actual.rms).unwrap()).abs() < 0.00001);
-            assert!((point.exhaust_peak_dbfs - dbfs(actual.peak).unwrap()).abs() < 0.00001);
-            let expected_difference = dbfs(export::low_cut_rms(&exported_samples, rate).unwrap())
-                .unwrap()
-                - dbfs(export::low_cut_rms(&source_samples, source_rate).unwrap()).unwrap();
-            assert!((point.exhaust_vs_source_db - expected_difference).abs() < 0.00001);
-
-            let (raw_exhaust, _, _) =
-                export::loop_stems(bank.clone(), p, procedural, 800., layer as f32);
-            let raw_peak = Stats::from_samples(&raw_exhaust).unwrap().peak;
-            let expected_gain = export::procedural_exhaust_level_gain(
-                &source_samples,
-                source_rate,
-                &raw_exhaust,
-                raw_peak,
-            )
-            .unwrap();
-            let documented_gain = procedural_manifest["loops"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|loop_info| loop_info["path"] == path)
-                .unwrap()["exhaust_level_gain"]
-                .as_f64()
-                .unwrap() as f32;
-            assert!((documented_gain - expected_gain).abs() < 1e-6);
-        }
-        drop(procedural_zip);
-
-        // The legacy full-replacement route still writes its original mixed
-        // channel with only the bank-wide safety gain.
-        let legacy_output = work.join("legacy");
-        export::package(&legacy_output, p, h, bank.clone()).unwrap();
-        let legacy_manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(legacy_output.join("manifest.json")).unwrap())
-                .unwrap();
+        // Old project settings cannot select a retired generator on export.
+        let h = Settings {
+            physical: false,
+            procedural: true,
+            ..Settings::default()
+        };
+        let error = analyze(bank.clone(), p, h).unwrap_err();
         assert!(
-            legacy_manifest["loops"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|loop_info| loop_info.get("exhaust_level_gain").is_none())
+            error.contains("metadata")
+                || error.contains("Metadata")
+                || error.contains("Automation"),
+            "{error}"
         );
-        let mut legacy = zip::ZipArchive::new(
-            File::open(legacy_output.join(export::package_name(&bank))).unwrap(),
-        )
-        .unwrap();
-        let legacy_wav =
-            read_limited(&mut legacy, "art/sound/engine/test/0.wav", MAX_WAV_BYTES).unwrap();
-        let (_, legacy_samples) = bank::decode_wav(&legacy_wav).unwrap();
-        let legacy_stats = Stats::from_samples(&legacy_samples).unwrap();
-        let (_, _, raw_mixed) = export::loop_stems(bank.clone(), p, h, 800., 0.);
-        let mixed_stats = Stats::from_samples(&raw_mixed).unwrap();
-        let legacy_safety = legacy_manifest["gain"].as_f64().unwrap() as f32;
-        assert!((legacy_stats.rms - mixed_stats.rms * legacy_safety).abs() < 1e-6);
-        drop(legacy);
-        std::fs::remove_dir_all(&work).unwrap();
+        let output = work.join("rendered");
+        assert!(export::package_exhaust_stem(&output, p, h, bank.clone()).is_err());
+        assert!(
+            export::loop_stems(bank.clone(), p, h, 12_001., 0.)
+                .unwrap_err()
+                .contains("RPM")
+        );
+        assert!(export::loop_stems(bank, p, h, 800., 0.).is_err());
+        std::fs::remove_dir_all(work).unwrap();
     }
 }

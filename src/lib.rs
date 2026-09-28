@@ -1,22 +1,25 @@
 pub mod acoustics;
+pub mod automation_model;
+pub mod automation_voice;
 pub mod bank;
 pub mod beamng;
 pub mod beamng_level;
 pub mod bench;
 pub mod combustion;
 pub mod drive;
-pub mod engine;
 pub mod engine_build;
 pub mod engine_meta;
 pub mod export;
 pub mod hybrid;
 pub mod maps;
+pub mod output_limiter;
 mod period;
 pub mod physical;
-pub mod procedural;
 pub mod project;
 pub mod realtime;
 pub mod render;
 pub mod scratch;
 pub mod standalone;
+#[cfg(test)]
+mod test_support;
 pub mod variant;

@@ -153,10 +153,13 @@ impl Audio {
         driving: Controls,
     ) -> Result<Self, String> {
         Self::open(|rate| {
-            Ok(RenderEngine::native(
-                Bench::new(rate, params, settings, driving, bank),
-                rate,
-            ))
+            let bench = Bench::new(rate, params, settings, driving, bank);
+            if settings.enhanced
+                && let Some(error) = bench.initialization_error()
+            {
+                return Err(error.to_owned());
+            }
+            Ok(RenderEngine::native(bench, rate))
         })
     }
     pub fn with_scratch(

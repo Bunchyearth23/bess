@@ -78,6 +78,12 @@ fn prepared_sound_retunes_preserve_running_bench_and_allocate_or_drop_no_buffers
         tail_length_m: 2.2,
         muffler_volume_scale: 1.8,
         muffler_absorption: 0.7,
+        exhaust_body_db: 6.,
+        exhaust_body_hz: 400.,
+        exhaust_low_cut_hz: 80.,
+        exhaust_high_cut_hz: 5000.,
+        exhaust_drive: 0.3,
+        ..Default::default()
     };
     let mut prepared: Vec<_> = (0..4)
         .map(|i| {

@@ -203,7 +203,8 @@ pub(crate) fn exhaust_safety_gain(peak: f32) -> f32 {
 /// RMS inputs are AC levels measured after subtracting each signal's mean.
 /// Inputs must first pass `signal_stats`. Absolute peak safety takes precedence over
 /// the 0.5 gain floor when both limits cannot be satisfied together.
-pub(crate) fn exhaust_level_gain(source_rms: f32, exhaust_rms: f32, exhaust_peak: f32) -> f32 {
+#[cfg(test)]
+fn exhaust_level_gain(source_rms: f32, exhaust_rms: f32, exhaust_peak: f32) -> f32 {
     exhaust_level_gain_with_floor(source_rms, exhaust_rms, exhaust_peak, 0.5)
 }
 
@@ -221,7 +222,7 @@ pub(crate) fn exhaust_level_gain_with_floor(
 
 /// Uses an 80 Hz low-cut proxy matching the current Automation fleet JBeam
 /// setting. Peak headroom still uses the unfiltered rendered waveform.
-pub(crate) fn procedural_exhaust_level_gain(
+pub(crate) fn physical_exhaust_level_gain(
     source: &[f32],
     source_rate: u32,
     rendered: &[f32],
@@ -235,13 +236,39 @@ pub(crate) fn procedural_exhaust_level_gain(
     ))
 }
 
+pub(crate) type LoopStems = (Vec<f32>, Vec<f32>, Vec<f32>);
+
+pub(crate) fn physical_settings(h: Settings) -> Settings {
+    let mut h = h.for_beamng_export();
+    h.physical = true;
+    h.procedural = false;
+    h
+}
+
+/// Old projects without a motor hash migrate once; recorded motor identities
+/// must match even when the blend/WAV bytes have not changed.
+pub(crate) fn verify_source_identity(
+    saved: &bank::SourceRef,
+    fresh: &bank::SourceRef,
+) -> Result<(), String> {
+    if saved.fingerprint != fresh.fingerprint || saved.blend != fresh.blend {
+        return Err("Source audio archive changed since import".into());
+    }
+    if saved.engine_fingerprint.is_some() && saved.engine_fingerprint != fresh.engine_fingerprint {
+        return Err(
+            "Source engine metadata changed since import; reimport the Automation vehicle".into(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn loop_stems(
     bank: Arc<Bank>,
     p: Parameters,
     h: Settings,
     rpm: f32,
     load: f32,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> Result<LoopStems, String> {
     render_stems(bank, p, h, rpm, load, 4.)
 }
 
@@ -252,24 +279,36 @@ fn render_stems(
     rpm: f32,
     load: f32,
     engine_seconds: f32,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> Result<LoopStems, String> {
+    h = physical_settings(h);
+    if !rpm.is_finite() || !(200.0..=12_000.0).contains(&rpm) {
+        return Err(format!(
+            "Unsupported export RPM {rpm}: physical synthesis supports 200–12000 rpm"
+        ));
+    }
     p.rpm = rpm;
     p.load = load;
     p.volume = 0.8;
     h.enhanced = true;
     h.level_match = false;
-    // These require runtime state: never bake a repeating lift-off or turbo transient.
-    h.overrun = 0.;
-    h.turbo = 0.;
-    h.attack = 0.;
-    h.roughness = 0.;
-    h.fuel_cut = 0.;
     let mut engine = Hybrid::new(48000, p, h, Some(bank.clone()));
+    if let Some(error) = engine.initialization_error() {
+        return Err(format!(
+            "Cannot construct export voice at {rpm} rpm: {error}"
+        ));
+    }
     // Start every RPM knot at the same 720-degree phase. A fixed one-second
     // preroll ends at a different crank angle for every RPM and makes adjacent
     // BeamNG samples cancel as they crossfade.
-    for _ in 0..aligned_warmup_frames(rpm) {
+    // The physical gas/thermal state gets at least two seconds to settle.
+    // Integer-cycle multiplication retains the same phase alignment.
+    for _ in 0..aligned_warmup_frames(rpm) * 2 {
         engine.next(true);
+    }
+    if engine.failed() {
+        return Err(format!(
+            "Export voice failed during warmup at {rpm} rpm / load {load}"
+        ));
     }
     let cycle = 48000. * 120. / rpm;
     let frames = (cycle * (2. * 48000. / cycle).ceil()) as usize;
@@ -280,6 +319,15 @@ fn render_stems(
     let stems: Vec<_> = (0..engine_frames + overlap)
         .map(|_| engine.next_stems(true))
         .collect();
+    if engine.failed()
+        || stems
+            .iter()
+            .any(|s| !s.exhaust.is_finite() || !s.engine.is_finite() || !s.mixed.is_finite())
+    {
+        return Err(format!(
+            "Invalid export voice output at {rpm} rpm / load {load}"
+        ));
+    }
     let join = |frames: usize, sample: fn(&crate::hybrid::HybridStems) -> f32| {
         let raw: Vec<f32> = stems
             .iter()
@@ -293,11 +341,12 @@ fn render_stems(
         }
         out
     };
-    (
+    Ok((
         join(frames, |s| s.exhaust),
         join(engine_frames, |s| s.engine),
-        join(frames, |s| s.mixed),
-    )
+        // Exports use the physical stem mix, never the audition limiter or A/B transition.
+        join(frames, |s| s.exhaust + s.engine * 0.25),
+    ))
 }
 
 /// Keep the previous full-replacement sound as a single mixed exhaust bank.
@@ -323,12 +372,12 @@ fn package_inner(
     exhaust_only: bool,
 ) -> Result<String, String> {
     p.validate()?;
+    let h = physical_settings(h);
     h.validate()?;
+    let physical_model = crate::automation_model::AutomationModel::from_bank(&bank)?;
     // Verify the file has not been swapped since import before copying the vehicle.
     let fresh = Bank::load(Path::new(&bank.source.archive), Some(&bank.source.blend))?;
-    if fresh.source.fingerprint != bank.source.fingerprint {
-        return Err("Source archive changed since import".into());
-    }
+    verify_source_identity(&bank.source, &fresh.source)?;
     drop(fresh);
     let mut zip =
         zip::ZipArchive::new(File::open(&bank.source.archive).map_err(|e| e.to_string())?)
@@ -384,20 +433,14 @@ fn package_inner(
             // Replacement and intermediate exhaust rendering use only their
             // two-second channels; variant conversion renders the four-second
             // engine stem separately with `loop_stems`.
-            let stems = render_stems(bank.clone(), p, h, rpm, layer as f32, 2.);
+            let stems = render_stems(bank.clone(), p, h, rpm, layer as f32, 2.)?;
             let mut rendered = if exhaust_only { stems.0 } else { stems.2 };
             if exhaust_only {
                 let (source_rate, source) = source_wav(&mut zip, name)?;
-                let (source_rms_ac, _) = signal_stats(&source)?;
-                let (rendered_rms_ac, rendered_peak) = signal_stats(&rendered)?;
-                let level_gain = if h.procedural {
-                    // Every active Automation exhaust in the current fleet
-                    // declares lowCutFreq=80. Matching whole-file RMS can
-                    // over-amplify B when A contains a large sub-80 Hz tone.
-                    procedural_exhaust_level_gain(&source, source_rate, &rendered, rendered_peak)?
-                } else {
-                    exhaust_level_gain(source_rms_ac, rendered_rms_ac, rendered_peak)
-                };
+                signal_stats(&source)?;
+                let (_, rendered_peak) = signal_stats(&rendered)?;
+                let level_gain =
+                    physical_exhaust_level_gain(&source, source_rate, &rendered, rendered_peak)?;
                 if !level_gain.is_finite() || level_gain <= 0. {
                     return Err(format!("Invalid exhaust level gain: {name}"));
                 }
@@ -497,7 +540,7 @@ fn package_inner(
                 scratch: None,
             },
         )?;
-        let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"render_channel":if exhaust_only {"exhaust"} else {"mixed"},"exhaust_level_reference":if exhaust_only && h.procedural {"estimated post-80-Hz low-cut RMS; absolute PCM peak still bounds gain"} else {"unfiltered AC RMS"},"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});
+        let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"render_channel":if exhaust_only {"exhaust"} else {"mixed"},"render_model":"physical_automation","physical_assumptions":physical_model.assumptions,"physical_sound":h.physical_sound,"physical_warmup":"at least 2 seconds, whole 720-degree cycles","exhaust_level_reference":if exhaust_only {"estimated post-80-Hz low-cut RMS; absolute PCM peak still bounds gain"} else {"unfiltered AC RMS"},"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});
         fs::write(
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
@@ -532,6 +575,36 @@ mod phase_tests {
             let sample_tolerance = rpm as f64 / (2. * 48_000. * 120.);
             assert!((cycles - cycles.round()).abs() <= sample_tolerance + 1e-9);
         }
+    }
+}
+
+#[cfg(test)]
+mod source_identity_tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_audio_does_not_hide_changed_physical_metadata() {
+        let saved = bank::SourceRef {
+            archive: "original.zip".into(),
+            blend: "motor.json".into(),
+            fingerprint: "same-wav-hash".into(),
+            engine_fingerprint: Some("engine-v1".into()),
+        };
+        let mut fresh = saved.clone();
+        assert!(verify_source_identity(&saved, &fresh).is_ok());
+        fresh.engine_fingerprint = Some("engine-v2".into());
+        assert!(
+            verify_source_identity(&saved, &fresh)
+                .unwrap_err()
+                .contains("engine metadata")
+        );
+        fresh.engine_fingerprint = None;
+        assert!(verify_source_identity(&saved, &fresh).is_err());
+        let mut legacy = saved.clone();
+        legacy.engine_fingerprint = None;
+        assert!(verify_source_identity(&legacy, &saved).is_ok());
+        fresh.fingerprint = "different-wav-hash".into();
+        assert!(verify_source_identity(&legacy, &fresh).is_err());
     }
 }
 
@@ -576,7 +649,7 @@ mod level_tests {
     }
 
     #[test]
-    fn procedural_level_reference_reduces_sub_bass_without_losing_engine_midrange() {
+    fn physical_level_reference_reduces_sub_bass_without_losing_engine_midrange() {
         let rate = 48_000;
         let sine = |hz: f32| {
             (0..rate)

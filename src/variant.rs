@@ -2,7 +2,7 @@
 use crate::{
     bank::{self, Bank},
     export,
-    hybrid::{Settings, inferred_layer_weight},
+    hybrid::Settings,
     project::Parameters,
 };
 use serde_json::{Value, json};
@@ -293,21 +293,16 @@ pub(crate) fn engine_stem_gain(
     engine_rms: f32,
     engine_peak: f32,
     load: f32,
-    residual_reliability: f32,
+    layer_gain: f32,
 ) -> f32 {
+    if layer_gain <= 0. {
+        return 0.;
+    }
     if engine_rms < 1e-7 || engine_peak < 1e-7 {
-        // A rejected source period has no trustworthy inferred texture. A
-        // silent engine-side WAV is valid and preferable to an exhaust copy.
+        // No mechanical signal must remain silence, without amplifying noise.
         return 1.;
     }
-    // If period analysis could not isolate the exhaust orders at this knot,
-    // its "residual" may contain the entire exhaust waveform. Keep that
-    // inferred engine layer subordinate instead of normalizing it to the same
-    // loudness as a trustworthy residual.
-    let target_ratio =
-        (if load == 0. { 0.35 } else { 0.55 }) * inferred_layer_weight(residual_reliability);
-    // Rejected period templates can leave a very loud exhaust copy in the
-    // inferred stem. A fixed minimum gain would defeat this suppression.
+    let target_ratio = (0.35 + 0.20 * load.clamp(0., 1.)) * layer_gain;
     (target_ratio * exhaust_rms / engine_rms)
         .min(12.)
         .min(0.94 / engine_peak)
@@ -368,11 +363,6 @@ fn build(
     }
     if previous["render_channel"] != "exhaust" {
         return Err("Variant requires a BESS exhaust-stem render, not a mixed replacement".into());
-    }
-    if previous["settings"]["procedural"] == true {
-        return Err(
-            "Experimental synthesis is for the listening interface, not BeamNG export".into(),
-        );
     }
     let mut original = ZipArchive::new(File::open(source).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -437,15 +427,19 @@ fn build(
     // Standalone conversion may be given a different Automation ZIP with the
     // same member names. The rendered exhaust and reconstructed engine must
     // still come from the exact sound bank recorded in the render manifest.
-    if previous["source"]["fingerprint"] != bank.source.fingerprint
-        || previous["source"]["blend"] != bank.source.blend
-    {
-        return Err("Automation source does not match the rendered sound bank".into());
-    }
+    let saved_source: bank::SourceRef = serde_json::from_value(previous["source"].clone())
+        .map_err(|e| format!("Invalid processed source identity: {e}"))?;
+    export::verify_source_identity(&saved_source, &bank.source)?;
     let p: Parameters = serde_json::from_value(previous["parameters"].clone())
         .map_err(|e| format!("Invalid processed parameters: {e}"))?;
     let h: Settings = serde_json::from_value(previous["settings"].clone())
         .map_err(|e| format!("Invalid processed settings: {e}"))?;
+    if previous["render_model"] != "physical_automation" {
+        return Err(
+            "Regenerate this archive with physical synthesis before creating an add-on".into(),
+        );
+    }
+    let h = export::physical_settings(h);
     p.validate()?;
     h.validate()?;
 
@@ -578,7 +572,7 @@ fn build(
             ));
         }
         let (_, exhaust) = bank::decode_wav(&wav)?;
-        let (_, engine, _) = export::loop_stems(bank.clone(), p, h, *rpm, *load);
+        let (_, engine, _) = export::loop_stems(bank.clone(), p, h, *rpm, *load)?;
         if engine.is_empty() || exhaust.is_empty() || engine.len() < exhaust.len() {
             return Err(format!("Invalid engine or exhaust loop length: {old_path}"));
         }
@@ -597,22 +591,13 @@ fn build(
                 "Exhaust stem is silent or a rendered stem is non-finite: {old_path}"
             ));
         }
-        // The engine-side signal is inferred from an exhaust recording. A
-        // fixed row-wide gain made some RPM knots dominate the sound. Balance
-        // each knot, but never rescue a weak proxy with an enormous boost.
-        let reliability = bank.residual_reliability(*rpm, *load);
-        let inference_weight = if h.procedural { 1. } else { reliability };
-        let gain = engine_stem_gain(
-            exhaust_rms,
-            engine_rms,
-            engine_peak,
-            *load,
-            inference_weight,
-        );
+        // Balance the physical mechanical stem against the calibrated exhaust;
+        // never amplify a nearly silent stem without a finite upper bound.
+        let gain = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, *load, h.engine_gain);
         let ratio = gain * engine_rms / exhaust_rms;
         engine_gains.push(gain);
         engine_ratios.push(ratio);
-        engine_points.push(json!({"rpm":rpm,"load":load,"gain":gain,"rms_ratio":ratio,"residual_reliability":reliability,"engine_inference_weight":inference_weight}));
+        engine_points.push(json!({"rpm":rpm,"load":load,"gain":gain,"rms_ratio":ratio,"stem_source":"physical_mechanics"}));
         exhaust_wavs.push(wav);
         engine_loops.push(engine);
     }
@@ -656,6 +641,16 @@ fn build(
     if names(&mut check)? != target_paths {
         return Err("BESS variant ZIP verification failed".into());
     }
+    // Consume every member: ZIP CRC validation happens while decoding, not
+    // when merely inspecting the central-directory names.
+    for index in 0..check.len() {
+        let mut entry = check.by_index(index).map_err(|e| e.to_string())?;
+        if entry.enclosed_name().is_none() || entry.name().contains('\\') {
+            return Err("Unsafe path in generated variant ZIP".into());
+        }
+        std::io::copy(&mut entry, &mut std::io::sink())
+            .map_err(|e| format!("Generated ZIP CRC/read failure: {e}"))?;
+    }
     fs::rename(&partial, dir.join(&zip_file)).map_err(|e| e.to_string())?;
     let wav_paths: Vec<_> = wav_pairs
         .iter()
@@ -667,6 +662,9 @@ fn build(
         .collect();
     let report = json!({
         "kind":"configuration_addon",
+        "render_model":"physical_automation",
+        "physical_assumptions":previous["physical_assumptions"],
+        "physical_sound":h.physical_sound,
         "version":env!("CARGO_PKG_VERSION"),
         "zip_file":zip_file,
         "vehicle_id":vehicle,
@@ -688,6 +686,7 @@ fn build(
         "engine_stem_rms_ratio":{"off_load":row_range(&engine_ratios,0.),"on_load":row_range(&engine_ratios,1.)},
         "engine_stem_points":engine_points,
         "source_archive":source,
+        "source_engine_fingerprint":bank.source.engine_fingerprint,
         "processed_archive":processed,
         "source_sha256":source_hash,
         "processed_sha256":processed_hash,
@@ -764,7 +763,7 @@ fn package_with_profile(
     profile: Option<&str>,
 ) -> Result<String, String> {
     fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
-    let h = h.for_beamng_export();
+    let h = export::physical_settings(h);
     let staging = dir.join(".bess-render");
     let result = (|| {
         export::package_exhaust_stem(&staging, p, h, bank.clone())?;
@@ -815,18 +814,20 @@ mod tests {
     }
 
     #[test]
-    fn rejected_period_cannot_receive_a_normal_engine_stem_balance() {
+    fn physical_engine_stem_balance_is_bounded_and_keeps_silence() {
         let exhaust_rms = 0.05;
         let engine_rms = 0.01;
         let engine_peak = 0.1;
-        let trusted = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, 1., 1.);
-        let rejected = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, 1., 0.);
-        assert!(trusted * engine_rms / exhaust_rms > 0.5);
-        assert!(rejected * engine_rms / exhaust_rms < 0.1);
-        assert!(rejected < trusted);
-        let loud_proxy = engine_stem_gain(0.05, 0.05, 0.1, 1., 0.);
-        assert!(loud_proxy * 0.05 / 0.05 <= 0.55 * 0.15 + 1e-6);
-        assert_eq!(engine_stem_gain(0.05, 0., 0., 1., 0.), 1.);
+        let gain = engine_stem_gain(exhaust_rms, engine_rms, engine_peak, 1., 1.);
+        assert!((gain * engine_rms / exhaust_rms - 0.55).abs() < 1e-6);
+        assert!(engine_stem_gain(0.5, 0.001, 1., 1., 1.) <= 0.94);
+        assert_eq!(engine_stem_gain(0.05, 0., 0., 1., 1.), 1.);
+        let half = engine_stem_gain(exhaust_rms, engine_rms * 0.5, engine_peak * 0.5, 1., 0.5);
+        assert!((half * engine_rms * 0.5 - gain * engine_rms * 0.5).abs() < 1e-6);
+        assert_eq!(
+            engine_stem_gain(exhaust_rms, engine_rms, engine_peak, 1., 0.),
+            0.
+        );
     }
 
     #[test]

@@ -321,3 +321,35 @@ fn turbo_spools_and_adds_manifold_pressure_under_open_throttle() {
         mean_map / f64::from(points)
     );
 }
+
+#[test]
+fn intake_and_contacts_have_cycle_texture_without_free_running_noise() {
+    use bess::physical::engine::{Commands, Engine};
+    let mut engine = Engine::new(&bess::scratch::Scratch::default(), 48000).unwrap();
+    let command = Commands {
+        imposed_rpm: Some(3000.),
+        throttle: 0.7,
+        ..Default::default()
+    };
+    let mut prior = [[0.; 2]; 1920];
+    let mut difference = [0.; 2];
+    let mut energy = [0.; 2];
+    for i in 0..96000 {
+        let s = engine.next(command);
+        assert!(!engine.failed());
+        for (stem, x) in [s.intake, s.mechanical].into_iter().enumerate() {
+            assert!(x.is_finite());
+            if i >= 48000 {
+                difference[stem] += (x - prior[i % 1920][stem]).powi(2);
+                energy[stem] += x * x;
+            }
+            prior[i % 1920][stem] = x;
+        }
+    }
+    for i in 0..2 {
+        assert!(
+            energy[i] > 1e-9 && difference[i] / energy[i] > 0.15,
+            "stem {i} repeats identical cycles"
+        );
+    }
+}

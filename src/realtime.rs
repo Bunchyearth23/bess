@@ -123,8 +123,9 @@ impl RenderEngine {
             let input = [self.bench.next(playing), self.bench.next(playing)];
             let mut output = [0.];
             decimator.process_block(&input, &mut output);
-            // FIR ringing can overshoot a pre-decimation limiter by a few
-            // samples. Keep the existing scratch -1 dBFS output guarantee.
+            // Last-resort protection for exceptional overloads after the FIR.
+            // The lookahead stage leaves headroom so ordinary muffled engines
+            // and sound-shaping presets do not hit this hard safety ceiling.
             output[0].clamp(-0.891, 0.891)
         } else {
             self.bench.next(playing)

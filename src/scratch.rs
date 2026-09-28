@@ -7,12 +7,10 @@ use crate::{
     drive::Controls,
     engine_build::{Aspiration, EngineBuild, Fuel, Head, Headers, Muffler, Throttle},
     hybrid::Settings,
-    procedural::ProceduralBank,
     project::Parameters,
     standalone,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 pub const BANDS: usize = 7;
 
@@ -397,6 +395,15 @@ impl EngineDesign {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoundTuning {
+    pub exhaust_bass_db: f32,
+    pub exhaust_body_db: f32,
+    pub exhaust_body_hz: f32,
+    pub exhaust_body_q: f32,
+    pub exhaust_rasp_db: f32,
+    pub exhaust_low_cut_hz: f32,
+    pub exhaust_high_cut_hz: f32,
+    pub exhaust_drive: f32,
+
     pub bass_db: f32,
     pub presence_db: f32,
     pub treble_db: f32,
@@ -421,6 +428,15 @@ pub struct SoundTuning {
 impl Default for SoundTuning {
     fn default() -> Self {
         Self {
+            exhaust_bass_db: 0.0,
+            exhaust_body_db: 0.0,
+            exhaust_body_hz: 250.0,
+            exhaust_body_q: 1.0,
+            exhaust_rasp_db: 0.0,
+            exhaust_low_cut_hz: 20.0,
+            exhaust_high_cut_hz: 20000.0,
+            exhaust_drive: 0.0,
+
             bass_db: 0.,
             presence_db: 0.,
             treble_db: 0.,
@@ -445,8 +461,34 @@ impl Default for SoundTuning {
 }
 
 impl SoundTuning {
+    /// Reset only the exhaust observation controls; keep geometry and other stems.
+    pub fn reset_exhaust_tone(&mut self) {
+        let defaults = Self::default();
+        self.exhaust_bass_db = defaults.exhaust_bass_db;
+        self.exhaust_body_db = defaults.exhaust_body_db;
+        self.exhaust_body_hz = defaults.exhaust_body_hz;
+        self.exhaust_body_q = defaults.exhaust_body_q;
+        self.exhaust_rasp_db = defaults.exhaust_rasp_db;
+        self.exhaust_low_cut_hz = defaults.exhaust_low_cut_hz;
+        self.exhaust_high_cut_hz = defaults.exhaust_high_cut_hz;
+        self.exhaust_drive = defaults.exhaust_drive;
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for (label, value, min, max) in [
+            ("exhaust_bass_db", self.exhaust_bass_db, -12.0, 12.0),
+            ("exhaust_body_db", self.exhaust_body_db, -12.0, 12.0),
+            ("exhaust_body_hz", self.exhaust_body_hz, 40.0, 2000.0),
+            ("exhaust_body_q", self.exhaust_body_q, 0.5, 8.0),
+            ("exhaust_rasp_db", self.exhaust_rasp_db, -12.0, 12.0),
+            ("exhaust_low_cut_hz", self.exhaust_low_cut_hz, 20.0, 300.0),
+            (
+                "exhaust_high_cut_hz",
+                self.exhaust_high_cut_hz,
+                500.0,
+                20000.0,
+            ),
+            ("exhaust_drive", self.exhaust_drive, 0.0, 1.0),
             ("Bass", self.bass_db, -12., 12.),
             ("Presence", self.presence_db, -12., 12.),
             ("Treble", self.treble_db, -12., 12.),
@@ -808,79 +850,27 @@ pub enum ScratchVoice {
     /// all its heap-owned buffers alive until the UI thread drains the trash.
     Prepared {
         physical: Option<Box<crate::physical::engine::Engine>>,
-        descriptors: Arc<ProceduralBank>,
-        synth: Box<standalone::Synth>,
-        exhaust: Box<crate::acoustics::ExhaustNetwork>,
     },
     Physical(Box<crate::physical::engine::Engine>),
-    Descriptors(Arc<ProceduralBank>),
-    Synth(Box<standalone::Synth>),
-    Exhaust(Box<crate::acoustics::ExhaustNetwork>),
 }
 
 /// A scratch engine prepared off the rendering thread and moved into it.
-/// The physical engine is the default playable source. Historical event data
-/// remain available for explicit offline reference comparisons only.
+/// The physical engine is the only synthesized source.
 pub struct ScratchModel {
-    /// The default playable engine. None only for explicit offline references.
+    /// Moved into the bench during installation; empty only after transfer.
     pub physical: Option<Box<crate::physical::engine::Engine>>,
-    pub descriptors: Arc<ProceduralBank>,
-    pub firing: Firing,
-    pub life: Life,
-    pub synth: Box<standalone::Synth>,
-    /// Built from the parts; the bench retunes lengths and temperatures live.
-    pub exhaust: Box<crate::acoustics::ExhaustNetwork>,
     pub idle_rpm: f32,
     pub redline_rpm: f32,
 }
 
 impl ScratchModel {
-    /// Allocates and analyses; never call from an audio callback.
+    /// Allocates the physical solver; never call from an audio callback.
     pub fn build(scratch: &Scratch, rate: u32) -> Result<Self, String> {
-        let mut model = Self::build_reference(scratch, rate)?;
-        model.physical = Some(Box::new(crate::physical::engine::Engine::new(
-            scratch, rate,
-        )?));
-        Ok(model)
-    }
-
-    /// Archived event voice for A/reference renders only, never a UI mode.
-    pub fn build_reference(scratch: &Scratch, rate: u32) -> Result<Self, String> {
         scratch.validate()?;
-        let synth = Box::new(standalone::Synth::new(
-            rate.clamp(8_000, 384_000),
-            scratch.standalone.clone(),
-            standalone::Commands {
-                rpm: scratch.idle_rpm,
-                load: 0.1,
-                volume: 1.,
-                combustion: standalone::CombustionState::Firing,
-            },
-        )?);
         Ok(Self {
-            physical: None,
-            descriptors: Arc::new(ProceduralBank::from_spec(
-                &scratch.experimental,
-                scratch.cylinders(),
-                scratch.idle_rpm,
-                scratch.redline_rpm,
-            )),
-            firing: scratch.design.firing(),
-            life: scratch.life(),
-            synth,
-            exhaust: Box::new(crate::acoustics::ExhaustNetwork::new(
-                rate.clamp(8_000, 384_000) as f32,
-                crate::acoustics::Geometry {
-                    header: 0.5,
-                    tail: 1.5,
-                    diameter_mm: scratch.build.exhaust_mm,
-                    chamber_litres: 6.,
-                    absorption: 0.4,
-                    resonance: 1.2,
-                    temperature_c: 400.,
-                },
-                scratch.life().exhaust,
-            )),
+            physical: Some(Box::new(crate::physical::engine::Engine::new(
+                scratch, rate,
+            )?)),
             idle_rpm: scratch.idle_rpm,
             redline_rpm: scratch.redline_rpm,
         })

@@ -2,7 +2,7 @@
 use crate::{
     bank::Bank,
     drive::{Controls, Mode, Simulator, State, TICK_RATE},
-    export::{exhaust_level_gain, exhaust_level_gain_with_floor},
+    export::exhaust_level_gain_with_floor,
     hybrid::{Hybrid, HybridStems, Settings, audition},
     physical::engine::{
         Commands as PhysicalCommands, Engine as PhysicalEngine, Sample as PhysicalSample,
@@ -115,7 +115,6 @@ impl<const BLOCKS: usize> PeakWindow<BLOCKS> {
 /// changes while the user listens.
 struct TwoEmitterPreview {
     rate: f32,
-    procedural: bool,
     source_power: f32,
     exhaust_power: f32,
     source_cut_power: f32,
@@ -134,15 +133,15 @@ struct TwoEmitterPreview {
     cam_overall_gain: f32,
     cam_cabin_amount: f32,
     cabin_filter: StateVariableFilter,
+    limiter: crate::output_limiter::OutputLimiter,
 }
 
 impl TwoEmitterPreview {
     const NOMINAL_ENGINE_GAIN: f32 = 0.398_107_17; // -8 dB vs exhaust in the current JBeam.
 
-    fn new(rate: u32, procedural: bool) -> Self {
+    fn new(rate: u32) -> Self {
         Self {
             rate: rate as f32,
-            procedural,
             source_power: 0.,
             exhaust_power: 0.,
             source_cut_power: 0.,
@@ -161,6 +160,7 @@ impl TwoEmitterPreview {
             cam_overall_gain: 1.,
             cam_cabin_amount: 0.,
             cabin_filter: StateVariableFilter::new(rate as f32, 1100., 0.707, SvfMode::Lowpass),
+            limiter: crate::output_limiter::OutputLimiter::new(rate),
         }
     }
 
@@ -189,27 +189,15 @@ impl TwoEmitterPreview {
         self.engine_power += (stems.engine * stems.engine - self.engine_power) * energy_step;
         let export_exhaust_peak = stems.exhaust.abs() / exhaust_export_normalizer.max(1e-6);
         let exhaust_peak = self.exhaust_peak.next(export_exhaust_peak);
-        let source_power = if self.procedural {
-            self.source_cut_power
-        } else {
-            self.source_power
-        };
-        let exhaust_power = if self.procedural {
-            self.exhaust_cut_power
-        } else {
-            self.exhaust_power
-        };
+        let source_power = self.source_cut_power;
+        let exhaust_power = self.exhaust_cut_power;
         let exhaust_target = if source_power > 1e-12 && exhaust_power > 1e-12 {
-            if self.procedural {
-                exhaust_level_gain_with_floor(
-                    source_power.sqrt(),
-                    exhaust_power.sqrt(),
-                    exhaust_peak,
-                    0.25,
-                )
-            } else {
-                exhaust_level_gain(source_power.sqrt(), exhaust_power.sqrt(), exhaust_peak)
-            }
+            exhaust_level_gain_with_floor(
+                source_power.sqrt(),
+                exhaust_power.sqrt(),
+                exhaust_peak,
+                0.25,
+            )
         } else {
             1.
         };
@@ -245,11 +233,7 @@ impl TwoEmitterPreview {
         let combined = (raw_emitters * (1. - self.cam_cabin_amount)
             + cabin_muffled * self.cam_cabin_amount)
             * self.cam_overall_gain;
-        let two_emitters = if combined.abs() > 0.95 {
-            combined.signum() * (0.95 + 0.049 * ((combined.abs() - 0.95) / 0.049).tanh())
-        } else {
-            combined
-        };
+        let two_emitters = self.limiter.next(combined);
         stems.mixed + (two_emitters - stems.mixed) * self.blend
     }
 }
@@ -266,15 +250,14 @@ struct Listener {
     /// Smoothed exhaust gain, engine gain, cabin, outside and overall weights.
     weights: [f32; 5],
     slew: f32,
-    /// Peak limiter: held envelope and its release coefficient.
-    limit_envelope: f32,
-    limit_release: f32,
+    /// Attenuate upcoming peaks before they arrive, without cutting their tops.
+    limiter: crate::output_limiter::OutputLimiter,
 }
 impl Listener {
-    // Fixed scratch listening calibration (+24.08 dB). The synth's scale was
-    // set by an open V12 at the tailpipe, leaving a stock I4 around -54 dBFS
-    // RMS outside at volume 0.8. Apply makeup after the perspective filters,
-    // before the peak limiter, without a level follower that lifts fuel cuts.
+    // Fixed scratch listening calibration (+24.08 dB), preserving audible idle.
+    // Physical loaded peaks can exceed full scale even with a muffler. Apply
+    // attenuation-only lookahead after these filters rather than clipping peaks
+    // as they arrive. There is no gain follower lifting quiet fuel cuts.
     const MAKEUP_GAIN: f32 = 16.;
 
     fn new(rate: u32) -> Self {
@@ -289,8 +272,7 @@ impl Listener {
             ground_delay: ((0.00028 * rate).round() as usize).clamp(1, 127),
             weights: [1., 0.16, 0., 0., 1.],
             slew: 1. / (rate * 0.05),
-            limit_envelope: 0.,
-            limit_release: (-1. / (rate * 0.15)).exp(),
+            limiter: crate::output_limiter::OutputLimiter::new(rate as u32),
         }
     }
     fn next(&mut self, camera: BeamNgCamera, stems: HybridStems) -> f32 {
@@ -317,16 +299,10 @@ impl Listener {
         let near = x * (1. - cabin - outside) + inside * cabin + far * outside;
         self.limit(near * overall * Self::MAKEUP_GAIN)
     }
-    /// Never exceed −1 dBFS: instant attack (the envelope already holds this
-    /// sample's peak), 150 ms release. Loud open exhausts can engage it.
+    /// Leave room for the output resampler. The 3 ms anticipation lets the gain
+    /// fall before a peak arrives, preserving the waveform's local shape.
     fn limit(&mut self, x: f32) -> f32 {
-        const CEILING: f32 = 0.891;
-        self.limit_envelope = (self.limit_envelope * self.limit_release).max(x.abs());
-        if self.limit_envelope > CEILING {
-            x * CEILING / self.limit_envelope
-        } else {
-            x
-        }
+        self.limiter.next(x)
     }
 }
 
@@ -398,20 +374,14 @@ impl Bench {
             params.load = 0.1;
         }
         let physical = model.physical.take();
-        let engine = if physical.is_some() {
-            // A cheap unused fallback keeps imported/reference handling intact.
-            // Physical scratch never calls its synthesis or procedural grid.
-            Hybrid::new(rate, params, settings, None)
-        } else {
-            Hybrid::from_scratch(rate, params, settings, model)
-        };
+        let engine = Hybrid::new(rate, params, settings, None);
         let mut bench = Self::with_engine(engine, rate, params, settings, controls, range);
         bench.physical = physical;
         bench.listener = Some(Listener::new(rate));
         bench.beamng_camera = BeamNgCamera::Orbit;
         bench
     }
-    /// See `Hybrid::swap_scratch`; also moves the simulator's RPM limits.
+    /// Replace a prepared physical engine and update the simulator RPM limits.
     pub fn swap_scratch(&mut self, mut model: ScratchModel) -> Option<ScratchVoice> {
         self.sim.set_range(model.idle_rpm, model.redline_rpm);
         self.max = model.redline_rpm;
@@ -419,13 +389,9 @@ impl Bench {
         if let (Some(current), Some(prepared)) = (&mut self.physical, &mut model.physical)
             && current.apply_sound_tuning(prepared)
         {
-            // Includes all archived descriptor/synth/duct allocations, not just
-            // the unused physical engine. Ownership returns to the UI trash.
+            // Return unused prepared buffers to the UI thread for disposal.
             return Some(ScratchVoice::Prepared {
                 physical: model.physical,
-                descriptors: model.descriptors,
-                synth: model.synth,
-                exhaust: model.exhaust,
             });
         }
         if let Some(physical) = model.physical.take() {
@@ -435,12 +401,10 @@ impl Bench {
             self.physics_accumulator = self.rate;
             return retired;
         }
-        self.engine.swap_scratch(model)
+        None
     }
     pub fn take_retired(&mut self) -> Option<ScratchVoice> {
-        self.retired_physical
-            .take()
-            .or_else(|| self.engine.take_retired())
+        self.retired_physical.take()
     }
     fn with_engine(
         engine: Hybrid,
@@ -472,7 +436,7 @@ impl Bench {
             cycle_seconds: 16.,
             audition_mix: AuditionMix::Live,
             beamng_camera: BeamNgCamera::Cockpit,
-            two_emitter_preview: TwoEmitterPreview::new(rate, settings.procedural),
+            two_emitter_preview: TwoEmitterPreview::new(rate),
         }
     }
     pub fn set_cycle_seconds(&mut self, seconds: f32) {
@@ -502,8 +466,6 @@ impl Bench {
         }
         self.params = p;
         self.settings = h;
-        self.two_emitter_preview.procedural =
-            h.procedural && self.audition_mix != AuditionMix::BeamNgTwoEmitter;
         self.controls = c;
         self.reset_token = reset_token;
         if c.mode == Mode::Direct {
@@ -545,7 +507,7 @@ impl Bench {
         self.two_emitter_preview.next(
             stems,
             self.engine.load(),
-            self.engine.inferred_layer_weight(),
+            self.engine.inferred_layer_weight() * self.settings.engine_gain,
             self.engine.export_stem_normalizer(),
             self.engine.exhaust_export_normalizer(),
             self.audition_mix == AuditionMix::BeamNgTwoEmitter && self.settings.enhanced,
@@ -568,8 +530,14 @@ impl Bench {
         state
     }
 
+    pub fn initialization_error(&self) -> Option<&str> {
+        self.engine.initialization_error()
+    }
+
     pub fn failed(&self) -> bool {
-        self.physical.as_ref().is_some_and(|engine| engine.failed())
+        self.physical
+            .as_ref()
+            .map_or_else(|| self.engine.failed(), |engine| engine.failed())
     }
 
     fn next_physical(&mut self, playing: bool) -> f32 {
@@ -686,7 +654,7 @@ mod preview_tests {
     #[test]
     fn two_emitter_preview_uses_export_load_targets_and_gain_cap() {
         let run = |load, engine, inferred_weight| {
-            let mut preview = TwoEmitterPreview::new(48_000, false);
+            let mut preview = TwoEmitterPreview::new(48_000);
             let stems = HybridStems {
                 source_reference: 0.1,
                 exhaust: 0.1,
@@ -713,7 +681,7 @@ mod preview_tests {
 
     #[test]
     fn preview_selection_fades_without_changing_default_live_mix() {
-        let mut preview = TwoEmitterPreview::new(48_000, false);
+        let mut preview = TwoEmitterPreview::new(48_000);
         let stems = HybridStems {
             source_reference: 0.2,
             exhaust: 0.2,
@@ -731,7 +699,7 @@ mod preview_tests {
 
     #[test]
     fn two_emitter_preview_has_a_mono_safety_ceiling() {
-        let mut preview = TwoEmitterPreview::new(48_000, false);
+        let mut preview = TwoEmitterPreview::new(48_000);
         let stems = HybridStems {
             source_reference: 0.95,
             exhaust: 0.95,
@@ -748,7 +716,7 @@ mod preview_tests {
     #[test]
     fn preview_engine_peak_cap_does_not_follow_listening_volume() {
         let run = |volume: f32| {
-            let mut preview = TwoEmitterPreview::new(48_000, false);
+            let mut preview = TwoEmitterPreview::new(48_000);
             for i in 0..96_000 {
                 let engine = if i % 10_000 == 0 { 0.5 } else { 0.0001 };
                 let stems = HybridStems {
@@ -770,7 +738,7 @@ mod preview_tests {
 
     #[test]
     fn preview_exhaust_calibration_tracks_original_level_with_a_peak_ceiling() {
-        let mut preview = TwoEmitterPreview::new(48_000, false);
+        let mut preview = TwoEmitterPreview::new(48_000);
         let stems = HybridStems {
             source_reference: 0.2,
             exhaust: 0.1,
@@ -782,7 +750,7 @@ mod preview_tests {
         }
         assert!((preview.exhaust_gain - 1.782_501_8).abs() < 0.01);
 
-        let mut capped = TwoEmitterPreview::new(48_000, false);
+        let mut capped = TwoEmitterPreview::new(48_000);
         let loud = HybridStems {
             source_reference: 1.2,
             exhaust: 0.8,
@@ -796,9 +764,9 @@ mod preview_tests {
     }
 
     #[test]
-    fn procedural_preview_uses_the_export_low_cut_basis() {
-        let run = |procedural| {
-            let mut preview = TwoEmitterPreview::new(48_000, procedural);
+    fn physical_preview_uses_the_export_low_cut_basis() {
+        let run = || {
+            let mut preview = TwoEmitterPreview::new(48_000);
             for frame in 0..144_000 {
                 let time = frame as f32 / 48_000.;
                 let source = 0.1 * (std::f32::consts::TAU * 40. * time).sin();
@@ -819,9 +787,7 @@ mod preview_tests {
             }
             preview.exhaust_gain
         };
-        let original_basis = run(false);
-        let low_cut_basis = run(true);
-        assert!((original_basis - 0.891_250_9).abs() < 0.02);
+        let low_cut_basis = run();
         assert!((low_cut_basis - 0.25).abs() < 0.02);
     }
 
@@ -840,7 +806,7 @@ mod preview_tests {
             BeamNgCamera::Tailpipe,
             BeamNgCamera::Orbit,
         ] {
-            let mut preview = TwoEmitterPreview::new(48_000, false);
+            let mut preview = TwoEmitterPreview::new(48_000);
             preview.set_camera(camera);
             let mut out = 0.;
             for _ in 0..48_000 {

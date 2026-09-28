@@ -26,6 +26,49 @@ pub struct EngineMeta {
     pub exhaust_count: Option<u8>,
     /// Whether Automation names turbo aspiration; unknown types remain unknown.
     pub turbocharged: Option<bool>,
+    /// Literal component data from the matched Family/Variant, never evaluated Lua.
+    pub physical: PhysicalMeta,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct PhysicalMeta {
+    /// Variant dimensions converted from Automation millimetres to SI metres.
+    pub bore_m: Option<f32>,
+    pub stroke_m: Option<f32>,
+    pub compression: Option<f32>,
+    pub cam_profile: Option<f32>,
+    /// Variant.RPMLimit, distinct from JBeam's over-rev damage maxRPM.
+    pub rpm_limit: Option<f32>,
+    /// Active .pc override, otherwise unique literal in the sole engine JBeam.
+    pub idle_rpm: Option<f32>,
+    pub valves: Option<u8>,
+    pub block_material: Option<String>,
+    pub head: Option<String>,
+    pub crank: Option<String>,
+    pub fuel_system: Option<String>,
+    pub aspiration_setup: Option<String>,
+    pub boost_setting: Option<f32>,
+    /// Raw Automation value; its conversion is explicitly identified by the mapper.
+    pub exhaust_diameter: Option<f32>,
+    pub headers: Option<String>,
+    pub muffler_1: Option<String>,
+    pub muffler_2: Option<String>,
+    pub catalyst: Option<String>,
+    pub vvt: Option<String>,
+}
+
+impl EngineMeta {
+    /// Separate from the recording hash: a .car/.pc/JBeam-only change can alter
+    /// physical B while leaving original A bit-identical. Bump the domain if
+    /// the metadata-to-engine interpretation changes incompatibly.
+    pub fn fingerprint(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        let mut hash = Sha256::new();
+        hash.update(b"bess-automation-physical-metadata-v1\0");
+        hash.update(bytes);
+        Ok(format!("{:x}", hash.finalize()))
+    }
 }
 
 const MAX_ENTRIES: usize = 20_000;
@@ -100,6 +143,13 @@ fn literal<'a>(table: &'a [u8], key: &str) -> Option<&'a str> {
 
 fn string_literal(table: &[u8], key: &str) -> Option<String> {
     serde_json::from_str(literal(table, key)?).ok()
+}
+
+fn number(table: &[u8], key: &str, min: f32, max: f32) -> Option<f32> {
+    literal(table, key)?
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && (min..=max).contains(v))
 }
 
 fn hex_uid(value: String) -> Option<String> {
@@ -178,6 +228,34 @@ fn parse_car(data: &[u8]) -> Option<EngineMeta> {
         displacement_l,
         exhaust_count,
         turbocharged,
+        physical: PhysicalMeta {
+            bore_m: number(variant, "Bore", 5., 500.).map(|v| v * 0.001),
+            stroke_m: number(variant, "Stroke", 5., 500.).map(|v| v * 0.001),
+            compression: number(variant, "Compression", 1., 30.),
+            cam_profile: number(variant, "CamProfileSetting", 0., 1.),
+            rpm_limit: number(variant, "RPMLimit", 1000., 30000.),
+            idle_rpm: None,
+            valves: string_literal(family, "Valves")
+                .and_then(|s| {
+                    s.strip_prefix("ValveCount_")?
+                        .strip_suffix("_Name")?
+                        .parse()
+                        .ok()
+                })
+                .filter(|v| (2..=5).contains(v)),
+            block_material: string_literal(family, "BlockMaterial"),
+            head: string_literal(family, "Head"),
+            crank: string_literal(variant, "Crank"),
+            fuel_system: string_literal(variant, "FuelSystem"),
+            aspiration_setup: string_literal(variant, "AspirationSetup"),
+            boost_setting: number(variant, "ChargerMaxBoost_1", 0., 10.),
+            exhaust_diameter: number(variant, "ExhaustDiameter", 0.1, 20.),
+            headers: string_literal(variant, "Headers"),
+            muffler_1: string_literal(variant, "Muffler1"),
+            muffler_2: string_literal(variant, "Muffler2"),
+            catalyst: string_literal(variant, "Cat"),
+            vvt: string_literal(variant, "VVT"),
+        },
     })
 }
 
@@ -200,32 +278,29 @@ fn vehicle_root(car_name: &str) -> Option<String> {
     Some(format!("vehicles/{vehicle}/"))
 }
 
-fn matches_active_engine(zip: &mut zip::ZipArchive<File>, root: &str, uid: &str) -> bool {
+fn matches_active_engine(
+    zip: &mut zip::ZipArchive<File>,
+    root: &str,
+    uid: &str,
+) -> Option<Option<f32>> {
     let short = uid[..5].to_ascii_lowercase();
     let engine_path = format!("{root}eng_{short}/camso_engine_{short}.jbeam");
-    let Some(engine_name) = zip
+    let engine_name = zip
         .file_names()
         .find(|n| n.eq_ignore_ascii_case(&engine_path))
-        .map(str::to_owned)
-    else {
-        return false;
-    };
-    let Some(jbeam) = read_member(zip, &engine_name, MAX_JBEAM_BYTES) else {
-        return false;
-    };
+        .map(str::to_owned)?;
+    let jbeam = read_member(zip, &engine_name, MAX_JBEAM_BYTES)?;
     // Confirm that the selected part is declared in this JBeam. Its commented
     // cylinder-frequency hint is inconsistent across the actual corpus.
     let head = String::from_utf8_lossy(&jbeam[..jbeam.len().min(256)]);
-    let Some(body) = head.trim_start().strip_prefix('{').map(str::trim_start) else {
-        return false;
-    };
+    let body = head.trim_start().strip_prefix('{').map(str::trim_start)?;
     let expected_key = format!("\"Camso_Engine_{short}\"");
     if !body
         .get(..expected_key.len())
         .is_some_and(|key| key.eq_ignore_ascii_case(&expected_key))
         || !body[expected_key.len()..].trim_start().starts_with(':')
     {
-        return false;
+        return None;
     }
     let pcs: Vec<String> = zip
         .file_names()
@@ -236,17 +311,27 @@ fn matches_active_engine(zip: &mut zip::ZipArchive<File>, root: &str, uid: &str)
         .map(str::to_owned)
         .collect();
     if pcs.len() != 1 {
-        return false;
+        return None;
     }
-    let Some(bytes) = read_member(zip, &pcs[0], MAX_PC_BYTES) else {
-        return false;
-    };
+    let bytes = read_member(zip, &pcs[0], MAX_PC_BYTES)?;
     let Ok(pc) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
+        return None;
     };
-    pc["parts"]["Camso_Engine"]
+    if !pc["parts"]["Camso_Engine"]
         .as_str()
         .is_some_and(|part| part.eq_ignore_ascii_case(&format!("Camso_Engine_{short}")))
+    {
+        return None;
+    }
+    let override_rpm = match pc.get("vars").and_then(|v| v.get("$idleRPM")) {
+        Some(value) => Some(
+            value
+                .as_f64()
+                .filter(|v| v.is_finite() && (0.0..=30000.).contains(v))? as f32,
+        ),
+        None => None,
+    };
+    Some(override_rpm)
 }
 
 /// Read metadata only for the engine corresponding to `selected_blend`.
@@ -267,16 +352,23 @@ pub fn inspect(zip_path: &Path, selected_blend: &str) -> Option<EngineMeta> {
         let Some(data) = read_member(&mut zip, &car_name, MAX_CAR_BYTES) else {
             continue;
         };
-        let Some(meta) = parse_car(&data) else {
+        let Some(mut meta) = parse_car(&data) else {
             continue;
         };
         if !meta.uid.eq_ignore_ascii_case(blend_uid) {
             continue;
         }
         let root = vehicle_root(&car_name)?;
-        if !matches_active_engine(&mut zip, &root, &meta.uid) || found.is_some() {
+        let pc_idle = matches_active_engine(&mut zip, &root, &meta.uid)?;
+        if found.is_some() {
             return None;
         }
+        meta.physical.idle_rpm = pc_idle.or_else(|| {
+            crate::beamng::inspect(zip_path)
+                .ok()
+                .filter(|v| v.engine_files == 1)
+                .and_then(|v| v.idle_rpm)
+        });
         found = Some(meta);
     }
     found
@@ -289,6 +381,35 @@ mod tests {
 
     const UID: &str = "694E80154252F6189DE80988120C7F13";
     const BLEND: &str = "art/sound/blends/694E80154252F6189DE80988120C7F13.sfxBlend2D.json";
+
+    #[test]
+    fn physical_literals_use_variant_geometry_and_reject_expressions_or_ambiguity() {
+        let car = format!(
+            "do local _={{\n\tFamily={{\n\t\tUID=\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\n\t\tBlockType=\"EngBlock_Inl_Name\",\n\t\tBlockConfig=\"EngBlock_Inl4_Name\",\n\t\tBore=69.7,\n\t\tStroke=65.5,\n\t\tValves=\"ValveCount_2_Name\"\n\t}},\n\tVariant={{\n\t\tUID=\"{UID}\",\n\t\tFUID=\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\n\t\tBore=72.7,\n\t\tStroke=64,\n\t\tCompression=9,\n\t\tCamProfileSetting=0.5,\n\t\tRPMLimit=6000,\n\t\tFuelSystem=\"FuelSys_Inj_MultiEFI_Name\"\n\t}}\n}}"
+        );
+        let p = parse_car(car.as_bytes()).unwrap().physical;
+        assert!((p.bore_m.unwrap() - 0.0727).abs() < 1e-8);
+        assert_eq!(p.stroke_m, Some(0.064));
+        assert_eq!(p.compression, Some(9.));
+        assert_eq!(p.cam_profile, Some(0.5));
+        assert_eq!(p.rpm_limit, Some(6000.));
+        assert_eq!(p.valves, Some(2));
+        assert_eq!(p.fuel_system.as_deref(), Some("FuelSys_Inj_MultiEFI_Name"));
+        for invalid in ["72 + 0.7", "os.execute(\"ignored\")", "NaN", "1e999"] {
+            let edited = car.replace("Bore=72.7", &format!("Bore={invalid}"));
+            assert_eq!(parse_car(edited.as_bytes()).unwrap().physical.bore_m, None);
+        }
+        let duplicate = car.replace("Bore=72.7,", "Bore=72.7,\n\t\tBore=80,");
+        assert_eq!(
+            parse_car(duplicate.as_bytes()).unwrap().physical.bore_m,
+            None
+        );
+        let wrong_parent = car.replace(
+            "FUID=\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+            "FUID=\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"",
+        );
+        assert!(parse_car(wrong_parent.as_bytes()).is_none());
+    }
 
     fn fixture_with(
         car_uid: &str,
@@ -314,8 +435,13 @@ mod tests {
             .unwrap_or_default();
         zip.write_all(format!("do local _={{\n\tFamily={{\n\t\tUID=\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\n\t\tBlockType=\"EngBlock_V90_Name\",\n\t\tBlockConfig=\"EngBlock_V8_Name\"\n\t}},\n\tVariant={{\n\t\tUID=\"{car_uid}\",\n\t\tFUID=\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\n\t\tCapacity=2.79,\n\t\tExhaustCount=\"Exhausts_1_Name\",{aspiration}\n\t}}\n}}" ).as_bytes()).unwrap();
         zip.start_file("vehicles/test/test.pc", opt).unwrap();
-        zip.write_all(format!("{{\"parts\":{{\"Camso_Engine\":\"{selected}\"}}}}").as_bytes())
-            .unwrap();
+        zip.write_all(
+            format!(
+                "{{\"parts\":{{\"Camso_Engine\":\"{selected}\"}},\"vars\":{{\"$idleRPM\":875}}}}"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         zip.start_file("vehicles/test/eng_694e8/camso_engine_694e8.jbeam", opt)
             .unwrap();
         zip.write_all(format!("{{\n\t\"{jbeam_key}\": {{}}\n}}").as_bytes())
@@ -348,6 +474,7 @@ mod tests {
         assert_eq!(meta.displacement_l, Some(2.79));
         assert_eq!(meta.exhaust_count, Some(1));
         assert_eq!(meta.turbocharged, Some(false));
+        assert_eq!(meta.physical.idle_rpm, Some(875.));
         assert!(inspect(&good, "art/sound/blends/other.sfxBlend2D.json").is_none());
         std::fs::remove_file(good).unwrap();
 
@@ -430,6 +557,11 @@ mod tests {
                 (meta.cylinders, meta.layout),
                 (cylinders, layout),
                 "{filename}"
+            );
+            assert!(meta.physical.bore_m.is_some() && meta.physical.stroke_m.is_some());
+            assert!(
+                meta.physical.idle_rpm.is_some(),
+                "{filename}: idle provenance absent"
             );
         }
     }

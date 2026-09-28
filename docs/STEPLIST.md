@@ -1,3 +1,15 @@
+# Current sequence — physical engine
+
+The current product has only source A and physical engine B. Automation imports, scratch engines, WAV renders and BeamNG loops share that engine. Legacy delivery milestones below are historical evidence, not selectable modes.
+
+- [x] Map verified Automation metadata to physical engine configuration and expose assumptions.
+- [x] Remove alternative synthesis routes and their product controls.
+- [x] Share the 19 physical sound controls and save them in projects.
+- [x] Technical validation and executable delivery: release tests, strict checks, corpus mapping, A/B artifacts, ZIP audit and imported-V8 device playback; evidence in the [index](INDEX.md).
+- [ ] User listening and BeamNG acceptance: [current guide](FINAL-TESTS.md).
+
+## Historical delivery sequence
+
 # Work sequence — user testing at the end
 
 User instruction: continue the work and group user tests at the end. Technical demonstrations and evidence are prepared as development proceeds; no step now depends on intermediate user listening. Final subjective validation and a BeamNG in-game test remain separate from compilation.

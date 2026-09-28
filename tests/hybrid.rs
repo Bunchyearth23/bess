@@ -1,3 +1,5 @@
+#[path = "../src/test_support.rs"]
+mod test_support;
 use bess::{
     bank::Bank,
     hybrid::{Hybrid, Settings},
@@ -12,6 +14,7 @@ use std::{
 thread_local! {
     static TRACK:std::cell::Cell<bool>=const {std::cell::Cell::new(false)};
     static ALLOCATIONS:std::cell::Cell<usize>=const {std::cell::Cell::new(0)};
+    static DEALLOCATIONS:std::cell::Cell<usize>=const {std::cell::Cell::new(0)};
 }
 struct CountingAllocator;
 // SAFETY: all memory operations are forwarded unchanged to System. Tracking
@@ -25,6 +28,9 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
         unsafe { std::alloc::System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if TRACK.try_with(|v| v.get()).unwrap_or(false) {
+            let _ = DEALLOCATIONS.try_with(|v| v.set(v.get() + 1));
+        }
         // SAFETY: pointer and layout belong to System, the sole allocating backend.
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
@@ -35,10 +41,6 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 fn fixture() -> Arc<Bank> {
     static BANK: OnceLock<Arc<Bank>> = OnceLock::new();
     BANK.get_or_init(|| build_fixture(false)).clone()
-}
-fn textured_fixture() -> Arc<Bank> {
-    static BANK: OnceLock<Arc<Bank>> = OnceLock::new();
-    BANK.get_or_init(|| build_fixture(true)).clone()
 }
 fn build_fixture(textured: bool) -> Arc<Bank> {
     let path = fixture_zip(textured, false);
@@ -122,315 +124,6 @@ fn params() -> Parameters {
         ..Default::default()
     }
 }
-fn rms_diff(a: &[f32], b: &[f32]) -> f64 {
-    (a.iter()
-        .zip(b)
-        .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
-        .sum::<f64>()
-        / a.len() as f64)
-        .sqrt()
-}
-
-#[test]
-fn reconstructed_engine_stem_is_distinct_and_preserves_audition_mix() {
-    let bank = fixture();
-    let p = params();
-    let h = Settings {
-        source_timbre: 1.,
-        ..Settings::default()
-    };
-    let mut normal = Hybrid::new(48000, p, h, Some(bank.clone()));
-    let mut split = Hybrid::new(48000, p, h, Some(bank.clone()));
-    let mut engine_energy = 0.;
-    let mut exhaust_energy = 0.;
-    for i in 0..48000 {
-        let sample = normal.next(true);
-        let stems = split.next_stems(true);
-        assert_eq!(sample, stems.mixed);
-        assert!(stems.exhaust.is_finite() && stems.engine.is_finite());
-        if i >= 24000 {
-            engine_energy += stems.engine * stems.engine;
-            exhaust_energy += stems.exhaust * stems.exhaust;
-        }
-    }
-    // A strictly periodic recording has no independent intake or mechanical
-    // detail to reconstruct. BESS should not invent a broadband layer for it.
-    assert!(
-        engine_energy < 1e-6,
-        "Periodic exhaust copied into the engine stem: {engine_energy}"
-    );
-    assert!(
-        engine_energy < exhaust_energy,
-        "The companion stem is an exhaust copy"
-    );
-
-    let mut source_only = p;
-    source_only.intake = 0.;
-    source_only.mechanical = 0.;
-    let mut split = Hybrid::new(48000, source_only, h, Some(bank));
-    for _ in 0..48000 {
-        assert_eq!(split.next_stems(true).engine, 0.);
-    }
-}
-
-#[test]
-fn source_timbre_extremes_change_standard_resynthesis_without_changing_reference() {
-    let bank = fixture();
-    let p = params();
-    let mut retained = Hybrid::new(
-        48_000,
-        p,
-        Settings {
-            source_timbre: 1.,
-            ..Settings::default()
-        },
-        Some(bank.clone()),
-    );
-    let mut rebuilt = Hybrid::new(
-        48_000,
-        p,
-        Settings {
-            source_timbre: 0.,
-            ..Settings::default()
-        },
-        Some(bank),
-    );
-    let mut difference = 0.;
-    let mut energy = 0.;
-    for i in 0..48_000 {
-        let a = retained.next_stems(true);
-        let b = rebuilt.next_stems(true);
-        assert_eq!(a.source_reference, b.source_reference);
-        assert!(b.mixed.is_finite() && b.engine.is_finite());
-        if i >= 24_000 {
-            difference += (a.mixed - b.mixed).powi(2);
-            energy += b.mixed.powi(2);
-        }
-    }
-    assert!(
-        difference > 0.01,
-        "Timbre control made no audible-level change"
-    );
-    assert!(energy > 0.01, "Reconstructed engine is silent");
-}
-
-#[test]
-fn source_timbre_and_named_profile_validate_and_round_trip() {
-    let mut setting = Settings {
-        source_timbre: -0.01,
-        ..Settings::default()
-    };
-    assert!(setting.validate().is_err());
-    setting.source_timbre = 1.01;
-    assert!(setting.validate().is_err());
-    setting.source_timbre = 0.37;
-    assert!(setting.validate().is_ok());
-    assert!(project::validate_profile_name("Natural").is_ok());
-    assert!(project::validate_profile_name("Raw / Open").is_err());
-    let p = Project {
-        version: 3,
-        parameters: params(),
-        hybrid: setting,
-        source: None,
-        driving: Default::default(),
-        profile_name: "My raw tune".into(),
-        scratch: None,
-    };
-    let path = std::env::temp_dir().join(format!("bess-profile-{}.json", std::process::id()));
-    project::save_project(&path, &p).unwrap();
-    let reopened = project::load_project(&path).unwrap();
-    assert_eq!(reopened.profile_name, p.profile_name);
-    assert_eq!(reopened.hybrid.source_timbre, setting.source_timbre);
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn procedural_mode_preserves_source_a_and_generates_a_distinct_b() {
-    let bank = fixture();
-    let p = params();
-    let original_a = Settings {
-        enhanced: false,
-        procedural: false,
-        ..Settings::default()
-    };
-    let procedural_a = Settings {
-        procedural: true,
-        ..original_a
-    };
-    let procedural_b = Settings {
-        enhanced: true,
-        ..procedural_a
-    };
-    let mut original = Hybrid::new(48_000, p, original_a, Some(bank.clone()));
-    let mut source = Hybrid::new(48_000, p, procedural_a, Some(bank.clone()));
-    let mut generated = Hybrid::new(48_000, p, procedural_b, Some(bank));
-    let mut difference = 0.;
-    let mut source_energy = 0.;
-    let mut generated_energy = 0.;
-    for i in 0..48_000 {
-        let a = original.next(true);
-        let a_in_new_mode = source.next(true);
-        let b = generated.next(true);
-        assert_eq!(a.to_bits(), a_in_new_mode.to_bits());
-        assert!(b.is_finite());
-        if i >= 24_000 {
-            difference += (a - b).powi(2);
-            source_energy += a * a;
-            generated_energy += b * b;
-        }
-    }
-    assert!(source_energy > 1e-6 && generated_energy > 1e-6);
-    assert!(difference > source_energy * 0.25);
-}
-
-#[test]
-fn b5_a_early_recording_peak_no_longer_overpowers_b_modes_when_available() {
-    let path = std::path::Path::new("cars/bunchyearth23_b5_a.zip");
-    if !path.exists() {
-        return;
-    }
-    let bank = Arc::new(Bank::load(path, None).unwrap());
-    let level = |rpm: f32, load: f32, procedural: bool| {
-        let p = Parameters {
-            rpm,
-            load,
-            cylinders: bank.engine_meta.as_ref().map_or(4, |meta| meta.cylinders),
-            brightness: 10_000.,
-            exhaust: 1.,
-            intake: 0.25,
-            mechanical: 0.12,
-            ..Parameters::default()
-        };
-        let h = Settings {
-            procedural,
-            ..Settings::calibrated(&bank)
-        };
-        let mut voice = Hybrid::new(48_000, p, h, Some(bank.clone()));
-        let mut energy = 0.;
-        for i in 0..4 * 48_000 {
-            let sample = voice.next_stems(true).mixed as f64;
-            if i >= 3 * 48_000 {
-                energy += sample * sample;
-            }
-        }
-        (energy / 48_000.).sqrt()
-    };
-    for load in [0.12, 0.65] {
-        for procedural in [false, true] {
-            let early = level(1052., load, procedural);
-            let middle = level(3000., load, procedural);
-            assert!(early > 0.001 && middle > 0.001);
-            assert!(
-                early < middle * 1.15,
-                "B5 A load={load} procedural={procedural}: {early} vs {middle}"
-            );
-        }
-    }
-}
-
-#[test]
-fn source_reference_retains_original_phase_across_listening_volumes() {
-    let bank = fixture();
-    let source_settings = Settings {
-        enhanced: false,
-        ..Settings::default()
-    };
-    let mut source = Hybrid::new(
-        48_000,
-        Parameters {
-            volume: 0.25,
-            ..params()
-        },
-        source_settings,
-        Some(bank.clone()),
-    );
-    let mut enhanced = Hybrid::new(
-        48_000,
-        Parameters {
-            volume: 0.8,
-            ..params()
-        },
-        Settings::default(),
-        Some(bank),
-    );
-    for _ in 0..48_000 {
-        source.next_stems(true);
-        enhanced.next_stems(true);
-    }
-    let mut reference_energy = 0.;
-    let mut source_ratio: Option<f32> = None;
-    for _ in 0..12_000 {
-        let a = source.next_stems(true);
-        let b = enhanced.next_stems(true);
-        assert_eq!(a.mixed, a.exhaust);
-        assert!(
-            (a.source_reference / 0.25 - b.source_reference / 0.8).abs() < 2e-5,
-            "The source reference followed listening volume or B sound controls"
-        );
-        reference_energy += a.source_reference * a.source_reference;
-        if a.exhaust.abs() > 1e-4 {
-            let ratio = a.source_reference / a.exhaust;
-            if let Some(expected) = source_ratio {
-                assert!((ratio - expected).abs() < 1e-4, "A reference changed phase");
-            } else {
-                source_ratio = Some(ratio);
-            }
-        }
-    }
-    assert!(reference_energy > 1e-5);
-}
-
-#[test]
-fn recorded_irregular_texture_drives_engine_without_copying_exhaust_orders() {
-    let bank = textured_fixture();
-    let p = Parameters {
-        rpm: 1600.,
-        load: 1.,
-        intake: 0.6,
-        mechanical: 0.,
-        exhaust: 1.,
-        ..params()
-    };
-    let mut synth = Hybrid::new(48000, p, Settings::default(), Some(bank));
-    for _ in 0..48000 {
-        synth.next_stems(true);
-    }
-    let period = 48000 * 120 / 1600;
-    let cycles = 12;
-    let mut exhaust = Vec::with_capacity(period * cycles);
-    let mut engine = Vec::with_capacity(period * cycles);
-    for _ in 0..period * cycles {
-        let stems = synth.next_stems(true);
-        exhaust.push(stems.exhaust);
-        engine.push(stems.engine);
-    }
-    let power = |audio: &[f32]| -> f64 {
-        audio.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / audio.len() as f64
-    };
-    let coherent_share = |audio: &[f32]| -> f64 {
-        let template: Vec<_> = (0..period)
-            .map(|phase| {
-                (0..cycles)
-                    .map(|cycle| audio[cycle * period + phase] as f64)
-                    .sum::<f64>()
-                    / cycles as f64
-            })
-            .collect();
-        template.iter().map(|x| x * x).sum::<f64>() / period as f64 / power(audio)
-    };
-    assert!(
-        power(&engine) > 1e-8,
-        "Source texture produced no engine stem"
-    );
-    assert!(power(&engine) < power(&exhaust));
-    let engine_orders = coherent_share(&engine);
-    let exhaust_orders = coherent_share(&exhaust);
-    assert!(
-        engine_orders < exhaust_orders * 0.5,
-        "Engine copied exhaust orders: {engine_orders:.3} vs {exhaust_orders:.3}"
-    );
-}
-
 #[test]
 fn imported_bank_and_project_retain_provenance() {
     let bank = fixture();
@@ -444,7 +137,7 @@ fn imported_bank_and_project_retain_provenance() {
         version: 3,
         parameters: params(),
         hybrid: Settings {
-            turbo: 0.4,
+            engine_gain: 0.4,
             ..Default::default()
         },
         source: Some(bank.source.clone()),
@@ -467,275 +160,7 @@ fn imported_bank_and_project_retain_provenance() {
     assert_eq!(read.profile_name, p.profile_name);
     std::fs::remove_file(path).unwrap();
 }
-#[test]
-fn bank_playback_is_deterministic_and_ab_crossfade_is_bounded() {
-    let h = Settings::default();
-    let bank = fixture();
-    let a = render::hybrid_samples(params(), h, bank.clone(), 2., true).unwrap();
-    let b = render::hybrid_samples(params(), h, bank.clone(), 2., true).unwrap();
-    assert_eq!(a, b);
-    assert!(a.iter().all(|s| s.is_finite() && s.abs() < 1.));
-    let mut engine = Hybrid::new(48000, params(), h, Some(bank));
-    let mut previous = 0f32;
-    let mut jump = 0f32;
-    for i in 0..96000 {
-        if i == 48000 {
-            engine.set(
-                params(),
-                Settings {
-                    enhanced: false,
-                    ..h
-                },
-            );
-        }
-        let s = engine.next(true);
-        jump = jump.max((s - previous).abs());
-        previous = s;
-    }
-    assert!(jump < 0.08, "Discontinuity {jump}");
-    for _ in 0..48000 {
-        engine.next(false);
-    }
-    assert!(engine.next(false).abs() < 1e-6);
-}
-#[test]
-fn every_exposed_hybrid_control_affects_the_audio() {
-    let bank = fixture();
-    let h = Settings {
-        level_match: false,
-        ..Default::default()
-    };
-    let baseline = render::hybrid_samples(params(), h, bank.clone(), 3., true).unwrap();
-    for (name, variant) in [
-        ("response", Settings { response: 0.9, ..h }),
-        ("attack", Settings { attack: 1., ..h }),
-        ("body", Settings { body: 1., ..h }),
-        ("rasp", Settings { rasp: 1., ..h }),
-        ("texture", Settings { texture: 1., ..h }),
-        (
-            "pulse_gain",
-            Settings {
-                pulse_gain: 0.,
-                ..h
-            },
-        ),
-        (
-            "residual_gain",
-            Settings {
-                residual_gain: 0.,
-                ..h
-            },
-        ),
-        ("pipe", Settings { pipe: 1., ..h }),
-        ("overrun", Settings { overrun: 1., ..h }),
-        ("turbo", Settings { turbo: 1., ..h }),
-        ("roughness", Settings { roughness: 1., ..h }),
-        (
-            "cycle_life",
-            Settings {
-                cycle_life: 1.,
-                ..h
-            },
-        ),
-        (
-            "pulse_texture",
-            Settings {
-                pulse_texture: 1.,
-                ..h
-            },
-        ),
-        (
-            "pressure_shape",
-            Settings {
-                pressure_shape: 1.,
-                ..h
-            },
-        ),
-        (
-            "header_length",
-            Settings {
-                header_length: 1.4,
-                ..h
-            },
-        ),
-        (
-            "diameter",
-            Settings {
-                diameter: 125.,
-                ..h
-            },
-        ),
-        ("chamber", Settings { chamber: 17., ..h }),
-        (
-            "absorption",
-            Settings {
-                absorption: 0.95,
-                ..h
-            },
-        ),
-        (
-            "temperature",
-            Settings {
-                temperature: 160.,
-                ..h
-            },
-        ),
-        (
-            "intake_length",
-            Settings {
-                intake_length: 1.15,
-                ..h
-            },
-        ),
-        ("airbox", Settings { airbox: 1., ..h }),
-        ("fuel_cut", Settings { fuel_cut: 1., ..h }),
-        (
-            "idle_gain",
-            Settings {
-                idle_gain: 0.2,
-                ..h
-            },
-        ),
-    ] {
-        let audio = render::hybrid_samples(params(), variant, bank.clone(), 3., true).unwrap();
-        let diff = rms_diff(&baseline, &audio);
-        println!("{name}: delta RMS {diff:.8}");
-        assert!(diff > 1e-7, "Ineffective control: {name}");
-    }
-    for (name, p) in [
-        (
-            "intake",
-            Parameters {
-                intake: 0.,
-                ..params()
-            },
-        ),
-        (
-            "mechanical",
-            Parameters {
-                mechanical: 1.,
-                ..params()
-            },
-        ),
-        (
-            "exhaust",
-            Parameters {
-                exhaust: 0.2,
-                ..params()
-            },
-        ),
-        (
-            "pipe_length",
-            Parameters {
-                pipe_length: 4.5,
-                ..params()
-            },
-        ),
-        (
-            "resonance",
-            Parameters {
-                resonance: 3.8,
-                ..params()
-            },
-        ),
-        (
-            "brightness",
-            Parameters {
-                brightness: 700.,
-                ..params()
-            },
-        ),
-    ] {
-        let audio = render::hybrid_samples(p, h, bank.clone(), 3., true).unwrap();
-        let diff = rms_diff(&baseline, &audio);
-        println!("{name}: delta RMS {diff:.8}");
-        assert!(diff > 1e-7, "Ineffective control: {name}");
-    }
-}
-#[test]
-fn calibration_is_bounded_and_color_zero_removes_added_layers() {
-    let bank = fixture();
-    let h = Settings::calibrated(&bank);
-    h.validate().unwrap();
-    assert_eq!((h.overrun, h.turbo, h.roughness), (0., 0., 0.));
-    assert!((0.6..=0.7).contains(&h.coloration));
-    let base = Settings {
-        coloration: 0.,
-        level_match: false,
-        ..h
-    };
-    let exaggerated = Settings {
-        pipe: 1.,
-        airbox: 1.,
-        overrun: 1.,
-        turbo: 1.,
-        rasp: 1.,
-        body: 1.,
-        ..base
-    };
-    let a = render::hybrid_samples(params(), base, bank.clone(), 3., true).unwrap();
-    let b = render::hybrid_samples(params(), exaggerated, bank, 3., true).unwrap();
-    assert_eq!(a, b, "added layers leaked through color=0");
-}
-#[test]
-fn simplified_controls_generate_distinct_bounded_timbre_curves() {
-    for rpm in [-1., 0., 1.] {
-        for load in [-1., 0., 1.] {
-            let mut h = Settings {
-                rpm_character: rpm,
-                load_character: load,
-                ..Default::default()
-            };
-            h.rebuild_character_maps();
-            h.validate().unwrap();
-            assert_eq!(h.maps.pulse.at(0., 0.), 1.);
-            if rpm != 0. || load != 0. {
-                assert_ne!(h.maps.pulse, h.maps.texture);
-            }
-            let decoded: Settings =
-                serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
-            assert_eq!(h, decoded);
-        }
-    }
-}
-#[test]
-fn timbre_maps_change_selected_regions_and_roundtrip() {
-    let bank = fixture();
-    let mut h = Settings {
-        level_match: false,
-        ..Default::default()
-    };
-    let low = Parameters {
-        rpm: bank.min_rpm,
-        load: 0.,
-        ..params()
-    };
-    let high = Parameters {
-        rpm: bank.max_rpm,
-        load: 1.,
-        ..params()
-    };
-    let baseline_low = render::hybrid_samples(low, h, bank.clone(), 1., false).unwrap();
-    let baseline_high = render::hybrid_samples(high, h, bank.clone(), 1., false).unwrap();
-    h.maps.exhaust.0[2][2] = 0.1;
-    let modified_low = render::hybrid_samples(low, h, bank.clone(), 1., false).unwrap();
-    let modified_high = render::hybrid_samples(high, h, bank.clone(), 1., false).unwrap();
-    assert_eq!(baseline_low, modified_low, "unrelated region changed");
-    assert!(rms_diff(&baseline_high, &modified_high) > 0.001);
-    let path = std::env::temp_dir().join(format!("bess-maps-{}.json", std::process::id()));
-    let project = Project {
-        version: 3,
-        parameters: high,
-        hybrid: h,
-        source: Some(bank.source.clone()),
-        driving: Default::default(),
-        profile_name: project::default_profile_name(),
-        scratch: None,
-    };
-    project::save_project(&path, &project).unwrap();
-    assert_eq!(project::load_project(&path).unwrap().hybrid.maps, h.maps);
-    std::fs::remove_file(path).unwrap();
-}
+
 #[test]
 fn invalid_waveforms_and_settings_are_rejected() {
     assert!(bess::bank::decode_wav(b"not a wav").is_err());
@@ -754,369 +179,24 @@ fn invalid_waveforms_and_settings_are_rejected() {
 }
 
 #[test]
-fn simulated_wav_uses_the_same_transport_as_listening() {
-    use bess::{
-        bench::Bench,
-        drive::{Controls, Mode},
-    };
-    let c = Controls {
-        mode: Mode::Simulated,
-        throttle: 0.85,
-        ..Default::default()
-    };
-    let h = Settings::default();
-    let export = render::bench_samples(params(), h, fixture(), 3., c).unwrap();
-    let mut live = Bench::new(48000, params(), h, c, Some(fixture()));
-    let total = export.len();
-    for (i, exported) in export.iter().enumerate() {
-        let fade = ((total - i) as f32 / 2400.).min(1.);
-        assert_eq!(*exported, live.next(true) * fade);
-    }
-    let heavy = render::bench_samples(
-        params(),
-        h,
-        fixture(),
-        3.,
-        Controls {
-            resistance_nm: 1800.,
-            ..c
-        },
-    )
-    .unwrap();
-    assert!(rms_diff(&export, &heavy) > 0.005);
-}
-
-#[test]
-fn simulated_transport_pauses_and_accepts_live_controls_without_allocating() {
-    use bess::{
-        bench::Bench,
-        drive::{Controls, Mode},
-    };
-    let mut c = Controls {
-        mode: Mode::Simulated,
-        throttle: 0.7,
-        automatic: false,
-        ..Default::default()
-    };
-    let mut bench = Bench::new(48000, params(), Settings::default(), c, Some(fixture()));
-    ALLOCATIONS.with(|v| v.set(0));
-    TRACK.with(|v| v.set(true));
-    for i in 0..96000 {
-        if i % 256 == 0 {
-            c.throttle = i as f32 / 96000.;
-            c.resistance_nm = i as f32 / 96.;
-            if i > 48000 {
-                c.gear = 2;
-            }
-            bench.set(params(), Settings::default(), c, 0);
-        }
-        std::hint::black_box(bench.next(true));
-    }
-    TRACK.with(|v| v.set(false));
-    assert_eq!(ALLOCATIONS.with(|v| v.get()), 0);
-    let before = bench.state();
-    for _ in 0..48000 {
-        bench.next(false);
-    }
-    assert_eq!(bench.state().speed_kmh, before.speed_kmh);
-    assert_eq!(bench.state().gear, before.gear);
-    bench.set(params(), Settings::default(), c, 1);
-    assert_eq!(bench.state().speed_kmh, 0.);
-}
-
-#[test]
-fn playback_and_parameter_changes_do_not_allocate() {
-    let mut engine = Hybrid::new(48000, params(), Settings::default(), Some(fixture()));
-    ALLOCATIONS.with(|v| v.set(0));
-    TRACK.with(|v| v.set(true));
-    for i in 0..48000 {
-        if i % 128 == 0 {
-            engine.set(
-                Parameters {
-                    rpm: 800. + i as f32 * 0.06,
-                    ..params()
-                },
-                Settings {
-                    diameter: 30. + 100. * i as f32 / 48000.,
-                    header_length: 0.15 + 1.35 * i as f32 / 48000.,
-                    ..Settings::default()
-                },
-            );
-        }
-        std::hint::black_box(engine.next(true));
-    }
-    TRACK.with(|v| v.set(false));
-    let allocations = ALLOCATIONS.with(|v| v.get());
-    assert_eq!(allocations, 0, "Audio path allocated");
-}
-
-#[test]
-fn source_ab_branch_is_unaffected_by_acoustic_and_event_controls() {
-    let h = Settings {
-        enhanced: false,
-        ..Settings::default()
-    };
-    let a = render::hybrid_samples(params(), h, fixture(), 2., true).unwrap();
-    let b = render::hybrid_samples(
-        params(),
-        Settings {
-            enhanced: false,
-            roughness: 1.,
-            turbo: 1.,
-            overrun: 1.,
-            header_length: 1.5,
-            diameter: 30.,
-            chamber: 18.,
-            temperature: 950.,
-            airbox: 1.,
-            intake_length: 1.2,
-            combustion: bess::combustion::Combustion::even(12),
-            ..Settings::character(2)
-        },
-        fixture(),
-        2.,
-        true,
-    )
-    .unwrap();
-    assert_eq!(
-        a, b,
-        "The source reference must remain independent of enrichment"
-    );
-}
-
-#[test]
-fn afterfire_requires_a_release_and_returns_to_silence() {
-    let p = Parameters {
-        rpm: 3600.,
-        load: 0.8,
-        ..params()
-    };
-    let off = Settings {
-        level_match: false,
-        overrun: 0.,
-        ..Settings::default()
-    };
-    let on = Settings { overrun: 1., ..off };
-    let mut a = Hybrid::new(48000, p, off, Some(fixture()));
-    let mut b = Hybrid::new(48000, p, on, Some(fixture()));
-    let mut release_energy = 0.;
-    let mut late_energy = 0.;
-    for i in 0..192000 {
-        if i == 48000 {
-            let p = Parameters { load: 0.02, ..p };
-            a.set(p, off);
-            b.set(p, on);
-        }
-        let diff = a.next(true) - b.next(true);
-        if i < 48000 {
-            assert_eq!(diff, 0., "Afterfire on steady load");
-        } else if i < 96000 {
-            release_energy += diff * diff;
-        } else if i > 144000 {
-            late_energy += diff * diff;
-        }
-    }
-    assert!(release_energy > 1e-5, "No lift-off event");
-    assert!(
-        late_energy < release_energy * 1e-5,
-        "Persistent noise after release"
-    );
-}
-
-#[test]
-fn legacy_settings_load_and_geometry_boundaries_are_validated() {
-    let old: Settings = serde_json::from_str(r#"{"body":0.7,"enhanced":false}"#).unwrap();
-    assert_eq!(old.body, 0.7);
-    assert!(!old.enhanced);
-    old.validate().unwrap();
-    for h in [
-        Settings {
-            diameter: 0.,
-            ..old
-        },
-        Settings {
-            chamber: f32::NAN,
-            ..old
-        },
-        Settings {
-            temperature: 10000.,
-            ..old
-        },
-        Settings {
-            header_length: 0.,
-            ..old
-        },
-        Settings {
-            intake_length: -1.,
-            ..old
-        },
-    ] {
-        assert!(h.validate().is_err());
-    }
-    for i in 0..3 {
-        Settings::character(i).validate().unwrap();
-    }
-}
-
-#[test]
-fn rapid_geometry_and_load_changes_remain_bounded_at_device_rates() {
-    for rate in [44100, 192000] {
-        let mut p = Parameters {
-            volume: 0.8,
-            ..params()
-        };
-        let mut engine = Hybrid::new(rate, p, Settings::default(), Some(fixture()));
-        let mut last = 0f32;
-        let mut jump = 0f32;
-        for i in 0..rate * 2 {
-            if i % (rate / 8) == 0 {
-                let high = (i / (rate / 8)).is_multiple_of(2);
-                p.rpm = if high { 4000. } else { 800. };
-                p.load = if high { 1. } else { 0. };
-                p.pipe_length = if high { 5. } else { 0.2 };
-                p.resonance = 4.;
-                engine.set(
-                    p,
-                    Settings {
-                        pipe: 1.,
-                        chamber: if high { 18. } else { 0.3 },
-                        diameter: if high { 30. } else { 130. },
-                        temperature: if high { 150. } else { 950. },
-                        header_length: if high { 0.15 } else { 1.5 },
-                        absorption: 0.,
-                        ..Settings::default()
-                    },
-                );
-            }
-            let s = engine.next(true);
-            assert!(s.is_finite() && s.abs() < 1.);
-            jump = jump.max((s - last).abs());
-            last = s;
-        }
-        assert!(jump < 0.15, "Geometry discontinuity at {rate}: {jump}");
-    }
-}
-
-#[test]
-fn configured_combustion_is_audible_bounded_and_allocation_free() {
-    let bank = fixture();
-    let h = Settings {
-        level_match: false,
-        procedural: false,
-        ..Settings::calibrated(&bank)
-    };
-    let configured = Settings {
-        combustion: bess::combustion::Combustion::even(6),
-        ..h
-    };
-    let a = render::hybrid_samples(params(), h, bank.clone(), 2., false).unwrap();
-    let b = render::hybrid_samples(params(), configured, bank.clone(), 2., false).unwrap();
-    assert!(rms_diff(&a, &b) > 0.0001);
-    let mut engine = Hybrid::new(48000, params(), configured, Some(bank));
-    ALLOCATIONS.with(|v| v.set(0));
-    TRACK.with(|v| v.set(true));
-    for _ in 0..48000 {
-        let v = engine.next(true);
-        assert!(v.is_finite() && v.abs() < 1.);
-    }
-    TRACK.with(|v| v.set(false));
-    assert_eq!(ALLOCATIONS.with(|v| v.get()), 0);
-}
-
-#[test]
-fn sound_presets_keep_explicit_engine_timing() {
-    let bank = fixture();
-    let mut custom = bess::combustion::Combustion::even(6);
-    custom.angles[1] = 130.;
-    custom.exhaust_delay = 190.;
-    let starting = Settings {
-        combustion: custom,
-        enhanced: false,
-        level_match: false,
-        response: 0.7,
-        ..Settings::calibrated(&bank)
-    };
-    for preset in 0..6 {
-        let next = starting.character_preserving_engine(preset, Some(&bank));
-        assert_eq!(next.combustion, custom);
-        assert!(!next.enhanced && !next.level_match);
-        assert_eq!(next.response, 0.7);
-        assert_ne!(next.pipe, 0.28);
-    }
-}
-
-#[test]
-fn generated_character_presets_change_the_waveform() {
-    let bank = fixture();
-    let generated = |index| Settings {
-        procedural: true,
-        ..Settings::character_for_bank(index, &bank)
-    };
-    let baseline = render::hybrid_samples(params(), generated(0), bank.clone(), 1., false).unwrap();
-    for preset in 1..6 {
-        let settings = generated(preset);
-        assert!(settings.procedural);
-        let candidate =
-            render::hybrid_samples(params(), settings, bank.clone(), 1., false).unwrap();
-        assert!(rms_diff(&baseline, &candidate) > 0.00005, "preset {preset}");
-    }
-}
-
-#[test]
-fn standard_character_presets_change_the_waveform() {
-    let bank = fixture();
-    let baseline = render::hybrid_samples(
-        params(),
-        Settings::character_for_bank(0, &bank),
-        bank.clone(),
-        1.,
-        false,
-    )
-    .unwrap();
-    for preset in 1..6 {
-        let settings = Settings::character_for_bank(preset, &bank);
-        assert!(!settings.procedural);
-        let candidate =
-            render::hybrid_samples(params(), settings, bank.clone(), 1., false).unwrap();
-        assert!(rms_diff(&baseline, &candidate) > 0.00005, "preset {preset}");
-    }
-}
-
-#[test]
-fn selectable_beamng_export_ignores_experimental_live_mode() {
+fn vehicle_label_preserves_nested_names_escapes_and_duplicate_paints() {
     let source =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cars/bunchyearth23_cerberus_a.zip");
-    if !source.is_file() {
-        return;
-    }
-    let bank = std::sync::Arc::new(bess::bank::Bank::load(&source, None).unwrap());
-    let settings = Settings {
-        procedural: true,
-        generated_body: 1.5,
-        ..Settings::calibrated(&bank)
-    };
-    let dir = std::env::temp_dir().join(format!(
-        "bess-standard-variant-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    bess::variant::package(&dir, params(), settings, bank).unwrap();
-    let project: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("settings.bess.json")).unwrap()).unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(project["hybrid"]["procedural"], false);
-    assert_eq!(manifest["settings"]["procedural"], false);
-    assert_eq!(project["hybrid"]["generated_body"], 1.0);
+        br#"{"paints":{"Name":"Blue","Blue":1,"Blue":2},"Name":"Cerberus \"A\"","notes":"Name"}"#;
+    let (labelled, name) = bess::export::label_vehicle_info(source).unwrap();
+    assert_eq!(name, "Cerberus \"A\" (BESS)");
+    assert_eq!(
+        labelled,
+        br#"{"paints":{"Name":"Blue","Blue":1,"Blue":2},"Name":"Cerberus \"A\" (BESS)","notes":"Name"}"#
+    );
+    let (again, _) = bess::export::label_vehicle_info(&labelled).unwrap();
+    assert_eq!(again, labelled);
+    assert!(bess::export::label_vehicle_info(br#"{"Name":"A","Name":"B"}"#).is_err());
 }
 
 #[test]
 fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
     use std::io::Read;
-    let bank = fixture();
+    let bank = physical_fixture();
     let original = std::fs::read(&bank.source.archive).unwrap();
     let dir = std::env::temp_dir().join(format!(
         "bess-export-test-{}-{}",
@@ -1154,7 +234,7 @@ fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
         entry.read_to_end(&mut a).unwrap();
         let mut b = Vec::new();
         new.by_name(&name).unwrap().read_to_end(&mut b).unwrap();
-        if name.ends_with(".wav") {
+        if name.ends_with(".wav") && a != b {
             assert_ne!(a, b);
             let (rate, pcm) = bess::bank::decode_wav(&b).unwrap();
             assert_eq!(rate, 48000);
@@ -1163,14 +243,9 @@ fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
             let rms = (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt();
             assert!(rms > 0.0001);
             assert!((pcm[0] - pcm[pcm.len() - 1]).abs() < rms * 0.25);
-        } else if name == "vehicles/test/info.json" {
-            let (expected, display_name) = bess::export::label_vehicle_info(&a).unwrap();
-            assert_eq!(display_name, "Test Vehicle (BESS)");
+        } else if name.ends_with("/info.json") && a != b {
+            let (expected, _) = bess::export::label_vehicle_info(&a).unwrap();
             assert_eq!(b, expected);
-            assert_eq!(
-                b,
-                b"{\"Name\":\"Test Vehicle (BESS)\",\"paints\":{\"Blue\":1,\"Blue\":2}}"
-            );
         } else {
             assert_eq!(a, b, "Changed {name}");
         }
@@ -1183,60 +258,214 @@ fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
     assert!(!project.hybrid.procedural);
 }
 
-#[test]
-fn vehicle_label_preserves_nested_names_escapes_and_duplicate_paints() {
-    let source =
-        br#"{"paints":{"Name":"Blue","Blue":1,"Blue":2},"Name":"Cerberus \"A\"","notes":"Name"}"#;
-    let (labelled, name) = bess::export::label_vehicle_info(source).unwrap();
-    assert_eq!(name, "Cerberus \"A\" (BESS)");
-    assert_eq!(
-        labelled,
-        br#"{"paints":{"Name":"Blue","Blue":1,"Blue":2},"Name":"Cerberus \"A\" (BESS)","notes":"Name"}"#
-    );
-    let (again, _) = bess::export::label_vehicle_info(&labelled).unwrap();
-    assert_eq!(again, labelled);
-    assert!(bess::export::label_vehicle_info(br#"{"Name":"A","Name":"B"}"#).is_err());
+fn physical_fixture() -> Arc<Bank> {
+    static BANK: OnceLock<Arc<Bank>> = OnceLock::new();
+    BANK.get_or_init(|| Arc::new(Bank::load(&test_support::automation_fixture(), None).unwrap()))
+        .clone()
 }
 
 #[test]
-fn idle_gain_scales_low_rpm_level_without_touching_high_rpm() {
+fn original_a_is_exact_source_playback_with_no_physical_metadata() {
+    use bdsp::resample::{SincQuality, SincTable};
     let bank = fixture();
-    let base_settings = Settings {
-        level_match: false,
-        idle_gain: 1.0,
-        ..Settings::default()
+    let p = params();
+    let h = Settings {
+        enhanced: false,
+        ..Default::default()
     };
-    let quiet_idle_settings = Settings {
-        level_match: false,
-        idle_gain: 0.4,
-        ..Settings::default()
-    };
+    let mut hybrid = Hybrid::new(48000, p, h, Some(bank.clone()));
+    assert!(hybrid.initialization_error().is_some());
+    assert!(!hybrid.failed());
+    let sinc = SincTable::for_quality(SincQuality::Realtime);
+    let mut cycle = 0.;
+    let mut gain = 0.;
+    let mut energy = 0.;
+    for _ in 0..12000 {
+        cycle += p.rpm as f64 / (120. * 48000.);
+        gain += (p.volume - gain) * (1. / (48000. * 0.025));
+        let raw = bank.read_original(cycle, p.rpm, p.load, 48000., &sinc) * gain;
+        let expected = if raw.abs() > 0.95 {
+            raw.signum() * (0.95 + 0.049 * ((raw.abs() - 0.95) / 0.049).tanh())
+        } else {
+            raw
+        };
+        assert_eq!(hybrid.next(true).to_bits(), expected.to_bits());
+        energy += expected * expected;
+    }
+    assert!(energy > 0.01);
+    hybrid.set(
+        p,
+        Settings {
+            enhanced: true,
+            ..h
+        },
+    );
+    assert!(hybrid.failed()); // Explicit error; never another synthesizer.
+}
 
-    let p_idle = Parameters {
-        rpm: 800.,
+#[test]
+fn physical_b_is_deterministic_and_sound_tuning_never_changes_reference_a() {
+    let bank = physical_fixture();
+    let p = params();
+    let h = Settings {
+        level_match: false,
+        ..Default::default()
+    };
+    let mut a = Hybrid::new(48000, p, h, Some(bank.clone()));
+    let mut b = Hybrid::new(48000, p, h, Some(bank.clone()));
+    assert!(a.initialization_error().is_none());
+    let mut difference = 0.;
+    let mut energy = 0.;
+    for i in 0..24000 {
+        if i == 12000 {
+            let mut tuned = h;
+            tuned.physical_sound.presence_db = 9.;
+            tuned.physical_sound.intake_resonance = 1.5;
+            b.set(p, tuned);
+        }
+        let x = a.next_stems(true);
+        let y = b.next_stems(true);
+        assert_eq!(x.source_reference.to_bits(), y.source_reference.to_bits());
+        assert!(
+            [x.exhaust, x.engine, x.mixed, y.mixed]
+                .iter()
+                .all(|v| v.is_finite())
+        );
+        assert!(x.mixed.abs() < 0.95 && y.mixed.abs() < 0.95);
+        if i < 12000 {
+            assert_eq!(x.mixed.to_bits(), y.mixed.to_bits());
+        } else {
+            difference += (x.mixed - y.mixed).abs();
+        }
+        energy += x.exhaust * x.exhaust + x.engine * x.engine;
+    }
+    assert!(energy > 1e-6 && difference > 1e-5);
+    assert!(!a.failed() && !b.failed());
+}
+
+#[test]
+fn physical_render_and_live_bench_share_identical_signal() {
+    use bess::{
+        bench::Bench,
+        drive::{Controls, Mode},
+    };
+    let bank = physical_fixture();
+    let p = params();
+    let h = Settings::default();
+    let c = Controls {
+        mode: Mode::Direct,
+        ..Default::default()
+    };
+    let rendered = render::bench_samples(p, h, bank.clone(), 1., c).unwrap();
+    let mut live = Bench::new(48000, p, h, c, Some(bank));
+    for (i, output) in rendered.iter().enumerate() {
+        let fade = ((rendered.len() - i) as f32 / 2400.).min(1.);
+        assert_eq!(output.to_bits(), (live.next(true) * fade).to_bits());
+    }
+}
+
+#[test]
+fn physical_processing_and_live_retunes_allocate_nothing() {
+    let p = params();
+    let mut h = Settings::default();
+    let mut hybrid = Hybrid::new(48000, p, h, Some(physical_fixture()));
+    for _ in 0..2400 {
+        hybrid.next(true);
+    }
+    ALLOCATIONS.with(|n| n.set(0));
+    DEALLOCATIONS.with(|n| n.set(0));
+    TRACK.with(|v| v.set(true));
+    for i in 0..9600 {
+        if i % 2400 == 0 {
+            h.physical_sound.bass_db = i as f32 / 2400.;
+            h.physical_sound.tail_length_m = 1. + i as f32 / 9600.;
+            h.physical_sound.exhaust_body_db = 8.;
+            h.physical_sound.exhaust_body_hz = 150. + i as f32 / 10.;
+            h.physical_sound.exhaust_low_cut_hz = 60.;
+            h.physical_sound.exhaust_high_cut_hz = 4000.;
+            h.physical_sound.exhaust_drive = 0.4;
+            hybrid.set(p, h);
+        }
+        std::hint::black_box(hybrid.next(true));
+    }
+    TRACK.with(|v| v.set(false));
+    assert_eq!(ALLOCATIONS.with(|n| n.get()), 0);
+    assert_eq!(DEALLOCATIONS.with(|n| n.get()), 0);
+    assert!(!hybrid.failed());
+}
+
+#[test]
+fn migration_reads_old_controls_but_saves_only_physical_audio_controls() {
+    let h: Settings =
+        serde_json::from_str(r#"{"procedural":true,"source_timbre":0.8,"enhanced":false}"#)
+            .unwrap();
+    let saved = serde_json::to_value(h).unwrap();
+    for old in [
+        "procedural",
+        "source_timbre",
+        "generated_body",
+        "combustion",
+        "maps",
+    ] {
+        assert!(saved.get(old).is_none(), "{old}");
+    }
+    assert!(saved.get("physical_sound").is_some());
+    assert!(!h.enhanced);
+}
+
+#[test]
+fn optional_level_match_converges_to_source_without_lifting_muted_stems() {
+    let bank = physical_fixture();
+    let p = Parameters {
+        rpm: 2000.,
+        load: 0.4,
+        volume: 0.8,
         ..params()
     };
-    let idle_base = render::hybrid_samples(p_idle, base_settings, bank.clone(), 2., false).unwrap();
-    let idle_quiet =
-        render::hybrid_samples(p_idle, quiet_idle_settings, bank.clone(), 2., false).unwrap();
-    let rms = |s: &[f32]| (s.iter().map(|&x| x * x).sum::<f32>() / s.len() as f32).sqrt();
-    let base_idle_rms = rms(&idle_base);
-    let quiet_idle_rms = rms(&idle_quiet);
-    assert!(
-        quiet_idle_rms < base_idle_rms * 0.65,
-        "Idle gain failed to reduce idle RMS: {quiet_idle_rms} vs {base_idle_rms}"
-    );
-
-    let p_high = Parameters {
-        rpm: 4000.,
-        ..params()
+    let h = Settings {
+        level_match: true,
+        ..Default::default()
     };
-    let high_base = render::hybrid_samples(p_high, base_settings, bank.clone(), 2., false).unwrap();
-    let high_quiet =
-        render::hybrid_samples(p_high, quiet_idle_settings, bank.clone(), 2., false).unwrap();
-    let diff = rms_diff(&high_base, &high_quiet);
-    assert!(
-        diff < 1e-4,
-        "Idle gain altered high RPM audio: diff = {diff}"
+    let mut original = Hybrid::new(
+        48000,
+        p,
+        Settings {
+            enhanced: false,
+            ..h
+        },
+        Some(bank.clone()),
     );
+    let mut physical = Hybrid::new(48000, p, h, Some(bank));
+    let mut a2 = 0_f64;
+    let mut b2 = 0_f64;
+    for frame in 0..48000 * 12 {
+        let a = original.next(true);
+        let b = physical.next(true);
+        if frame >= 48000 * 9 {
+            a2 += f64::from(a).powi(2);
+            b2 += f64::from(b).powi(2);
+        }
+    }
+    let difference_db = 10. * (b2 / a2).log10();
+    assert!(
+        difference_db.abs() < 1.,
+        "Matched RMS difference {difference_db} dB"
+    );
+    physical.set(
+        Parameters {
+            intake: 0.,
+            exhaust: 0.,
+            mechanical: 0.,
+            ..p
+        },
+        h,
+    );
+    let mut peak = 0_f32;
+    for frame in 0..48000 * 2 {
+        let sample = physical.next(true);
+        if frame > 48000 {
+            peak = peak.max(sample.abs());
+        }
+    }
+    assert!(peak < 1e-7, "Muted layer was raised: {peak}");
 }

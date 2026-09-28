@@ -6,7 +6,6 @@ use std::{
     fs::File,
     io::{Cursor, Read},
     path::Path,
-    sync::{Arc, OnceLock},
 };
 
 const PAD: usize = 128;
@@ -25,6 +24,9 @@ pub struct SourceRef {
     pub archive: String,
     pub blend: String,
     pub fingerprint: String,
+    /// Verified engine metadata identity for physical B. Absent on old projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_fingerprint: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Character {
@@ -52,7 +54,6 @@ pub struct Bank {
     original_gain: f32,
     pub min_rpm: f32,
     pub max_rpm: f32,
-    procedural: OnceLock<Arc<crate::procedural::ProceduralBank>>,
 }
 fn read_entry(zip: &mut zip::ZipArchive<File>, name: &str, limit: u64) -> Result<Vec<u8>, String> {
     let entry = zip.by_name(name).map_err(|e| format!("{name} : {e}"))?;
@@ -103,16 +104,6 @@ pub fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
     Ok((spec.sample_rate, mono))
 }
 impl Sample {
-    /// Prepared recording for offline descriptor extraction. The audio thread
-    /// must not use this slice for procedural playback.
-    pub(crate) fn analysis_pcm(&self) -> &[f32] {
-        &self.pcm[PAD..PAD + self.frames]
-    }
-
-    pub(crate) fn analysis_cycles(&self) -> usize {
-        self.cycles
-    }
-
     fn prepare(rpm: f32, rate: u32, mut raw: Vec<f32>) -> Result<Self, String> {
         let mean = raw.iter().map(|x| *x as f64).sum::<f64>() / raw.len() as f64;
         for x in &mut raw {
@@ -239,18 +230,6 @@ impl Sample {
     }
 }
 impl Bank {
-    /// Prepare the generated sound model on the import worker before playback.
-    pub fn prepare_procedural(&self) {
-        let _ = self.procedural_model();
-    }
-
-    /// The descriptor analysis runs once per imported bank, before audio starts.
-    pub(crate) fn procedural_model(&self) -> Arc<crate::procedural::ProceduralBank> {
-        self.procedural
-            .get_or_init(|| Arc::new(crate::procedural::ProceduralBank::from_bank(self)))
-            .clone()
-    }
-
     /// Import-time descriptors, not an identification of physical engine parts.
     pub fn character(&self) -> Character {
         let mut confidence = 0.;
@@ -294,6 +273,10 @@ impl Bank {
             }
         };
         let engine_meta = crate::engine_meta::inspect(path, &blend);
+        let engine_fingerprint = engine_meta
+            .as_ref()
+            .map(crate::engine_meta::EngineMeta::fingerprint)
+            .transpose()?;
         let bytes = read_entry(&mut zip, &blend, 1_000_000)?;
         let mut hash = Sha256::new();
         hash.update(&bytes);
@@ -398,6 +381,7 @@ impl Bank {
                     .into_owned(),
                 blend,
                 fingerprint: format!("{:x}", hash.finalize()),
+                engine_fingerprint,
             },
             engine_meta,
             layers,
@@ -405,7 +389,6 @@ impl Bank {
             original_gain,
             min_rpm,
             max_rpm,
-            procedural: OnceLock::new(),
         })
     }
     pub fn read(&self, cycle: f64, rpm: f32, load: f32, rate: f32, sinc: &SincTable) -> f32 {
@@ -498,8 +481,138 @@ impl Bank {
 }
 
 #[cfg(test)]
+mod physical_source_independence_tests {
+    use super::*;
+    use crate::{
+        hybrid::{Hybrid, Settings},
+        project::Parameters,
+    };
+
+    #[test]
+    fn physical_b_ignores_recording_pcm_even_after_live_tuning() {
+        let path = crate::test_support::automation_fixture();
+        let original = Bank::load(&path, None).unwrap();
+        let mut changed = Bank::load(&path, None).unwrap();
+        // Keep verified metadata, source RPM, normalization and all physical
+        // construction inputs identical. Replace only A's recording samples.
+        for layer in &mut changed.layers {
+            for sample in layer {
+                let original = if let Some(original) = &mut sample.legacy {
+                    original.as_mut()
+                } else {
+                    sample
+                };
+                for value in &mut original.pcm {
+                    *value *= -0.25;
+                }
+            }
+        }
+        let p = Parameters {
+            rpm: 2000.,
+            load: 0.4,
+            volume: 0.8,
+            ..Default::default()
+        };
+        let mut h = Settings {
+            level_match: false,
+            ..Default::default()
+        };
+        let mut a = Hybrid::new(48000, p, h, Some(std::sync::Arc::new(original)));
+        let mut b = Hybrid::new(48000, p, h, Some(std::sync::Arc::new(changed)));
+        assert!(a.initialization_error().is_none() && b.initialization_error().is_none());
+        let mut reference_difference = 0.;
+        let mut physical_energy = 0.;
+        for frame in 0..12000 {
+            if frame == 6000 {
+                h.physical_sound.presence_db = 7.;
+                h.physical_sound.flow_texture = 0.3;
+                a.set(p, h);
+                b.set(p, h);
+            }
+            let x = a.next_stems(true);
+            let y = b.next_stems(true);
+            assert_eq!(x.exhaust.to_bits(), y.exhaust.to_bits());
+            assert_eq!(x.engine.to_bits(), y.engine.to_bits());
+            assert_eq!(x.mixed.to_bits(), y.mixed.to_bits());
+            reference_difference += (x.source_reference - y.source_reference).abs();
+            physical_energy += x.exhaust * x.exhaust + x.engine * x.engine;
+        }
+        assert!(reference_difference > 0.01 && physical_energy > 1e-6);
+        assert!(!a.failed() && !b.failed());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_source_ref_remains_readable_without_engine_fingerprint() {
+        let legacy = r#"{"archive":"vehicle.zip","blend":"engine.json","fingerprint":"audio"}"#;
+        let source: SourceRef = serde_json::from_str(legacy).unwrap();
+        assert_eq!(source.engine_fingerprint, None);
+        assert!(
+            !serde_json::to_string(&source)
+                .unwrap()
+                .contains("engine_fingerprint")
+        );
+        let current = SourceRef {
+            engine_fingerprint: Some("physical".into()),
+            ..source
+        };
+        assert_eq!(
+            serde_json::from_str::<SourceRef>(&serde_json::to_string(&current).unwrap()).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn car_only_change_updates_engine_fingerprint_without_changing_original_audio() {
+        use std::io::Write;
+        let original_path = crate::test_support::automation_fixture();
+        let changed_path = original_path.with_extension("changed.zip");
+        let original = Bank::load(&original_path, None).unwrap();
+        let mut reader = zip::ZipArchive::new(File::open(&original_path).unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(File::create(&changed_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        let mut replacements = 0;
+        for index in 0..reader.len() {
+            let mut entry = reader.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if entry.name().ends_with(".car") {
+                let marker = b"\n\t\tCompression=";
+                let start = bytes
+                    .windows(marker.len())
+                    .position(|w| w == marker)
+                    .unwrap()
+                    + marker.len();
+                let end = start + bytes[start..].iter().position(|b| *b == b',').unwrap();
+                bytes.splice(start..end, b"10.25".iter().copied());
+                replacements += 1;
+            }
+            writer.start_file(entry.name(), options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(reader);
+        let changed = Bank::load(&changed_path, None).unwrap();
+        std::fs::remove_file(original_path).unwrap();
+        std::fs::remove_file(changed_path).unwrap();
+        assert_eq!(replacements, 1);
+        assert_eq!(original.source.fingerprint, changed.source.fingerprint);
+        assert!(original.source.engine_fingerprint.is_some());
+        assert!(changed.source.engine_fingerprint.is_some());
+        assert_ne!(
+            original.source.engine_fingerprint,
+            changed.source.engine_fingerprint
+        );
+        let original_meta = original.engine_meta.unwrap();
+        let changed_meta = changed.engine_meta.unwrap();
+        assert_eq!(original_meta.uid, changed_meta.uid);
+        assert_eq!(original_meta.physical.compression, Some(9.));
+        assert_eq!(changed_meta.physical.compression, Some(10.25));
+    }
 
     #[test]
     fn residual_reliability_follows_rpm_and_load_interpolation() {
@@ -526,6 +639,7 @@ mod tests {
                 archive: String::new(),
                 blend: String::new(),
                 fingerprint: String::new(),
+                engine_fingerprint: None,
             },
             engine_meta: None,
             layers: [
@@ -536,7 +650,6 @@ mod tests {
             original_gain: 1.,
             min_rpm: 1000.,
             max_rpm: 2000.,
-            procedural: OnceLock::new(),
         };
         assert_eq!(bank.residual_reliability(1000., 0.), 1.);
         assert_eq!(bank.residual_reliability(1000., 1.), 0.);

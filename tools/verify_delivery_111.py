@@ -1,4 +1,4 @@
-"""Verify the BESS 0.11.1 application and recording-free Windows assets."""
+"""Verify the BESS 0.11.1 original-reference / physical-engine application assets."""
 
 from __future__ import annotations
 
@@ -15,18 +15,7 @@ DIST = ROOT / "dist"
 FOLDER = DIST / "BESS-0.11.1-public"
 ARCHIVE = DIST / "BESS-0.11.1-Windows-Portable.zip"
 STANDALONE = DIST / "BESS-0.11.1-Windows.exe"
-INSTRUMENT_FOLDER = DIST / "BESS-0.11.1-Standalone-public"
-INSTRUMENT_ARCHIVE = DIST / "BESS-0.11.1-Standalone-Windows-Portable.zip"
 FILES = {"BESS.exe", "START.html", "README.md", "RELEASE_NOTES_0.11.1.md", "SHA256.json"}
-INSTRUMENT_FILES = {
-    "standalone_engine.exe",
-    "standalone_live.exe",
-    "START_STANDALONE.md",
-    "presets/single.json",
-    "presets/four-even.json",
-    "presets/four-split.json",
-    "SHA256.json",
-}
 FORBIDDEN_EXTENSIONS = {".zip", ".wav", ".car", ".bess.json"}
 FORBIDDEN_DIRECTORIES = {"sources", "beamng-addons", "listening"}
 
@@ -82,29 +71,14 @@ def verify() -> None:
                 assert hashlib.sha256(stream.read()).hexdigest() == checksum, name
         with outer.open(f"{FOLDER.name}/SHA256.json") as stream:
             assert hashlib.sha256(stream.read()).hexdigest() == sha256(FOLDER / "SHA256.json")
-    actual_instrument = {
-        path.relative_to(INSTRUMENT_FOLDER).as_posix(): path
-        for path in INSTRUMENT_FOLDER.rglob("*") if path.is_file()
-    }
-    assert set(actual_instrument) == INSTRUMENT_FILES, "Instrument has missing or extra files"
-    assert not any(name.lower().endswith(tuple(FORBIDDEN_EXTENSIONS)) for name in actual_instrument)
-    for name in ("standalone_engine", "standalone_live"):
-        assert sha256(INSTRUMENT_FOLDER / f"{name}.exe") == sha256(ROOT / "target/release" / f"{name}.exe")
-    instrument_hashes = json.loads((INSTRUMENT_FOLDER / "SHA256.json").read_text(encoding="utf-8"))
-    assert set(instrument_hashes) == INSTRUMENT_FILES - {"SHA256.json"}
-    for name, expected in instrument_hashes.items():
-        assert sha256(INSTRUMENT_FOLDER / name) == expected, name
-    with zipfile.ZipFile(INSTRUMENT_ARCHIVE) as outer:
-        assert outer.testzip() is None, "Instrument archive CRC failure"
-        expected = {f"{INSTRUMENT_FOLDER.name}/{name}" for name in INSTRUMENT_FILES}
-        assert len(outer.namelist()) == len(expected) and set(outer.namelist()) == expected
-        for name, checksum in instrument_hashes.items():
-            with outer.open(f"{INSTRUMENT_FOLDER.name}/{name}") as stream:
-                assert hashlib.sha256(stream.read()).hexdigest() == checksum, name
-    sidecar = Path(str(INSTRUMENT_ARCHIVE) + ".sha256")
-    assert sidecar.read_text(encoding="ascii") == f"{sha256(INSTRUMENT_ARCHIVE)}  {INSTRUMENT_ARCHIVE.name}\n"
-    print("PASS: application package has five allow-listed files; instrument package has seven")
-    print(f"PASS: {len(hashes) + len(instrument_hashes)} file hashes, {len(page.urls)} HTML links, both ZIP CRCs, executables and sidecars")
+    for document in (readme, (FOLDER / "START.html").read_text(encoding="utf-8")):
+        lower = document.lower()
+        assert "physical engine" in lower and "original" in lower, "Missing A/B physical workflow"
+        for retired in ("source-guided", "experimental generated", "standalone_engine", "standalone_live"):
+            assert retired not in lower, f"Retired synthesis path advertised: {retired}"
+    print("PASS: application package has five allow-listed files; only original A / physical B")
+    print(f"PASS: {len(hashes)} file hashes, {len(page.urls)} HTML links, ZIP CRC, executable and sidecars")
+
 
 
 if __name__ == "__main__":

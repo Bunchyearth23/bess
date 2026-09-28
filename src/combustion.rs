@@ -1,10 +1,11 @@
-//! Explicit four-stroke event timing, never inferred from audio harmonics.
+//! Archived event settings retained only to read older projects.
+//! Sound generation lives exclusively in the physical engine.
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Combustion {
-    /// Zero means unknown: source-only hybrid fallback.
+    /// Zero represented an unspecified cylinder count in older projects.
     pub cylinders: u32,
     /// Cylinder-indexed ignition angles in a 720-degree cycle.
     pub angles: [f32; 12],
@@ -54,46 +55,19 @@ impl Combustion {
         }
         Ok(())
     }
-    /// Smooth, finite pressure windows, delayed to the exhaust opening.
-    /// A phenomenological excitation, not a thermodynamic pressure solver.
-    pub fn pressure(&self, cycle: f64, rpm: f32, load: f32) -> f32 {
-        if self.cylinders == 0 {
-            return 0.;
-        }
-        let width = (self.width_ms * 0.001 * rpm / 120.).min(0.8 / self.cylinders as f32);
-        let mut sum = 0.;
-        for &angle in &self.angles[..self.cylinders as usize] {
-            let phase = (cycle - (angle + self.exhaust_delay) as f64 / 720.).rem_euclid(1.) as f32;
-            if phase < width {
-                let w = (std::f32::consts::PI * phase / width).sin();
-                sum += w * w;
-            }
-        }
-        sum * (0.2 + 0.8 * load) * 0.18
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn explicit_events_and_unknown_fallback() {
+    fn archived_settings_validate_and_roundtrip() {
         let c = Combustion::even(4);
         assert!(c.validate().is_ok());
-        let mut starts = 0;
-        let mut was = false;
-        for n in 0..7200 {
-            let active = c.pressure(n as f64 / 7200., 1200., 1.) > 0.;
-            if active && !was {
-                starts += 1;
-            }
-            was = active;
-            assert_eq!(
-                Combustion::default().pressure(n as f64 / 7200., 1200., 1.),
-                0.
-            );
-        }
-        assert_eq!(starts, 4);
+        assert_eq!(c.angles[..4], [0., 180., 360., 540.]);
+        let old: Combustion = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, Combustion::default());
+        old.validate().unwrap();
         let mut invalid = c;
         invalid.angles[0] = f32::NAN;
         assert!(invalid.validate().is_err());
