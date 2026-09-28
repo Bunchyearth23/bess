@@ -71,6 +71,16 @@ pub enum Headers {
     EqualLength,
 }
 
+/// Acoustic connection between the two exhaust banks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Crossover {
+    #[default]
+    None,
+    H,
+    X,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Catalyst {
@@ -107,6 +117,7 @@ pub struct EngineBuild {
     pub fuel: Fuel,
     pub throttle: Throttle,
     pub headers: Headers,
+    pub crossover: Crossover,
     pub exhaust_mm: f32,
     pub catalyst: Catalyst,
     pub muffler: Muffler,
@@ -130,6 +141,7 @@ impl Default for EngineBuild {
             fuel: Fuel::PortInjection,
             throttle: Throttle::Single,
             headers: Headers::CastManifold,
+            crossover: Crossover::None,
             exhaust_mm: 55.,
             catalyst: Catalyst::Standard,
             muffler: Muffler::Baffled,
@@ -195,13 +207,16 @@ impl EngineBuild {
         let redline_rpm = (piston_speed * 30_000. / self.stroke_mm / 100.).round() * 100.;
         let redline_rpm = redline_rpm.clamp(3000., 12_000.);
         // Overlap destabilises low-speed combustion; racier cams idle higher.
-        let idle_rpm = (700. + self.cam * 500. + (self.aspiration != Aspiration::Natural) as u8 as f32 * 50.)
-            .min(redline_rpm - 1500.);
+        let idle_rpm =
+            (700. + self.cam * 500. + (self.aspiration != Aspiration::Natural) as u8 as f32 * 50.)
+                .min(redline_rpm - 1500.);
         let boost = match self.aspiration {
             Aspiration::Natural => 0.,
             _ => self.boost_bar,
         };
-        let bmep_bar = (10.5 + (self.compression - 10.) * 0.35 + self.cam * 1.2
+        let bmep_bar = (10.5
+            + (self.compression - 10.) * 0.35
+            + self.cam * 1.2
             + if self.vvt { 0.6 } else { 0. }
             + if self.valves >= 4 { 0.5 } else { 0. })
             * (1. + boost * 0.85);
@@ -209,7 +224,9 @@ impl EngineBuild {
         // Torque falls away above its peak; racier cams keep it higher.
         let power_rpm = redline_rpm * (0.85 + self.cam * 0.08).min(0.95);
         let peak_power_kw =
-            peak_torque_nm * (0.78 + self.cam * 0.12) * power_rpm * std::f32::consts::TAU / 60. / 1000.;
+            peak_torque_nm * (0.78 + self.cam * 0.12) * power_rpm * std::f32::consts::TAU
+                / 60.
+                / 1000.;
         let inertia = (0.08 + displacement_l * 0.07)
             * match self.crank {
                 Crankshaft::Cast => 1.,
@@ -235,13 +252,38 @@ mod tests {
     #[test]
     fn a_square_two_litre_four_has_plausible_figures() {
         let p = EngineBuild::default().performance(4);
-        assert!((p.displacement_l - 1.998).abs() < 0.01, "{}", p.displacement_l);
-        assert!((6800. ..=7800.).contains(&p.redline_rpm), "{}", p.redline_rpm);
-        assert!((170. ..=220.).contains(&p.peak_torque_nm), "{}", p.peak_torque_nm);
-        assert!((90. ..=130.).contains(&p.peak_power_kw), "{}", p.peak_power_kw);
-        let turbo = EngineBuild { aspiration: Aspiration::Turbo, ..Default::default() }.performance(4);
+        assert!(
+            (p.displacement_l - 1.998).abs() < 0.01,
+            "{}",
+            p.displacement_l
+        );
+        assert!(
+            (6800. ..=7800.).contains(&p.redline_rpm),
+            "{}",
+            p.redline_rpm
+        );
+        assert!(
+            (170. ..=220.).contains(&p.peak_torque_nm),
+            "{}",
+            p.peak_torque_nm
+        );
+        assert!(
+            (90. ..=130.).contains(&p.peak_power_kw),
+            "{}",
+            p.peak_power_kw
+        );
+        let turbo = EngineBuild {
+            aspiration: Aspiration::Turbo,
+            ..Default::default()
+        }
+        .performance(4);
         assert!(turbo.peak_torque_nm > p.peak_torque_nm * 1.5);
-        let race = EngineBuild { cam: 1., crank: Crankshaft::Billet, ..Default::default() }.performance(4);
+        let race = EngineBuild {
+            cam: 1.,
+            crank: Crankshaft::Billet,
+            ..Default::default()
+        }
+        .performance(4);
         assert!(race.redline_rpm > p.redline_rpm && race.idle_rpm > p.idle_rpm);
     }
 }

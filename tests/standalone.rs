@@ -207,7 +207,7 @@ fn json_validation_and_range_stability() {
     invalid.version = 2;
     assert!(invalid.validate().is_err());
     for name in ["single", "four-even", "four-split"] {
-        for rate in [8_000, 48_000, 192_000] {
+        for rate in [8_000, 48_000, 192_000, 384_000] {
             for rpm in [0., 200., 3_000., 12_000.] {
                 let commands = Commands {
                     rpm,

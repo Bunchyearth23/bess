@@ -4,6 +4,9 @@ use crate::{
     drive::{Controls, Mode, Simulator, State, TICK_RATE},
     export::{exhaust_level_gain, exhaust_level_gain_with_floor},
     hybrid::{Hybrid, HybridStems, Settings, audition},
+    physical::engine::{
+        Commands as PhysicalCommands, Engine as PhysicalEngine, Sample as PhysicalSample,
+    },
     project::Parameters,
     scratch::{ScratchModel, ScratchVoice},
 };
@@ -41,9 +44,15 @@ impl BeamNgCamera {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Cockpit => "Cabin insulation filter (~1100 Hz low-pass), dominant engine sound through firewall, muted exhaust.",
-            Self::Hood => "Direct engine bay and intake sound, no cabin filter, distant exhaust (-12 dB).",
-            Self::Tailpipe => "Direct tailpipe outlet at full level (0 dB), distant engine sound (-16 dB).",
+            Self::Cockpit => {
+                "Cabin insulation filter (~1100 Hz low-pass), dominant engine sound through firewall, muted exhaust."
+            }
+            Self::Hood => {
+                "Direct engine bay and intake sound, no cabin filter, distant exhaust (-12 dB)."
+            }
+            Self::Tailpipe => {
+                "Direct tailpipe outlet at full level (0 dB), distant engine sound (-16 dB)."
+            }
             Self::Orbit => "Standard exterior two-emitter mix (-8 dB engine relative to exhaust).",
         }
     }
@@ -251,7 +260,7 @@ struct Listener {
     cabin_low: StateVariableFilter,
     cabin_mode: StateVariableFilter,
     air: StateVariableFilter,
-    ground: [f32; 64],
+    ground: [f32; 128],
     ground_index: usize,
     ground_delay: usize,
     /// Smoothed exhaust gain, engine gain, cabin, outside and overall weights.
@@ -262,16 +271,22 @@ struct Listener {
     limit_release: f32,
 }
 impl Listener {
+    // Fixed scratch listening calibration (+24.08 dB). The synth's scale was
+    // set by an open V12 at the tailpipe, leaving a stock I4 around -54 dBFS
+    // RMS outside at volume 0.8. Apply makeup after the perspective filters,
+    // before the peak limiter, without a level follower that lifts fuel cuts.
+    const MAKEUP_GAIN: f32 = 16.;
+
     fn new(rate: u32) -> Self {
         let rate = rate as f32;
         Self {
             cabin_low: StateVariableFilter::new(rate, 350., 0.8, SvfMode::Lowpass),
             cabin_mode: StateVariableFilter::new(rate, 60., 3., SvfMode::Bandpass),
             air: StateVariableFilter::new(rate, 9000., 0.707, SvfMode::Lowpass),
-            ground: [0.; 64],
+            ground: [0.; 128],
             ground_index: 0,
             // Tailpipe 0.3 m and ear 1.2 m high, 7.5 m away: ~0.28 ms, first notch ~1.8 kHz.
-            ground_delay: ((0.00028 * rate).round() as usize).clamp(1, 63),
+            ground_delay: ((0.00028 * rate).round() as usize).clamp(1, 127),
             weights: [1., 0.16, 0., 0., 1.],
             slew: 1. / (rate * 0.05),
             limit_envelope: 0.,
@@ -295,15 +310,15 @@ impl Listener {
         let muffled = self.cabin_low.next_sample(x);
         let inside = muffled + self.cabin_mode.next_sample(muffled) * 0.5;
         self.ground[self.ground_index] = x;
-        let reflected =
-            self.ground[(self.ground_index + 64 - self.ground_delay) % 64];
-        self.ground_index = (self.ground_index + 1) % 64;
+        let reflected = self.ground
+            [(self.ground_index + self.ground.len() - self.ground_delay) % self.ground.len()];
+        self.ground_index = (self.ground_index + 1) % self.ground.len();
         let far = self.air.next_sample(x + 0.7 * reflected) * 0.6;
         let near = x * (1. - cabin - outside) + inside * cabin + far * outside;
-        self.limit(near * overall)
+        self.limit(near * overall * Self::MAKEUP_GAIN)
     }
     /// Never exceed −1 dBFS: instant attack (the envelope already holds this
-    /// sample's peak), 150 ms release. Calibrated levels rarely engage it.
+    /// sample's peak), 150 ms release. Loud open exhausts can engage it.
     fn limit(&mut self, x: f32) -> f32 {
         const CEILING: f32 = 0.891;
         self.limit_envelope = (self.limit_envelope * self.limit_release).max(x.abs());
@@ -317,6 +332,13 @@ impl Listener {
 
 pub struct Bench {
     engine: Hybrid,
+    physical: Option<Box<PhysicalEngine>>,
+    outgoing_physical: Option<Box<PhysicalEngine>>,
+    retired_physical: Option<ScratchVoice>,
+    physical_commands: PhysicalCommands,
+    physical_fade: f32,
+    physical_gain: f32,
+    physical_idle_rpm: f32,
     listener: Option<Listener>,
     sim: Simulator,
     params: Parameters,
@@ -367,7 +389,7 @@ impl Bench {
         mut params: Parameters,
         settings: Settings,
         controls: Controls,
-        model: ScratchModel,
+        mut model: ScratchModel,
     ) -> Self {
         let rate = rate.max(8000);
         let range = (model.idle_rpm, model.redline_rpm);
@@ -375,20 +397,50 @@ impl Bench {
             params.rpm = range.0;
             params.load = 0.1;
         }
-        let engine = Hybrid::from_scratch(rate, params, settings, model);
+        let physical = model.physical.take();
+        let engine = if physical.is_some() {
+            // A cheap unused fallback keeps imported/reference handling intact.
+            // Physical scratch never calls its synthesis or procedural grid.
+            Hybrid::new(rate, params, settings, None)
+        } else {
+            Hybrid::from_scratch(rate, params, settings, model)
+        };
         let mut bench = Self::with_engine(engine, rate, params, settings, controls, range);
+        bench.physical = physical;
         bench.listener = Some(Listener::new(rate));
         bench.beamng_camera = BeamNgCamera::Orbit;
         bench
     }
     /// See `Hybrid::swap_scratch`; also moves the simulator's RPM limits.
-    pub fn swap_scratch(&mut self, model: ScratchModel) -> Option<ScratchVoice> {
+    pub fn swap_scratch(&mut self, mut model: ScratchModel) -> Option<ScratchVoice> {
         self.sim.set_range(model.idle_rpm, model.redline_rpm);
         self.max = model.redline_rpm;
+        self.physical_idle_rpm = model.idle_rpm;
+        if let (Some(current), Some(prepared)) = (&mut self.physical, &mut model.physical)
+            && current.apply_sound_tuning(prepared)
+        {
+            // Includes all archived descriptor/synth/duct allocations, not just
+            // the unused physical engine. Ownership returns to the UI trash.
+            return Some(ScratchVoice::Prepared {
+                physical: model.physical,
+                descriptors: model.descriptors,
+                synth: model.synth,
+                exhaust: model.exhaust,
+            });
+        }
+        if let Some(physical) = model.physical.take() {
+            let retired = self.outgoing_physical.take().map(ScratchVoice::Physical);
+            self.outgoing_physical = self.physical.replace(physical);
+            self.physical_fade = 0.;
+            self.physics_accumulator = self.rate;
+            return retired;
+        }
         self.engine.swap_scratch(model)
     }
     pub fn take_retired(&mut self) -> Option<ScratchVoice> {
-        self.engine.take_retired()
+        self.retired_physical
+            .take()
+            .or_else(|| self.engine.take_retired())
     }
     fn with_engine(
         engine: Hybrid,
@@ -400,6 +452,13 @@ impl Bench {
     ) -> Self {
         Self {
             engine,
+            physical: None,
+            outgoing_physical: None,
+            retired_physical: None,
+            physical_commands: PhysicalCommands::default(),
+            physical_fade: 1.,
+            physical_gain: 0.,
+            physical_idle_rpm: min,
             listener: None,
             sim: Simulator::new(min, max, controls),
             params,
@@ -434,6 +493,12 @@ impl Bench {
             self.sim.reset(c);
             self.frames = 0;
             self.physics_accumulator = self.rate;
+            if let Some(physical) = &mut self.physical {
+                physical.reset();
+            }
+            if let Some(outgoing) = &mut self.outgoing_physical {
+                outgoing.reset();
+            }
         }
         self.params = p;
         self.settings = h;
@@ -446,6 +511,9 @@ impl Bench {
         }
     }
     pub fn next(&mut self, playing: bool) -> f32 {
+        if self.physical.is_some() {
+            return self.next_physical(playing);
+        }
         if playing {
             if self.physics_accumulator >= self.rate {
                 self.physics_accumulator -= self.rate;
@@ -489,15 +557,131 @@ impl Bench {
         } else {
             State::default()
         };
-        state.rpm = self.engine.rpm();
-        state.load = self.engine.load();
+        if let Some(physical) = &self.physical {
+            let sample = physical.state();
+            state.rpm = sample.rpm as f32;
+            state.load = (sample.map_pa / 101325.).clamp(0., 1.) as f32;
+        } else {
+            state.rpm = self.engine.rpm();
+            state.load = self.engine.load();
+        }
         state
+    }
+
+    pub fn failed(&self) -> bool {
+        self.physical.as_ref().is_some_and(|engine| engine.failed())
+    }
+
+    fn next_physical(&mut self, playing: bool) -> f32 {
+        if playing {
+            if self.physics_accumulator >= self.rate {
+                self.physics_accumulator -= self.rate;
+                let physical = self.physical.as_ref().expect("physical branch");
+                self.physical_commands = match self.controls.mode {
+                    Mode::Direct => PhysicalCommands {
+                        imposed_rpm: Some(self.params.rpm as f64),
+                        throttle: self.params.load as f64,
+                        load_nm: 0.,
+                        overrun: self.settings.fuel_cut as f64,
+                        starter: false,
+                        ac: self.settings.accessory_ac,
+                        steering: self.settings.accessory_steering,
+                    },
+                    Mode::Cycle => {
+                        let p = audition(
+                            (self.frames as f32 / self.rate as f32 * 16. / self.cycle_seconds)
+                                % 16.,
+                            self.params,
+                            self.max,
+                        );
+                        PhysicalCommands {
+                            imposed_rpm: Some(p.rpm as f64),
+                            throttle: p.load as f64,
+                            load_nm: 0.,
+                            overrun: self.settings.fuel_cut as f64,
+                            starter: false,
+                            ac: self.settings.accessory_ac,
+                            steering: self.settings.accessory_steering,
+                        }
+                    }
+                    Mode::Simulated => {
+                        let c = Controls {
+                            inertia: physical.inertia() as f32,
+                            ..self.controls
+                        };
+                        let (_, load_nm, throttle) =
+                            self.sim.step_physical(c, physical.state().rpm as f32);
+                        PhysicalCommands {
+                            imposed_rpm: None,
+                            throttle: throttle as f64,
+                            load_nm,
+                            overrun: self.settings.fuel_cut as f64,
+                            starter: self.settings.starter,
+                            ac: self.settings.accessory_ac,
+                            steering: self.settings.accessory_steering,
+                        }
+                    }
+                };
+            }
+            self.physics_accumulator += TICK_RATE;
+            self.frames += 1;
+        }
+        self.physical_gain += ((if playing { self.params.volume } else { 0. })
+            - self.physical_gain)
+            / (self.rate as f32 * 0.025);
+        let mut sample = PhysicalSample::default();
+        if playing || self.physical_gain > 1e-6 {
+            sample = self
+                .physical
+                .as_mut()
+                .expect("physical branch")
+                .next(self.physical_commands);
+            if let Some(outgoing) = &mut self.outgoing_physical {
+                let old = outgoing.next(self.physical_commands);
+                self.physical_fade = (self.physical_fade + 1. / (self.rate as f32 * 0.030)).min(1.);
+                let mix = self.physical_fade;
+                sample.exhaust = old.exhaust + (sample.exhaust - old.exhaust) * mix;
+                sample.intake = old.intake + (sample.intake - old.intake) * mix;
+                sample.mechanical = old.mechanical + (sample.mechanical - old.mechanical) * mix;
+                if mix >= 1. {
+                    self.retired_physical =
+                        self.outgoing_physical.take().map(ScratchVoice::Physical);
+                }
+            }
+        }
+        let idle_weight = (2. - sample.rpm as f32 / self.physical_idle_rpm.max(1.)).clamp(0., 1.);
+        let gain = self.physical_gain * (1. + (self.settings.idle_gain - 1.) * idle_weight);
+        let exhaust = sample.exhaust * self.params.exhaust * gain;
+        let engine = (sample.intake * self.params.intake
+            + sample.mechanical * self.params.mechanical)
+            * self.settings.engine_gain
+            * gain;
+        let stems = HybridStems {
+            exhaust,
+            engine,
+            mixed: exhaust + engine * 0.25,
+            source_reference: 0.,
+        };
+        self.listener
+            .as_mut()
+            .expect("scratch listener")
+            .next(self.beamng_camera, stems)
     }
 }
 
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn scratch_ground_reflection_keeps_its_delay_at_double_device_rates() {
+        for rate in [88_200, 96_000, 384_000] {
+            let listener = Listener::new(rate);
+            let delay_s = listener.ground_delay as f64 / rate as f64;
+            assert!((delay_s - 0.00028).abs() <= 0.5 / rate as f64);
+            assert!(listener.ground_delay < listener.ground.len());
+        }
+    }
 
     #[test]
     fn two_emitter_preview_uses_export_load_targets_and_gain_cap() {

@@ -130,7 +130,11 @@ impl ProceduralBank {
                         (pulse_width_ms * pressure_duration_scale(bass_share)).min(4.8);
                     let tilt = |band: usize| db(spec.brightness * 12. * (band as f32 - 3.) / 3.);
                     let tone_gain: [f32; BANDS] = std::array::from_fn(|band| {
-                        let rasp = if band >= 4 { 1. + spec.rasp * load * 1.5 } else { 1. };
+                        let rasp = if band >= 4 {
+                            1. + spec.rasp * load * 1.5
+                        } else {
+                            1.
+                        };
                         (tilt(band) * rasp * db(spec.tone_db[layer][band])).clamp(0.15, 7.)
                     });
                     let (_, mixed_rms, _) = pulse_bands(
@@ -148,7 +152,12 @@ impl ProceduralBank {
                             * db(spec.noise_db[layer][band])
                     });
                     noise_color[0] *= 0.3;
-                    let norm = noise_color.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                    let norm = noise_color
+                        .iter()
+                        .map(|x| x * x)
+                        .sum::<f32>()
+                        .sqrt()
+                        .max(1e-6);
                     noise_color = noise_color.map(|x| x / norm);
                     Descriptor {
                         rpm,
@@ -697,6 +706,8 @@ fn white_band_reference(rate: f32) -> [f32; BANDS] {
 #[derive(Clone, Copy, Debug)]
 pub struct ProceduralStems {
     pub exhaust_tone: f32,
+    /// Separate transient so replacing pressure pulses cannot erase afterfire.
+    pub afterfire: f32,
     pub exhaust_texture: f32,
     pub intake: f32,
     pub mechanical: f32,
@@ -824,15 +835,17 @@ impl LifeState {
         let n = self.life.cylinders.max(1) as f32;
         let idle = self.life.idle_rpm;
         // ±1–4 % for a 4-cylinder at idle, less with more cylinders, inertia or speed.
-        self.ripple = (0.025 * (4. / n).powf(1.2) * (idle / rpm).powi(2) * (0.22 / self.life.inertia))
-            .min(0.05);
+        self.ripple =
+            (0.025 * (4. / n).powf(1.2) * (idle / rpm).powi(2) * (0.22 / self.life.inertia))
+                .min(0.05);
         self.speed_deviation *= self.speed_decay;
         self.hunt[0] += (noise - self.hunt[0]) * self.hunt_coefficient;
         self.hunt[1] += (self.hunt[0] - self.hunt[1]) * self.hunt_coefficient;
         // ±5–15 rpm modern, up to ±60 rpm with a race cam, only near idle.
         let hunt_rpm = (8. + 60. * self.life.cam * self.life.cam) * self.hunt[1] * 25.;
         let hunt = hunt_rpm / rpm * self.idle_weight(rpm, load);
-        let firing_ripple = self.ripple * (2. * PI * (phase - 0.15)).sin() * (1. - self.motoring * 0.6);
+        let firing_ripple =
+            self.ripple * (2. * PI * (phase - 0.15)).sin() * (1. - self.motoring * 0.6);
         self.speed_factor = (1. + self.speed_deviation + firing_ripple + hunt).clamp(0.85, 1.15);
     }
 }
@@ -939,7 +952,8 @@ impl ProceduralVoice {
     pub fn set_firing(&mut self, firing: crate::scratch::Firing) {
         let n = firing.events.clamp(1, 12);
         let mut order: [u8; 12] = std::array::from_fn(|k| k as u8);
-        order[..n].sort_by(|&a, &b| firing.angles[a as usize].total_cmp(&firing.angles[b as usize]));
+        order[..n]
+            .sort_by(|&a, &b| firing.angles[a as usize].total_cmp(&firing.angles[b as usize]));
         self.schedule = Some(Schedule {
             cylinders: n,
             fractions: std::array::from_fn(|k| firing.angles[order[k] as usize] / 720.),
@@ -963,12 +977,20 @@ impl ProceduralVoice {
                 } else {
                     (k - 1, s.fractions[k - 1], whole as i64)
                 };
-                (turn * n as i64 + k as i64, (position - start) * n as f32, s.cylinder[k] as usize)
+                (
+                    turn * n as i64 + k as i64,
+                    (position - start) * n as f32,
+                    s.cylinder[k] as usize,
+                )
             }
             _ => {
                 let x = cycle * n as f64;
                 let event = x.floor();
-                (event as i64, (x - event) as f32, (event as i64).rem_euclid(n as i64) as usize)
+                (
+                    event as i64,
+                    (x - event) as f32,
+                    (event as i64).rem_euclid(n as i64) as usize,
+                )
             }
         }
     }
@@ -1026,7 +1048,8 @@ impl ProceduralVoice {
             // the global crank phase or discontinuously cutting off a pulse.
             let (bank_gain, bank_delay) = self.schedule.map_or((1., 0.), |s| {
                 let bank = s.firing.banks[cylinder].min(1) as usize;
-                let intervals = s.firing.bank_delay_ms[bank] * 0.001 * rpm * self.cylinders as f32 / 120.;
+                let intervals =
+                    s.firing.bank_delay_ms[bank] * 0.001 * rpm * self.cylinders as f32 / 120.;
                 // A pulse must start before the next event replaces it.
                 (s.firing.bank_gain[bank], intervals.min(0.5))
             });
@@ -1035,14 +1058,17 @@ impl ProceduralVoice {
                 let weakness = 1. - life.strength;
                 // Late heat release keeps blowdown pressure: a weak burn costs
                 // torque (above) far more than exhaust level, and widens the pulse.
-                self.event_gain = life.cylinder_gain[cylinder] * bank_gain * (1. - 0.45 * weakness)
+                self.event_gain = life.cylinder_gain[cylinder]
+                    * bank_gain
+                    * (1. - 0.45 * weakness)
                     * (1. + 0.15 * life.retard);
                 // Throttled blowdown is lower and rounder (rise 20–40° at idle).
-                self.event_width = (1. + 0.9 * weakness + 0.4 * life.retard) * (1. + 0.35 * (1. - load));
-                self.event_delay = (0.012 + life.cylinder_offset[cylinder]
-                    + 0.004 * gaussian(&mut life.rng))
-                .max(0.)
-                    + bank_delay;
+                self.event_width =
+                    (1. + 0.9 * weakness + 0.4 * life.retard) * (1. + 0.35 * (1. - load));
+                self.event_delay =
+                    (0.012 + life.cylinder_offset[cylinder] + 0.004 * gaussian(&mut life.rng))
+                        .max(0.)
+                        + bank_delay;
                 let redline = life.life.redline_rpm;
                 if life.pop_chance > 0.
                     && (0.3 * redline..0.75 * redline).contains(&rpm)
@@ -1120,16 +1146,17 @@ impl ProceduralVoice {
             sine = sine * base_cosine + cosine * base_sine;
             cosine = next_cosine;
         }
-        let mut resonant = tonal
+        let resonant = tonal
             + self.low_resonator.next_sample(tonal) * 0.075
             + self.mid_resonator.next_sample(tonal) * 0.04;
+        let mut afterfire = 0.;
         if let Some(life) = &mut self.life
             && life.pop > 1e-4
         {
             // Afterfire: a steep, dull burst (not a click) at the header entry;
             // the exhaust network gives it its body.
             let burst = life.pop_body.next_sample(xorshift(&mut life.rng));
-            resonant += life.pop * burst * descriptor.source_rms * 12.;
+            afterfire = life.pop * burst * descriptor.source_rms * 12.;
             life.pop *= life.pop_decay;
         }
 
@@ -1191,10 +1218,12 @@ impl ProceduralVoice {
         let mut detail = 0.;
         // Suction peaks mid intake stroke (~450° after firing), at a
         // strength set by manifold pressure, which collapses on overrun.
-        let valve_events = self
-            .life
-            .is_some()
-            .then(|| (self.event_at(cycle - 450. / 720.), self.event_at(cycle - 360. / 720.)));
+        let valve_events = self.life.is_some().then(|| {
+            (
+                self.event_at(cycle - 450. / 720.),
+                self.event_at(cycle - 360. / 720.),
+            )
+        });
         if let (Some(life), Some(((_, suction_phase, _), (_, overlap_phase, overlap_cylinder)))) =
             (&mut self.life, valve_events)
         {
@@ -1252,10 +1281,13 @@ impl ProceduralVoice {
                 } else {
                     0.
                 };
-                let ticks = life.tick_high.next_sample(xorshift(&mut life.rng) * life.click);
+                let ticks = life
+                    .tick_high
+                    .next_sample(xorshift(&mut life.rng) * life.click);
                 life.click *= life.click_decay;
                 // At a DI idle the fuel system outweighs valvetrain and combustion.
-                detail += (ticks * 0.6 + life.pump.next_sample(kick) * 0.25) * descriptor.source_rms;
+                detail +=
+                    (ticks * 0.6 + life.pump.next_sample(kick) * 0.25) * descriptor.source_rms;
             }
             let noise = xorshift(&mut life.rng);
             life.advance(rpm, load, event_phase, noise);
@@ -1282,6 +1314,7 @@ impl ProceduralVoice {
         );
         ProceduralStems {
             exhaust_tone: resonant,
+            afterfire,
             exhaust_texture,
             intake,
             mechanical,

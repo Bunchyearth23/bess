@@ -50,7 +50,7 @@ impl Parameters {
             ("Brightness", self.brightness, 200., 10000.),
             ("Resonance", self.resonance, 0.5, 4.),
             ("Length", self.pipe_length, 0.2, 5.),
-            ("Volume", self.volume, 0., 0.8),
+            ("Volume", self.volume, 0., 1.),
         ] {
             if !v.is_finite() || v < min || v > max {
                 return Err(format!("{name} out of range"));

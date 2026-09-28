@@ -159,6 +159,8 @@ pub struct ExhaustNetwork {
     forward_in: Vec<Vec<f32>>,
     backward_in: Vec<Vec<f32>>,
     arrivals: Vec<Vec<(f32, f32)>>,
+    arrivals_prepared: bool,
+    chamber_length_scale: f32,
 }
 
 impl ExhaustNetwork {
@@ -183,7 +185,14 @@ impl ExhaustNetwork {
         let chamber = |ratio: f32, scales: &[f32], packing: f32| -> Vec<Segment> {
             scales
                 .iter()
-                .map(|&k| segment(Role::Chamber(k), pipe * ratio / scales.len() as f32, 0.5, packing))
+                .map(|&k| {
+                    segment(
+                        Role::Chamber(k),
+                        pipe * ratio / scales.len() as f32,
+                        0.5,
+                        packing,
+                    )
+                })
                 .collect()
         };
         match layout.muffler {
@@ -198,6 +207,8 @@ impl ExhaustNetwork {
             forward_in: shape(&stages),
             backward_in: shape(&stages),
             arrivals: stages.iter().map(|s| vec![(0., 0.); s.len()]).collect(),
+            arrivals_prepared: false,
+            chamber_length_scale: 1.,
             stages,
             rate,
             inlet_reflection: 0.4,
@@ -206,6 +217,16 @@ impl ExhaustNetwork {
         };
         this.tune(g, true);
         this
+    }
+    /// Additional acoustic chamber scaling, applied after the legacy geometry
+    /// bounds. A value of one preserves existing callers exactly. Call `tune`
+    /// afterwards to retarget lengths without clearing propagation state.
+    pub fn set_chamber_length_scale(&mut self, scale: f32) {
+        self.chamber_length_scale = if scale.is_finite() {
+            scale.clamp(0.25, 3.)
+        } else {
+            1.
+        };
     }
     pub fn tune(&mut self, g: Geometry, initial: bool) {
         self.inlet_reflection = 0.1 + (g.resonance - 0.5) / 3.5 * 0.48;
@@ -220,7 +241,7 @@ impl ExhaustNetwork {
                 let length = match s.role {
                     Role::Header => g.header,
                     Role::Fixed(length) => length,
-                    Role::Chamber(scale) => volume_length * scale,
+                    Role::Chamber(scale) => volume_length * scale * self.chamber_length_scale,
                     // Unflanged end correction 0.6133·a.
                     Role::Tail => g.tail + 0.6133 * radius,
                 };
@@ -243,14 +264,35 @@ impl ExhaustNetwork {
         let corner = 0.58 * tail_speed / (std::f32::consts::TAU * radius);
         self.end_coefficient = 1. - (-std::f32::consts::TAU * corner / self.rate).exp();
     }
-    pub fn next(&mut self, excitation: f32) -> f32 {
-        for (stage, arrivals) in self.stages.iter_mut().zip(&mut self.arrivals) {
-            for (s, a) in stage.iter_mut().zip(arrivals.iter_mut()) {
-                *a = s.tube.arrivals();
+    /// Most recently prepared inlet wave. Coupled callers must prepare the
+    /// current sample before scattering at their external junction.
+    pub fn inlet_wave(&self) -> f32 {
+        self.arrivals[0][0].1
+    }
+    /// Read/filter every arriving wave once for the current sample, before an
+    /// external junction computes its outgoing wave. Repeated preparation is
+    /// idempotent until `next_coupled` (or `next`) launches and consumes it.
+    pub fn prepare_inlet(&mut self) -> f32 {
+        if !self.arrivals_prepared {
+            for (stage, arrivals) in self.stages.iter_mut().zip(&mut self.arrivals) {
+                for (s, a) in stage.iter_mut().zip(arrivals.iter_mut()) {
+                    *a = s.tube.arrivals();
+                }
             }
+            self.arrivals_prepared = true;
         }
+        self.inlet_wave()
+    }
+    pub fn next_coupled(&mut self, excitation: f32) -> f32 {
+        self.step_boundary(excitation, 0.)
+    }
+    pub fn next(&mut self, excitation: f32) -> f32 {
+        self.step_boundary(excitation, self.inlet_reflection)
+    }
+    fn step_boundary(&mut self, excitation: f32, inlet_reflection: f32) -> f32 {
+        self.prepare_inlet();
         // Source end: the valve side reflects part of the returning wave.
-        self.forward_in[0][0] = excitation + self.arrivals[0][0].1 * self.inlet_reflection;
+        self.forward_in[0][0] = excitation + self.arrivals[0][0].1 * inlet_reflection;
         for k in 0..self.stages.len() - 1 {
             let (mut flux, mut admittance) = (0., 0.);
             for (s, a) in self.stages[k].iter().zip(&self.arrivals[k]) {
@@ -279,6 +321,7 @@ impl ExhaustNetwork {
                 s.tube.launch(self.forward_in[k][i], self.backward_in[k][i]);
             }
         }
+        self.arrivals_prepared = false;
         outgoing - self.end_state
     }
 }
@@ -316,6 +359,103 @@ impl Intake {
 mod tests {
     use super::*;
     #[test]
+    fn chamber_scaling_is_continuous_past_legacy_bounds_without_reset() {
+        for diameter_mm in [35., 100.] {
+            let g = Geometry {
+                header: 0.05,
+                tail: 1.4,
+                diameter_mm,
+                chamber_litres: 6.,
+                absorption: 0.4,
+                resonance: 1.,
+                temperature_c: 400.,
+            };
+            let mut network = ExhaustNetwork::new(
+                48000.,
+                g,
+                ExhaustLayout {
+                    catalyst: true,
+                    muffler: 2,
+                },
+            );
+            for i in 0..1000 {
+                network.next(if i == 0 { 0.01 } else { 0. });
+            }
+            let mut previous_target = 0.;
+            for factor in [0.25, 0.26, 0.5, 0.51, 1., 1.01, 2.99, 3.] {
+                let delay = network.stages[4][0].tube.delay;
+                let end_state = network.end_state;
+                network.set_chamber_length_scale(factor);
+                network.tune(g, false);
+                let target = network.stages[4][0].tube.target_delay;
+                assert!(
+                    target > previous_target,
+                    "{diameter_mm} mm, factor {factor}"
+                );
+                assert_eq!(network.stages[4][0].tube.delay, delay);
+                assert_eq!(network.end_state, end_state);
+                previous_target = target;
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_external_reflection_matches_standalone_without_double_advance() {
+        let geometry = Geometry {
+            header: 0.05,
+            tail: 1.4,
+            diameter_mm: 55.,
+            chamber_litres: 6.,
+            absorption: 0.4,
+            resonance: 1.2,
+            temperature_c: 400.,
+        };
+        for rate in [48_000., 96_000.] {
+            let mut g = geometry;
+            let layout = ExhaustLayout {
+                catalyst: true,
+                muffler: 2,
+            };
+            let mut standalone = ExhaustNetwork::new(rate, g, layout);
+            let mut coupled = ExhaustNetwork::new(rate, g, layout);
+            let (mut early, mut late) = (0_f64, 0_f64);
+            let mut nonzero_return = false;
+            for frame in 0..rate as usize {
+                if frame == 200 {
+                    // Delay slewing and stateful loss filters must also advance
+                    // exactly once, even if a caller inspects the port twice.
+                    g.temperature_c = 550.;
+                    standalone.tune(g, false);
+                    coupled.tune(g, false);
+                }
+                let source = if frame < 100 {
+                    (frame as f32 * 0.37).sin() * 0.01
+                } else {
+                    0.
+                };
+                let incoming = coupled.prepare_inlet();
+                nonzero_return |= incoming.abs() > 1e-8;
+                assert_eq!(incoming.to_bits(), coupled.prepare_inlet().to_bits());
+                let expected = standalone.next(source);
+                let actual = coupled.next_coupled(source + incoming * coupled.inlet_reflection);
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "frame {frame}, rate {rate}"
+                );
+                assert!(actual.is_finite());
+                if frame < rate as usize / 4 {
+                    early += f64::from(actual).powi(2);
+                }
+                if frame > rate as usize * 3 / 4 {
+                    late += f64::from(actual).powi(2);
+                }
+            }
+            assert!(nonzero_return && early > 0.);
+            assert!(late < early * 1e-6, "tail failed to decay: {late}/{early}");
+        }
+    }
+    #[test]
     fn junction_conserves_energy_for_different_pipe_areas() {
         for w in [0.001, 0.02, 0.1, 0.5, 0.9, 0.999] {
             for (a, b) in [(1., 0.), (0., 1.), (-0.4, 0.7)] {
@@ -338,7 +478,14 @@ mod tests {
             temperature_c: 600.,
         };
         let energy = |muffler: u8, freq: f32| {
-            let mut line = ExhaustNetwork::new(48_000., g, ExhaustLayout { catalyst: true, muffler });
+            let mut line = ExhaustNetwork::new(
+                48_000.,
+                g,
+                ExhaustLayout {
+                    catalyst: true,
+                    muffler,
+                },
+            );
             let mut out = 0f32;
             for i in 0..48_000 {
                 let x = (std::f32::consts::TAU * freq * i as f32 / 48_000.).sin();
@@ -357,8 +504,19 @@ mod tests {
         }
         assert!(energy(3, 3000.) < energy(0, 3000.) * 0.5);
         // An impulse dies away (no unstable loop through the junctions).
-        let mut line = ExhaustNetwork::new(48_000., g, ExhaustLayout { catalyst: true, muffler: 3 });
-        let tail: f32 = (0..96_000).map(|i| line.next(f32::from(i == 0))).skip(72_000).map(|y| y * y).sum();
+        let mut line = ExhaustNetwork::new(
+            48_000.,
+            g,
+            ExhaustLayout {
+                catalyst: true,
+                muffler: 3,
+            },
+        );
+        let tail: f32 = (0..96_000)
+            .map(|i| line.next(f32::from(i == 0)))
+            .skip(72_000)
+            .map(|y| y * y)
+            .sum();
         assert!(tail < 1e-6, "{tail}");
     }
     #[test]
@@ -373,7 +531,14 @@ mod tests {
             temperature_c: 400.,
         };
         let gain = |freq: f32| {
-            let mut line = ExhaustNetwork::new(48_000., g, ExhaustLayout { catalyst: false, muffler: 0 });
+            let mut line = ExhaustNetwork::new(
+                48_000.,
+                g,
+                ExhaustLayout {
+                    catalyst: false,
+                    muffler: 0,
+                },
+            );
             let (mut input, mut output) = (0f32, 0f32);
             for i in 0..48_000 * 2 {
                 let x = (std::f32::consts::TAU * freq * i as f32 / 48_000.).sin();
@@ -387,7 +552,12 @@ mod tests {
             (output / input).sqrt()
         };
         // Radiation efficiency rises with frequency (ka ≪ 1 radiates poorly).
-        assert!(gain(2500.) > gain(60.) * 2., "{} vs {}", gain(2500.), gain(60.));
+        assert!(
+            gain(2500.) > gain(60.) * 2.,
+            "{} vs {}",
+            gain(2500.),
+            gain(60.)
+        );
     }
     #[test]
     fn acoustic_tail_decays_at_extreme_geometries_and_device_rates() {

@@ -377,8 +377,9 @@ impl Synth {
     pub fn new(rate: u32, config: Config, commands: Commands) -> Result<Self, String> {
         config.validate()?;
         commands.validate()?;
-        if !(8_000..=192_000).contains(&rate) {
-            return Err("sample rate must be 8–192 kHz".into());
+        // The listening worker oversamples 192 kHz devices at 2× internally.
+        if !(8_000..=384_000).contains(&rate) {
+            return Err("internal sample rate must be 8–384 kHz".into());
         }
         let cylinders = (0..config.cylinders.len())
             .map(|_| CylinderState {

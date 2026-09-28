@@ -63,14 +63,17 @@ mod tests {
         let mut spectrum = Spectrum::new(48_000.);
         let target = 120;
         let hz = bin_hz(target);
-        let block: [f32; WINDOW] = std::array::from_fn(|i| {
-            0.5 * (std::f32::consts::TAU * hz * i as f32 / 48_000.).sin()
-        });
+        let block: [f32; WINDOW] =
+            std::array::from_fn(|i| 0.5 * (std::f32::consts::TAU * hz * i as f32 / 48_000.).sin());
         for _ in 0..40 {
             spectrum.update(&block);
         }
         let loudest = (0..BINS).max_by(|&a, &b| spectrum.db[a].total_cmp(&spectrum.db[b]));
         assert_eq!(loudest, Some(target));
-        assert!((spectrum.db[target] - 20. * 0.5f32.log10()).abs() < 1., "{}", spectrum.db[target]);
+        assert!(
+            (spectrum.db[target] - 20. * 0.5f32.log10()).abs() < 1.,
+            "{}",
+            spectrum.db[target]
+        );
     }
 }

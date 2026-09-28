@@ -70,11 +70,31 @@ pub fn scratch_wav(
     seconds: f32,
     driving: Controls,
 ) -> Result<(), String> {
-    let samples = render_bench(params, settings, seconds, driving, |params| {
-        let model = crate::scratch::ScratchModel::build(scratch, 48000)?;
-        Ok(Bench::from_scratch(48000, params, settings, driving, model))
-    })?;
+    let samples = scratch_samples(params, settings, scratch, seconds, driving)?;
     write_pcm(path, &samples)
+}
+/// Scratch uses exactly the same 2x synthesis and decimation as live audio.
+/// The final 50 ms file fade is presentation only, applied after that shared path.
+pub fn scratch_samples(
+    params: Parameters,
+    settings: Settings,
+    scratch: &crate::scratch::Scratch,
+    seconds: f32,
+    driving: Controls,
+) -> Result<Vec<f32>, String> {
+    let _denormals = crate::realtime::DenormalGuard::enter();
+    if !seconds.is_finite() || !(1.0..=60.0).contains(&seconds) {
+        return Err("Duration: 1–60 seconds".into());
+    }
+    let mut engine =
+        crate::realtime::RenderEngine::scratch(48000, params, settings, driving, scratch)?;
+    engine.bench.set_cycle_seconds(seconds);
+    let frames = (seconds * 48000.) as usize;
+    let mut samples = Vec::with_capacity(frames);
+    for i in 0..frames {
+        samples.push(engine.next_sample(true) * ((frames - i) as f32 / 2400.).min(1.));
+    }
+    Ok(samples)
 }
 fn render_bench(
     params: Parameters,

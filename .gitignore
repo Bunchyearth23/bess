@@ -1,6 +1,7 @@
 /target/
 /.inspect-bdsp/
 /output/
+/outputs/physical-*/
 /dist/
 /*.zip
 

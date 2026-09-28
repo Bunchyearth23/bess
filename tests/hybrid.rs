@@ -589,7 +589,13 @@ fn every_exposed_hybrid_control_affects_the_audio() {
         ),
         ("airbox", Settings { airbox: 1., ..h }),
         ("fuel_cut", Settings { fuel_cut: 1., ..h }),
-        ("idle_gain", Settings { idle_gain: 0.2, ..h }),
+        (
+            "idle_gain",
+            Settings {
+                idle_gain: 0.2,
+                ..h
+            },
+        ),
     ] {
         let audio = render::hybrid_samples(params(), variant, bank.clone(), 3., true).unwrap();
         let diff = rms_diff(&baseline, &audio);

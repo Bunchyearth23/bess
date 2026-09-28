@@ -1,9 +1,8 @@
 //! Engines designed from scratch, without an Automation sound bank.
 //!
-//! Two recording-free voices share the bench, driving model and WAV export:
-//! the experimental descriptor voice, fed a descriptor grid generated from the
-//! controls below instead of one measured from a ZIP, and the standalone
-//! four-stroke event synth. Neither claims to model a specific real engine.
+//! The physical engine shares the bench, driving model and WAV export.
+//! Legacy event data remain readable for project migration and offline reference
+//! comparisons; they do not supply the playable physical engine's sound.
 use crate::{
     drive::Controls,
     engine_build::{Aspiration, EngineBuild, Fuel, Head, Headers, Muffler, Throttle},
@@ -16,17 +15,17 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub const BANDS: usize = 7;
-/// Broad band centres shown for the advanced tone controls (Hz).
-pub const BAND_LABELS: [&str; BANDS] = ["<80", "80–200", "200–500", "0.5–1.2k", "1.2–2.5k", "2.5–5k", ">5k"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScratchEngine {
-    Experimental,
+    // Read old projects into the remaining voice; never write the retired name.
+    #[serde(alias = "experimental")]
     Standalone,
 }
 
-/// Macro controls that generate the experimental voice's RPM × load grid.
+/// Supporting texture and level grid. The legacy name is kept for project
+/// compatibility; it no longer identifies a selectable scratch voice.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalSpec {
@@ -151,6 +150,10 @@ pub struct EngineDesign {
     pub pins: [f32; 12],
     /// Bank of each cylinder (0 or 1).
     pub banks: [u8; 12],
+    /// Mechanical cam revolution, independent of the electrical firing order.
+    /// Missing in old projects: infer once from their original event schedule.
+    #[serde(default)]
+    pub cam_revolutions: Option<[bool; 12]>,
     /// Firing sequence of 1-based cylinder numbers; `order_len` are used.
     pub firing_order: [u8; 12],
     pub order_len: u8,
@@ -166,18 +169,29 @@ impl Default for EngineDesign {
     }
 }
 
-const fn design(layout: Layout, cylinders: u32, bank_angle: f32, crank: Crank, order: &[u8]) -> EngineDesign {
+const fn design(
+    layout: Layout,
+    cylinders: u32,
+    bank_angle: f32,
+    crank: Crank,
+    order: &[u8],
+) -> EngineDesign {
     let n = cylinders as usize;
     let mut firing_order = [0; 12];
     let mut banks = [0; 12];
     let mut pins = [0.; 12];
+    let mut cam_revolutions = [false; 12];
     let pairs = if n / 2 > 1 { n / 2 } else { 1 };
     let mut k = 0;
     while k < order.len() {
         firing_order[k] = order[k];
         let i = order[k] as usize - 1;
         // Odd-numbered cylinders on bank 1, even on bank 2.
-        let bank = if matches!(layout, Layout::Inline) { 0 } else { (i % 2) as u8 };
+        let bank = if matches!(layout, Layout::Inline) {
+            0
+        } else {
+            (i % 2) as u8
+        };
         banks[i] = bank;
         let angle = match crank {
             Crank::Even => k as f32 * 720. / n as f32,
@@ -195,6 +209,7 @@ const fn design(layout: Layout, cylinders: u32, bank_angle: f32, crank: Crank, o
             pin -= 360.;
         }
         pins[i] = pin;
+        cam_revolutions[i] = angle >= 360.;
         k += 1;
     }
     EngineDesign {
@@ -203,6 +218,7 @@ const fn design(layout: Layout, cylinders: u32, bank_angle: f32, crank: Crank, o
         bank_angle,
         pins,
         banks,
+        cam_revolutions: Some(cam_revolutions),
         firing_order,
         order_len: order.len() as u8,
         bank_gain_db: 0.,
@@ -228,12 +244,27 @@ pub const PRESETS: [(&str, EngineDesign); 14] = [
     ("Inline-5", design(Inline, 5, 0., Even, &[1, 2, 4, 5, 3])),
     ("Inline-6", design(Inline, 6, 0., Even, &[1, 5, 3, 6, 2, 4])),
     ("V6 60°", design(V, 6, 60., Even, &[1, 2, 3, 4, 5, 6])),
-    ("V6 90° odd-fire", design(V, 6, 90., SharedPin, &[1, 2, 3, 4, 5, 6])),
+    (
+        "V6 90° odd-fire",
+        design(V, 6, 90., SharedPin, &[1, 2, 3, 4, 5, 6]),
+    ),
     ("Flat-6", design(Flat, 6, 180., Even, &[1, 6, 2, 4, 3, 5])),
-    ("V8 cross-plane", design(V, 8, 90., Even, &[1, 8, 4, 3, 6, 5, 7, 2])),
-    ("V8 flat-plane", design(V, 8, 90., Even, &[1, 2, 3, 4, 5, 6, 7, 8])),
-    ("V10 72°", design(V, 10, 72., Even, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
-    ("V12 60°", design(V, 12, 60., Even, &[1, 12, 5, 8, 3, 10, 6, 7, 2, 11, 4, 9])),
+    (
+        "V8 cross-plane",
+        design(V, 8, 90., Even, &[1, 8, 4, 3, 6, 5, 7, 2]),
+    ),
+    (
+        "V8 flat-plane",
+        design(V, 8, 90., Even, &[1, 2, 3, 4, 5, 6, 7, 8]),
+    ),
+    (
+        "V10 72°",
+        design(V, 10, 72., Even, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+    ),
+    (
+        "V12 60°",
+        design(V, 12, 60., Even, &[1, 12, 5, 8, 3, 10, 6, 7, 2, 11, 4, 9]),
+    ),
 ];
 
 /// Firing events resolved from an `EngineDesign`, in firing-order sequence.
@@ -251,12 +282,28 @@ pub struct Firing {
 }
 
 impl EngineDesign {
+    /// Freeze migrated cam timing before changing spark wiring in the editor.
+    pub fn resolve_cam_revolutions(&mut self) {
+        if self.cam_revolutions.is_none() {
+            let firing = self.firing();
+            let mut revolutions = [false; 12];
+            for k in 0..firing.events {
+                revolutions[firing.cylinder[k] as usize] = firing.angles[k] >= 360.;
+            }
+            self.cam_revolutions = Some(revolutions);
+        }
+    }
+
     pub fn order(&self) -> &[u8] {
         &self.firing_order[..(self.order_len as usize).clamp(1, 12)]
     }
     /// Top dead centre of cylinder `i` within one crank revolution.
     pub fn tdc(&self, i: usize) -> f32 {
-        let offset = if self.banks[i] == 1 { self.bank_angle } else { 0. };
+        let offset = if self.banks[i] == 1 {
+            self.bank_angle
+        } else {
+            0.
+        };
         (self.pins[i] + offset).rem_euclid(360.)
     }
     /// Change the count: an evenly firing inline-style crank, sequential order.
@@ -279,10 +326,20 @@ impl EngineDesign {
         if !(1..=12).contains(&self.order_len) {
             return Err("The firing order needs 1 to 12 entries".into());
         }
-        if self.order().iter().any(|&c| c == 0 || c as u32 > self.cylinders) {
-            return Err(format!("Firing order entries must be cylinders 1–{}", self.cylinders));
+        if self
+            .order()
+            .iter()
+            .any(|&c| c == 0 || c as u32 > self.cylinders)
+        {
+            return Err(format!(
+                "Firing order entries must be cylinders 1–{}",
+                self.cylinders
+            ));
         }
-        if self.pins.iter().any(|p| !p.is_finite() || !(0.0..360.0).contains(p))
+        if self
+            .pins
+            .iter()
+            .any(|p| !p.is_finite() || !(0.0..360.0).contains(p))
             || self.banks.iter().any(|&b| b > 1)
         {
             return Err("Pin angles must be 0–360° and banks 1 or 2".into());
@@ -335,6 +392,89 @@ impl EngineDesign {
     }
 }
 
+/// Independent sound adjustments. Part changes preserve these user choices;
+/// missing fields in older projects use neutral settings.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundTuning {
+    pub bass_db: f32,
+    pub presence_db: f32,
+    pub treble_db: f32,
+    pub brightness_hz: f32,
+    pub drive: f32,
+    pub flow_texture: f32,
+    pub rpm_brightness_db: f32,
+    pub load_brightness_db: f32,
+    pub intake_length_m: f32,
+    pub intake_resonance: f32,
+    pub mechanical_pitch_hz: f32,
+    pub mechanical_resonance: f32,
+    pub cycle_variation: f32,
+    pub combustion_duration: f32,
+    pub ignition_retard_deg: f32,
+    pub primary_length_scale: f32,
+    pub tail_length_m: f32,
+    pub muffler_volume_scale: f32,
+    pub muffler_absorption: f32,
+}
+
+impl Default for SoundTuning {
+    fn default() -> Self {
+        Self {
+            bass_db: 0.,
+            presence_db: 0.,
+            treble_db: 0.,
+            brightness_hz: 20_000.,
+            drive: 0.,
+            flow_texture: 0.,
+            rpm_brightness_db: 0.,
+            load_brightness_db: 0.,
+            intake_length_m: 0.38,
+            intake_resonance: 0.,
+            mechanical_pitch_hz: 2400.,
+            mechanical_resonance: 2.,
+            cycle_variation: 1.,
+            combustion_duration: 1.,
+            ignition_retard_deg: 0.,
+            primary_length_scale: 1.,
+            tail_length_m: 1.4,
+            muffler_volume_scale: 1.,
+            muffler_absorption: 0.4,
+        }
+    }
+}
+
+impl SoundTuning {
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, value, min, max) in [
+            ("Bass", self.bass_db, -12., 12.),
+            ("Presence", self.presence_db, -12., 12.),
+            ("Treble", self.treble_db, -12., 12.),
+            ("Brightness", self.brightness_hz, 500., 20_000.),
+            ("Drive", self.drive, 0., 1.),
+            ("Flow texture", self.flow_texture, 0., 1.),
+            ("RPM brightness", self.rpm_brightness_db, -12., 12.),
+            ("Load brightness", self.load_brightness_db, -12., 12.),
+            ("Intake length", self.intake_length_m, 0.15, 1.5),
+            ("Intake resonance", self.intake_resonance, 0., 3.),
+            ("Mechanical pitch", self.mechanical_pitch_hz, 600., 6000.),
+            ("Mechanical resonance", self.mechanical_resonance, 0.5, 8.),
+            ("Cycle variation", self.cycle_variation, 0., 2.),
+            ("Combustion duration", self.combustion_duration, 0.5, 1.5),
+            ("Ignition retard", self.ignition_retard_deg, -20., 20.),
+            ("Primary length", self.primary_length_scale, 0.5, 2.),
+            ("Tailpipe length", self.tail_length_m, 0.2, 5.),
+            ("Muffler volume", self.muffler_volume_scale, 0.25, 3.),
+            ("Muffler absorption", self.muffler_absorption, 0., 1.),
+        ] {
+            if !value.is_finite() || !(min..=max).contains(&value) {
+                return Err(format!("{label}: expected {min}–{max}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scratch {
     pub engine: ScratchEngine,
@@ -351,15 +491,16 @@ pub struct Scratch {
     /// Rotating inertia (kg·m²) that turns combustion scatter into crank-speed ripple.
     #[serde(default = "default_inertia")]
     pub inertia: f32,
+    #[serde(default)]
+    pub sound: SoundTuning,
 }
 
 fn default_inertia() -> f32 {
     0.22
 }
 
-/// Scratch-only engine behaviour the descriptor voice needs at run time:
-/// combustion statistics, crank dynamics, valve events and overrun. Built
-/// engines get their own cylinder imbalance from `seed`.
+/// Design-derived behavior and deterministic seed. The archived event renderer
+/// also consumes these values for offline reference comparisons.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Life {
     pub seed: u64,
@@ -383,7 +524,7 @@ fn default_standalone() -> standalone::Config {
 impl Default for Scratch {
     fn default() -> Self {
         let mut scratch = Self {
-            engine: ScratchEngine::Experimental,
+            engine: ScratchEngine::Standalone,
             design: EngineDesign::default(),
             build: EngineBuild::default(),
             idle_rpm: 850.,
@@ -391,6 +532,7 @@ impl Default for Scratch {
             experimental: ExperimentalSpec::default(),
             standalone: default_standalone(),
             inertia: default_inertia(),
+            sound: SoundTuning::default(),
         };
         scratch.apply_design();
         scratch
@@ -398,6 +540,19 @@ impl Default for Scratch {
 }
 
 impl Scratch {
+    /// Whether a prepared model can update only sound controls without restarting
+    /// the running cylinders, crank or thermal state. Does not allocate.
+    pub fn same_engine_except_sound(&self, other: &Self) -> bool {
+        self.engine == other.engine
+            && self.design == other.design
+            && self.build == other.build
+            && self.idle_rpm == other.idle_rpm
+            && self.redline_rpm == other.redline_rpm
+            && self.experimental == other.experimental
+            && self.standalone == other.standalone
+            && self.inertia == other.inertia
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.design.validate()?;
         self.build.validate()?;
@@ -409,9 +564,12 @@ impl Scratch {
             || !(300.0..=2000.0).contains(&self.idle_rpm)
             || !(self.idle_rpm + 1000.0..=12_000.0).contains(&self.redline_rpm)
         {
-            return Err("Idle 300–2000 rpm; redline at least 1000 rpm above idle, up to 12000".into());
+            return Err(
+                "Idle 300–2000 rpm; redline at least 1000 rpm above idle, up to 12000".into(),
+            );
         }
         self.experimental.validate()?;
+        self.sound.validate()?;
         self.standalone.validate()
     }
     /// Derive every sound and bench setting from the built engine, as a
@@ -462,12 +620,14 @@ impl Scratch {
         e.level = ((0.035 + 0.05 * (1. - (-perf.displacement_l / 4.).exp())) * turbo_gain)
             .clamp(0.01, 0.3);
         e.body = (0.25 + 0.45 * (cylinder / 0.6)).clamp(0., 1.);
-        e.sharpness = (0.25 + 0.05 * (b.compression - 10.) + 0.25 * cam - 0.15 * turbo as u8 as f32)
+        e.sharpness = (0.25 + 0.05 * (b.compression - 10.) + 0.25 * cam
+            - 0.15 * turbo as u8 as f32)
             .clamp(0., 1.);
         e.brightness = (header_bright + muffler_bright + cat_bright + turbo_bright).clamp(-1., 1.);
         e.rasp = (0.2 + 0.3 * cam + if open_exhaust { 0.2 } else { 0. }).clamp(0., 1.);
-        e.flow = (0.25 + 0.15 * turbo as u8 as f32 + if b.muffler == Muffler::None { 0.1 } else { 0. })
-            .clamp(0., 1.);
+        e.flow =
+            (0.25 + 0.15 * turbo as u8 as f32 + if b.muffler == Muffler::None { 0.1 } else { 0. })
+                .clamp(0., 1.);
         e.crackle = (0.15 + 0.3 * cam + if open_exhaust { 0.15 } else { 0. }).clamp(0., 1.);
         // Valve overlap makes low-speed combustion irregular: the lumpy race idle.
         e.variation = (0.05 + 0.13 * cam).clamp(0., 0.25);
@@ -492,18 +652,45 @@ impl Scratch {
         };
         settings.roughness = (0.08 + 0.5 * cam).min(1.);
         settings.cycle_life = (0.35 + 0.4 * cam).min(1.);
-        settings.overrun = (0.1 + 0.3 * cam + if b.catalyst == Catalyst::None { 0.2 } else { 0. }).min(1.);
-        settings.fuel_cut = 0.5;
+        settings.overrun = (0.1
+            + 0.3 * cam
+            + if b.catalyst == Catalyst::None {
+                0.2
+            } else {
+                0.
+            })
+        .min(1.);
+        // Physical injection uses a complete fuel cut by default; the live
+        // control can retain fuel deliberately. Carburettors ignore DFCO.
+        settings.fuel_cut = 1.;
         self.inertia = perf.inertia.clamp(0.05, 2.);
         let itb = b.throttle == Throttle::Individual;
         settings.intake_length = if itb { 0.18 } else { 0.38 };
-        settings.airbox = if itb { 0.7 } else if b.fuel == Fuel::Carburettor { 0.5 } else { 0.3 };
-        settings.texture = if itb { 0.45 } else if b.fuel == Fuel::Carburettor { 0.35 } else { 0.2 };
+        settings.airbox = if itb {
+            0.7
+        } else if b.fuel == Fuel::Carburettor {
+            0.5
+        } else {
+            0.3
+        };
+        settings.texture = if itb {
+            0.45
+        } else if b.fuel == Fuel::Carburettor {
+            0.35
+        } else {
+            0.2
+        };
         settings.attack = (0.35 + 0.03 * (b.compression - 10.)).clamp(0., 1.);
 
         params.cylinders = self.design.cylinders;
         params.exhaust = 1.;
-        let intake: f32 = if itb { 0.55 } else if b.fuel == Fuel::Carburettor { 0.4 } else { 0.25 };
+        let intake: f32 = if itb {
+            0.55
+        } else if b.fuel == Fuel::Carburettor {
+            0.4
+        } else {
+            0.25
+        };
         params.intake = (intake - if turbo { 0.1 } else { 0. }).clamp(0., 1.);
         let valvetrain: f32 = match b.head {
             Head::Pushrod => 0.2,
@@ -512,10 +699,19 @@ impl Scratch {
         };
         // Direct injectors tick audibly at idle. A cast-iron block is heavier
         // and better damped: its structure-borne mechanical noise is lower.
-        let block = if b.block == BlockMaterial::CastIron { 0.85 } else { 1. };
-        params.mechanical =
-            ((valvetrain + if b.fuel == Fuel::DirectInjection { 0.08 } else { 0. }) * block)
-                .clamp(0., 1.);
+        let block = if b.block == BlockMaterial::CastIron {
+            0.85
+        } else {
+            1.
+        };
+        params.mechanical = ((valvetrain
+            + if b.fuel == Fuel::DirectInjection {
+                0.08
+            } else {
+                0.
+            })
+            * block)
+            .clamp(0., 1.);
         params.brightness = 10000.;
         params.pipe_length = if open_exhaust { 1.2 } else { 1.8 };
 
@@ -530,7 +726,11 @@ impl Scratch {
             BlockMaterial::CastIron => 110.,
             BlockMaterial::Aluminium => 150.,
         };
-        c.block_level = if b.head == Head::Pushrod { 0.035 } else { 0.022 };
+        c.block_level = if b.head == Head::Pushrod {
+            0.035
+        } else {
+            0.022
+        };
         c.intake_level = if itb { 0.45 } else { 0.3 };
         for bank in &mut self.standalone.banks {
             bank.exhaust_length_m = (header_length + params.pipe_length).clamp(0.1, 6.);
@@ -580,7 +780,11 @@ impl Scratch {
             + firing.bank_delay_ms[1] * 0.001 * first.sound_speed_m_s)
             .min(6.);
         let two_banks = self.design.banks[..self.design.cylinders as usize].contains(&1);
-        config.banks = if two_banks { vec![first, second] } else { vec![first] };
+        config.banks = if two_banks {
+            vec![first, second]
+        } else {
+            vec![first]
+        };
         // One explicit event per firing-order entry: repeats fire twice,
         // cylinders left out of the order never fire.
         config.cylinders = (0..firing.events)
@@ -600,19 +804,30 @@ impl Scratch {
 
 /// Something the audio thread displaced, to be dropped elsewhere.
 pub enum ScratchVoice {
+    /// A complete prepared model displaced by an in-place sound edit. Keeps
+    /// all its heap-owned buffers alive until the UI thread drains the trash.
+    Prepared {
+        physical: Option<Box<crate::physical::engine::Engine>>,
+        descriptors: Arc<ProceduralBank>,
+        synth: Box<standalone::Synth>,
+        exhaust: Box<crate::acoustics::ExhaustNetwork>,
+    },
+    Physical(Box<crate::physical::engine::Engine>),
     Descriptors(Arc<ProceduralBank>),
     Synth(Box<standalone::Synth>),
     Exhaust(Box<crate::acoustics::ExhaustNetwork>),
 }
 
-/// A scratch engine prepared off the audio thread and moved into it. The
-/// descriptor grid always supplies flow, intake and mechanical texture; the
-/// optional event synth replaces its pressure pulses.
+/// A scratch engine prepared off the rendering thread and moved into it.
+/// The physical engine is the default playable source. Historical event data
+/// remain available for explicit offline reference comparisons only.
 pub struct ScratchModel {
+    /// The default playable engine. None only for explicit offline references.
+    pub physical: Option<Box<crate::physical::engine::Engine>>,
     pub descriptors: Arc<ProceduralBank>,
     pub firing: Firing,
     pub life: Life,
-    pub synth: Option<Box<standalone::Synth>>,
+    pub synth: Box<standalone::Synth>,
     /// Built from the parts; the bench retunes lengths and temperatures live.
     pub exhaust: Box<crate::acoustics::ExhaustNetwork>,
     pub idle_rpm: f32,
@@ -622,21 +837,28 @@ pub struct ScratchModel {
 impl ScratchModel {
     /// Allocates and analyses; never call from an audio callback.
     pub fn build(scratch: &Scratch, rate: u32) -> Result<Self, String> {
+        let mut model = Self::build_reference(scratch, rate)?;
+        model.physical = Some(Box::new(crate::physical::engine::Engine::new(
+            scratch, rate,
+        )?));
+        Ok(model)
+    }
+
+    /// Archived event voice for A/reference renders only, never a UI mode.
+    pub fn build_reference(scratch: &Scratch, rate: u32) -> Result<Self, String> {
         scratch.validate()?;
-        let synth = match scratch.engine {
-            ScratchEngine::Experimental => None,
-            ScratchEngine::Standalone => Some(Box::new(standalone::Synth::new(
-                rate.clamp(8_000, 192_000),
-                scratch.standalone.clone(),
-                standalone::Commands {
-                    rpm: scratch.idle_rpm,
-                    load: 0.1,
-                    volume: 1.,
-                    combustion: standalone::CombustionState::Firing,
-                },
-            )?)),
-        };
+        let synth = Box::new(standalone::Synth::new(
+            rate.clamp(8_000, 384_000),
+            scratch.standalone.clone(),
+            standalone::Commands {
+                rpm: scratch.idle_rpm,
+                load: 0.1,
+                volume: 1.,
+                combustion: standalone::CombustionState::Firing,
+            },
+        )?);
         Ok(Self {
+            physical: None,
             descriptors: Arc::new(ProceduralBank::from_spec(
                 &scratch.experimental,
                 scratch.cylinders(),
@@ -647,7 +869,7 @@ impl ScratchModel {
             life: scratch.life(),
             synth,
             exhaust: Box::new(crate::acoustics::ExhaustNetwork::new(
-                rate.clamp(8_000, 192_000) as f32,
+                rate.clamp(8_000, 384_000) as f32,
                 crate::acoustics::Geometry {
                     header: 0.5,
                     tail: 1.5,

@@ -18,6 +18,30 @@ fn projects_roundtrip_and_reject_invalid_data() {
 }
 
 #[test]
+fn listening_volume_supports_the_full_unit_range_and_round_trips() {
+    let path = std::env::temp_dir().join(format!("bess-volume-{}.json", std::process::id()));
+    for volume in [0., 0.8, 0.9, 1.] {
+        let p = Parameters {
+            volume,
+            ..Parameters::default()
+        };
+        project::save(&path, p).unwrap();
+        assert_eq!(project::load(&path).unwrap().volume, volume);
+    }
+    for volume in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+        assert!(
+            Parameters {
+                volume,
+                ..Parameters::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn rendered_wav_has_expected_format_signal_and_duration() {
     let path = std::env::temp_dir().join(format!("bess-audio-{}.wav", std::process::id()));
     let start = Instant::now();

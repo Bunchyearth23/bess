@@ -213,8 +213,7 @@ impl Simulator {
             self.idle_raise *= 1. - STEP / 1.2;
         }
         let idle_target = self.idle * (1.015 + 0.2 * self.idle_raise);
-        let idle_throttle =
-            (drag / available + (idle_target - self.omega) * 0.012).clamp(0., 0.3);
+        let idle_throttle = (drag / available + (idle_target - self.omega) * 0.012).clamp(0., 0.3);
         let limiter = ((self.maximum - self.omega) / (self.maximum * 0.035).max(1.)).clamp(0., 1.);
         let combustion = available * self.throttle.max(idle_throttle) * limiter;
         let free_engine = self.omega + (combustion - drag) / c.inertia * STEP;
@@ -252,5 +251,184 @@ impl Simulator {
         self.state.shifting = self.shift_left > 0.;
         self.state.limited = limiter < 0.95 || overspeed;
         self.state
+    }
+
+    /// Physical scratch driveline at 1 kHz. RPM is measured from the physical
+    /// crank, never integrated, clamped to idle or generated from a torque curve
+    /// here. Returns (telemetry, resisting crank torque Nm, effective throttle).
+    /// A negative load means the wheels are back-driving the crank. For impulse
+    /// consistency `c.inertia` must equal the physical crank's inertia.
+    pub fn step_physical(&mut self, c: Controls, rpm: f32) -> (State, f64, f32) {
+        self.omega = if rpm.is_finite() {
+            rpm.max(0.) / RPM_PER_RAD
+        } else {
+            0.
+        };
+        let pending_safe = self.state.shift_rejected
+            && c.gear != self.state.gear
+            && self.wheel * Self::ratio(c, c.gear) <= self.maximum * 0.98;
+        if !c.automatic && (c.gear != self.requested_gear || self.was_auto || pending_safe) {
+            self.shift(c, c.gear);
+        }
+        if c.automatic && !self.was_auto && self.state.gear == 0 {
+            self.shift(c, 1);
+        }
+        self.requested_gear = c.gear;
+        self.was_auto = c.automatic;
+        self.shift_left = (self.shift_left - STEP).max(0.);
+        self.shift_cooldown = (self.shift_cooldown - STEP).max(0.);
+        let ratio = Self::ratio(c, self.state.gear);
+        if c.automatic && self.shift_cooldown == 0. {
+            let coupled = self.wheel * ratio;
+            if self.omega > self.maximum * 0.87 && coupled > self.omega * 0.8 && self.state.gear < 6
+            {
+                self.shift(c, self.state.gear + 1);
+            } else if self.omega < self.maximum * 0.34 && self.state.gear > 1 {
+                let lower = self.state.gear - 1;
+                if self.wheel * Self::ratio(c, lower) < self.maximum * 0.68 {
+                    self.shift(c, lower);
+                }
+            }
+        }
+        let ratio = Self::ratio(c, self.state.gear);
+        let shift_open = (self.shift_left / 0.2).clamp(0., 1.);
+        self.throttle += (c.throttle * (1. - shift_open * 0.95) - self.throttle) * STEP / 0.03;
+        let speed = self.wheel * c.wheel_radius;
+        let grade = c.grade_percent / (10000. + c.grade_percent * c.grade_percent).sqrt();
+        let road_force = c.mass_kg * 9.81 * (0.015 + grade) + 0.5 * 1.225 * 0.65 * speed * speed;
+        let resistance =
+            c.resistance_nm + (road_force + c.brake * c.mass_kg * 9.81 * 0.8) * c.wheel_radius;
+        let wheel_inertia = c.mass_kg * c.wheel_radius * c.wheel_radius;
+        // Static road/brake resistance never starts reverse motion or provides
+        // energy for the clutch. Only a rotating shaft can drive the wheels.
+        let free_wheel = (self.wheel - resistance / wheel_inertia * STEP).max(0.);
+        let engagement = ((self.omega - self.idle) / (self.idle * 0.55).max(1.)).clamp(0., 1.)
+            * (1. - shift_open);
+        // peak_torque_nm estimates CLUTCH CAPACITY ONLY. Engine torque comes
+        // exclusively from physical cylinder pressure in the caller's crank.
+        let capacity = c.peak_torque_nm * 1.5 * engagement;
+        let impulse = if ratio > 0. {
+            ((self.omega - free_wheel * ratio) / (1. / c.inertia + ratio * ratio / wheel_inertia))
+                .clamp(-capacity * STEP, capacity * STEP)
+        } else {
+            0.
+        };
+        self.wheel = (free_wheel + impulse * ratio / wheel_inertia).max(0.);
+        self.state.rpm = self.omega * RPM_PER_RAD;
+        self.state.load = self.throttle;
+        self.state.speed_kmh = self.wheel * c.wheel_radius * 3.6;
+        self.state.wheel_torque = impulse / STEP * ratio;
+        self.state.resisting_torque = resistance;
+        self.state.shifting = self.shift_left > 0.;
+        self.state.limited = self.omega >= self.maximum;
+        (self.state, (impulse / STEP) as f64, self.throttle)
+    }
+}
+
+#[cfg(test)]
+mod physical_tests {
+    use super::*;
+
+    #[test]
+    fn physical_rpm_is_never_restored_to_idle_or_clamped_to_redline() {
+        let c = Controls {
+            automatic: false,
+            gear: 0,
+            throttle: 1.,
+            ..Default::default()
+        };
+        let mut sim = Simulator::new(850., 7000., c);
+        for rpm in [0., 100., 3000., 8200.] {
+            let (state, load, _) = sim.step_physical(c, rpm);
+            assert!((state.rpm - rpm).abs() < 0.001);
+            assert_eq!(state.speed_kmh, 0.);
+            assert_eq!(load, 0.);
+        }
+    }
+
+    #[test]
+    fn stopped_engine_cannot_accelerate_vehicle_at_full_pedal() {
+        let c = Controls {
+            throttle: 1.,
+            ..Default::default()
+        };
+        let mut sim = Simulator::new(850., 7000., c);
+        for _ in 0..2000 {
+            let (state, load, _) = sim.step_physical(c, 0.);
+            assert_eq!(state.rpm, 0.);
+            assert_eq!(state.speed_kmh, 0.);
+            assert_eq!(load, 0.);
+        }
+    }
+
+    #[test]
+    fn clutch_load_and_wheel_torque_are_equal_opposite_through_ratio() {
+        let c = Controls {
+            automatic: false,
+            gear: 2,
+            throttle: 0.7,
+            ..Default::default()
+        };
+        let mut sim = Simulator::new(850., 7000., c);
+        let (state, load, throttle) = sim.step_physical(c, 2500.);
+        assert!(load > 0. && state.speed_kmh > 0.);
+        assert!((state.wheel_torque as f64 - load * Simulator::ratio(c, 2) as f64).abs() < 0.001);
+        assert!(throttle > 0. && throttle < c.throttle);
+        sim.wheel = 250.;
+        let (_, backdrive, _) = sim.step_physical(c, 2500.);
+        assert!(
+            backdrive < 0.,
+            "coasting wheels must drive the crank through the clutch"
+        );
+    }
+
+    #[test]
+    fn coupled_coast_never_gains_energy_without_gas_torque() {
+        let c = Controls {
+            automatic: false,
+            gear: 3,
+            inertia: 0.35,
+            ..Default::default()
+        };
+        let mut sim = Simulator::new(850., 7000., c);
+        let mut crank =
+            crate::physical::crank::Crank::new(c.inertia as f64, 0.086, 0.002, 3000.).unwrap();
+        sim.wheel = 3000. / RPM_PER_RAD / Simulator::ratio(c, 3);
+        let initial_speed = sim.wheel * c.wheel_radius * 3.6;
+        let wheel_inertia = c.mass_kg * c.wheel_radius * c.wheel_radius;
+        let energy = |sim: &Simulator, crank: &crate::physical::crank::Crank| {
+            crank.state().kinetic_energy_j + 0.5 * wheel_inertia as f64 * (sim.wheel as f64).powi(2)
+        };
+        let mut previous = energy(&sim, &crank);
+        for _ in 0..3000 {
+            let (_, load, _) = sim.step_physical(c, crank.state().rpm as f32);
+            crank.step(STEP as f64, 0., 0., load, false).unwrap();
+            let next = energy(&sim, &crank);
+            assert!(
+                next <= previous + 0.01,
+                "energy increased {previous} -> {next}"
+            );
+            previous = next;
+        }
+        assert!(sim.state.speed_kmh < initial_speed);
+    }
+
+    #[test]
+    fn brakes_dissipate_wheel_energy_without_acoustic_speed_ceiling() {
+        let c = Controls {
+            automatic: false,
+            gear: 0,
+            brake: 1.,
+            ..Default::default()
+        };
+        let mut sim = Simulator::new(850., 7000., c);
+        sim.wheel = 120.;
+        let before = sim.wheel;
+        sim.step_physical(c, 0.);
+        assert!(sim.wheel < before && sim.wheel > 0.);
+        for _ in 0..8000 {
+            sim.step_physical(c, 0.);
+        }
+        assert_eq!(sim.wheel, 0.);
     }
 }
