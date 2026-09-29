@@ -60,6 +60,8 @@ pub struct Sample {
     pub fuel_cut: bool,
     pub misfires: u64,
     pub turbo_rpm: f64,
+    /// Compressor-outlet (charge) pressure; atmospheric without a turbo.
+    pub charge_pa: f64,
     /// Acoustic afterfire excitation energy: 0.8 * reacted chemical heat.
     /// Not total chemical heat, nor net heat transferred to the gas after cooling.
     pub afterfire_heat_j: f64,
@@ -909,6 +911,7 @@ impl Engine {
             fuel_cut,
             misfires,
             turbo_rpm: self.induction.as_ref().map_or(0., Induction::shaft_rpm),
+            charge_pa: supply.pressure_pa,
             afterfire_heat_j: afterfire.iter().sum(),
             idle_bypass,
             fresh_supply_kg_s: fresh_supply,

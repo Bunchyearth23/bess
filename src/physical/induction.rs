@@ -239,8 +239,29 @@ impl Induction {
         // 1.5 m is an equivalent inertance length, not a measured pipe length.
         let reference_flow =
             density * self.compressor_displacement_m3 * omega.max(4000.0) / std::f64::consts::TAU;
+        // X-027: surge (the peak, 2 × reference at the speed limit) sits at a
+        // constant diffuser flow coefficient m/(ρ₂U), so it scales with the
+        // stage-exit density ρ₂ ∝ PR^(1 − (γ−1)/(γη)) of each speed line's peak,
+        // while choke (the zero-head end, 3.10 × reference) stays set by the
+        // inlet. Low-speed lines are wider (≈3× surge → zero head at 1500 rpm
+        // WOT, 1.55× at the limit), as on measured maps; with inlet-density
+        // similarity alone the low-rpm WOT and part-load points sat left of
+        // the peak and deep-surged (30–70 kPa at 10–30 Hz). Reverse flow is unchanged.
+        let ga = thermo::gamma(300.0);
+        let exit_density = |ratio: f64| ratio.powf(1.0 - (ga - 1.0) / (ga * 0.7));
+        let surge = exit_density(1.0 + head / ATMOSPHERE.pressure_pa)
+            / exit_density(1.0 + 4.0 * self.max_boost_pa / ATMOSPHERE.pressure_pa);
+        const ZERO_HEAD: f64 = 3.1038;
         let acceleration = |flow: f64| {
-            let x = (flow / reference_flow).clamp(-8.0, 8.0) - 1.0;
+            let r = (flow / reference_flow).clamp(-8.0, 8.0);
+            // Three C¹ pieces of the same cubic (zero slope at x = ±1).
+            let x = if r < 0.0 {
+                r - 1.0
+            } else if r < 2.0 * surge {
+                r / surge - 1.0
+            } else {
+                1.0 + (r - 2.0 * surge) * (ZERO_HEAD - 2.0) / (ZERO_HEAD - 2.0 * surge)
+            };
             let characteristic = if self.enabled {
                 head * (0.2 + 0.4 * (1.0 + 1.5 * x - 0.5 * x * x * x))
             } else {
@@ -256,7 +277,6 @@ impl Induction {
         let next_flow = self.compressor_flow_kg_s
             + 0.5 * dt * (first + acceleration(self.compressor_flow_kg_s + dt * first));
         let compressor_ratio = (self.charge.pressure_pa() / ATMOSPHERE.pressure_pa).max(1.0);
-        let ga = thermo::gamma(300.0);
         let work_per_kg = (thermo::specific_heat_cv(300.0) + thermo::GAS_CONSTANT)
             * 300.0
             * (compressor_ratio.powf((ga - 1.0) / ga) - 1.0)

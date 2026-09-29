@@ -292,10 +292,11 @@ impl EngineTuning {
             // ponytail: geometric similarity (swept volume ∝ r³, inertia ∝ r⁵),
             // not a turbo family map; replace with measured frames if needed.
             // Matched to the engine's WOT line at the target boost: with the
-            // 4 × target head (Induction) the surge flow at target is one
-            // swept volume per revolution at half the speed limit (≈0.054
-            // kg/s at 2 L, ≈2500 rpm at 0.8 bar) and the choke side at the
-            // limit ≈3 × that (≈0.165 kg/s, ≈6300 rpm). The former 0.005
+            // 4 × target head (Induction) the target is reached at half the
+            // speed limit, where one swept volume per revolution is ≈0.054
+            // kg/s at 2 L (surge sits at 0.6 × that, ≈0.033 kg/s, after the
+            // X-027 exit-density scaling) and the choke side at the limit
+            // ≈3 × that (≈0.165 kg/s, ≈6300 rpm). The former 0.005
             // choked at ≈0.10 kg/s, so boost collapsed above 4400 rpm.
             compressor_displacement_m3: displacement * 0.008 * turbo,
             turbo_inertia_kg_m2: rotor * turbo.powf(5. / 3.),
