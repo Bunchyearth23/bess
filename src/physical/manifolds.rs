@@ -761,6 +761,9 @@ impl Manifolds {
                 + 0.0003
                 + 0.035 * idle_bypass.clamp(0.0, 1.0))
     }
+    /// Rejected flows (budgets, validity) leave the state untouched. The state
+    /// is advanced in place: a gas-step guard failing after that validation
+    /// leaves it part-advanced (the engine then stays failed until `reset`).
     pub fn step(
         &mut self,
         dt: f64,
@@ -833,7 +836,6 @@ impl Manifolds {
             return Err(ThermoError::InvalidInput);
         }
         let mut result = ManifoldStep::default();
-        let mut working = self.clone(); // Copy gas states, no heap allocation
         // Runner columns: dṁ/dt = (A/L)(p_plenum − p_port) − (A/L)·K ṁ|ṁ|/(2ρA²),
         // entry/bend loss K = 0.5 (sharp-edged plenum entry, Idelchik) taken
         // semi-implicitly. Inertia lets flow overshoot pressure equilibrium:
@@ -847,7 +849,8 @@ impl Manifolds {
         let mut plenum_species = Species::default();
         for i in 0..self.runner_count {
             let (port, port_removable) = runners[i];
-            let port_mixture = self.runners[i].mixture();
+            let old_runner = self.runners[i];
+            let port_mixture = old_runner.mixture();
             let (upstream, upstream_mixture) = if plenum.pressure_pa >= port.pressure_pa {
                 (plenum, plenum_mixture)
             } else {
@@ -862,7 +865,7 @@ impl Manifolds {
             let dm = (flow * dt)
                 .min(share)
                 .max(-(port_removable - flows.runner[i].mass_out_kg).max(0.0));
-            working.runner_flow_kg_s[i] = dm / dt;
+            self.runner_flow_kg_s[i] = dm / dt;
             let port_h = port_mixture.enthalpy(port.temperature_k);
             let port_composition = self.runner_composition(i);
             plenum_exchange.add_signed(-dm, port_h);
@@ -870,8 +873,8 @@ impl Manifolds {
             plenum_species.fuel_kg += (-dm).max(0.0) * port_composition.fuel_fraction;
             let mut input = flows.runner[i];
             input.add_signed(dm, plenum_h);
-            let ledger = working.runners[i].step(
-                self.runners[i].volume_m3(),
+            let ledger = self.runners[i].step(
+                old_runner.volume_m3(),
                 EnergyInput {
                     mass_in_kg: input.mass_in_kg,
                     enthalpy_in_j: input.enthalpy_in_j,
@@ -880,8 +883,8 @@ impl Manifolds {
                 },
             )?;
             result.runner_correction_j += ledger.numerical_correction_j;
-            working.runner_species[i] = self.runner_species[i].transport(
-                self.runners[i].mass_kg(),
+            self.runner_species[i] = self.runner_species[i].transport(
+                old_runner.mass_kg(),
                 ledger.mass_out_kg,
                 Species {
                     fresh_air_kg: flows.runner_species[i].fresh_air_kg
@@ -913,8 +916,9 @@ impl Manifolds {
         let supply_h = supply_mixture.enthalpy(self.supply.temperature_k);
         let intake_h = plenum_mixture.enthalpy(plenum.temperature_k);
         intake_input.add_signed(intake_flux, supply_h);
-        result.intake_ledger = working.intake.step(
-            self.intake.volume_m3(),
+        let old_intake = self.intake;
+        result.intake_ledger = self.intake.step(
+            old_intake.volume_m3(),
             EnergyInput {
                 mass_in_kg: intake_input.mass_in_kg,
                 enthalpy_in_j: intake_input.enthalpy_in_j,
@@ -936,8 +940,8 @@ impl Manifolds {
                 + plenum_species.fuel_kg
                 + intake_flux.max(0.0) * self.supply_composition.fuel_fraction,
         };
-        working.intake_species = self.intake_species.transport(
-            self.intake.mass_kg(),
+        self.intake_species = self.intake_species.transport(
+            old_intake.mass_kg(),
             result.intake_ledger.mass_out_kg,
             incoming_species,
             result.intake_ledger.mass_in_kg,
@@ -972,13 +976,15 @@ impl Manifolds {
             };
             let (collector_reservoir, collector_removable) = collectors[i];
             let (tail_reservoir, tail_removable) = tails[i];
-            let collector = (collector_reservoir, self.exhaust[i].mixture());
-            let tail = (tail_reservoir, self.tailpipe[i].mixture());
+            let (old_exhaust, old_tail) = (self.exhaust[i], self.tailpipe[i]);
+            let collector_composition = self.exhaust_composition(i);
+            let collector = (collector_reservoir, old_exhaust.mixture());
+            let tail = (tail_reservoir, old_tail.mixture());
             let collector_h = collector.1.enthalpy(collector.0.temperature_k);
             let tail_h = tail.1.enthalpy(tail.0.temperature_k);
             let ambient_h = Mixture::AIR.enthalpy(ATMOSPHERE.temperature_k);
             let out = rate(collector, tail, area, cd) * dt;
-            let cfl_mass = self.tailpipe[i].mass_kg() / TAIL_SPECIES_CELLS as f64 * 0.25;
+            let cfl_mass = old_tail.mass_kg() / TAIL_SPECIES_CELLS as f64 * 0.25;
             let bounded_out = out
                 .min(collector_removable - exchange.mass_out_kg)
                 .max(-tail_removable * 0.5)
@@ -986,8 +992,8 @@ impl Manifolds {
             result.transport_limited_mass_kg += (out - bounded_out).abs();
             let out = bounded_out;
             input.add_signed(-out, tail_h);
-            result.exhaust_ledger[i] = working.exhaust[i].step(
-                self.exhaust[i].volume_m3(),
+            result.exhaust_ledger[i] = self.exhaust[i].step(
+                old_exhaust.volume_m3(),
                 EnergyInput {
                     heat_j: self.exhaust_heat_j[i],
                     mass_in_kg: input.mass_in_kg,
@@ -998,15 +1004,15 @@ impl Manifolds {
             )?;
             result.exhaust_mass_flow_kg_s[i] = out / dt;
             let tail_composition = self.tailpipe_cells[i][0]
-                .composition(self.tailpipe[i].mass_kg() / TAIL_SPECIES_CELLS as f64);
+                .composition(old_tail.mass_kg() / TAIL_SPECIES_CELLS as f64);
             let incoming_species = Species {
                 fresh_air_kg: flows.exhaust_species[i].fresh_air_kg
                     + (-out).max(0.0) * tail_composition.fresh_air_fraction,
                 fuel_kg: flows.exhaust_species[i].fuel_kg
                     + (-out).max(0.0) * tail_composition.fuel_fraction,
             };
-            working.exhaust_species[i] = self.exhaust_species[i].transport(
-                self.exhaust[i].mass_kg(),
+            self.exhaust_species[i] = self.exhaust_species[i].transport(
+                old_exhaust.mass_kg(),
                 result.exhaust_ledger[i].mass_out_kg,
                 incoming_species,
                 result.exhaust_ledger[i].mass_in_kg,
@@ -1029,8 +1035,8 @@ impl Manifolds {
             let mut tail_input = Exchange::default();
             tail_input.add_signed(out, collector_h);
             tail_input.add_signed(-tail_out, ambient_h);
-            result.tailpipe_ledger[i] = working.tailpipe[i].step(
-                self.tailpipe[i].volume_m3(),
+            result.tailpipe_ledger[i] = self.tailpipe[i].step(
+                old_tail.volume_m3(),
                 EnergyInput {
                     heat_j: self.tailpipe_heat_j[i],
                     mass_in_kg: tail_input.mass_in_kg,
@@ -1039,10 +1045,9 @@ impl Manifolds {
                     ..Default::default()
                 },
             )?;
-            let collector_composition = self.exhaust_composition(i);
-            working.tailpipe_species[i] = advect_tail(
-                &mut working.tailpipe_cells[i],
-                self.tailpipe[i].mass_kg(),
+            self.tailpipe_species[i] = advect_tail(
+                &mut self.tailpipe_cells[i],
+                old_tail.mass_kg(),
                 out,
                 tail_out,
                 collector_composition,
@@ -1056,10 +1061,9 @@ impl Manifolds {
                 result.external_enthalpy_in_j -= tail_out * ambient_h;
             }
         }
-        working.exhaust_heat_j = [0.0; 2];
-        working.tailpipe_heat_j = [0.0; 2];
-        working.refresh_mixtures();
-        *self = working;
+        self.exhaust_heat_j = [0.0; 2];
+        self.tailpipe_heat_j = [0.0; 2];
+        self.refresh_mixtures();
         Ok(result)
     }
 }
