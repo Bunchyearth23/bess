@@ -353,3 +353,31 @@ fn intake_and_contacts_have_cycle_texture_without_free_running_noise() {
         );
     }
 }
+
+#[test]
+fn combustion_pressure_rise_makes_mechanics_load_dependent() {
+    let energy = |throttle: f64| {
+        let mut engine = Engine::new(&Scratch::default(), 48000).unwrap();
+        let command = Commands {
+            imposed_rpm: Some(3000.),
+            throttle,
+            ..Default::default()
+        };
+        let mut energy = 0.;
+        for i in 0..96000 {
+            let s = engine.next(command);
+            finite(s);
+            if i >= 48000 {
+                energy += f64::from(s.mechanical).powi(2);
+            }
+        }
+        assert!(!engine.failed());
+        energy
+    };
+    let loaded = energy(0.7);
+    // Valve contacts are identical at equal RPM; only combustion differs.
+    for throttle in [0.1, 0.] {
+        let ratio = loaded / energy(throttle);
+        assert!(ratio > 1.3, "throttle {throttle}: energy ratio {ratio}");
+    }
+}
