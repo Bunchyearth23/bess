@@ -21,10 +21,9 @@ ssh -o BatchMode=yes $host "mkdir -p ~/bess-build/bdsp ~/$base/src/.cargo"
 rsync -a --delete "$bdsp/" "$host:bess-build/bdsp/"
 rsync -a --delete --exclude target --exclude .git --exclude .claude --exclude out \
   --exclude .cargo "$src/" "$host:$base/src/"
-ssh -o BatchMode=yes $host "cat > ~/$base/src/.cargo/config.toml" <<'EOF'
-[patch."ssh://git@github.com/bunchyearth23/bdsp"]
-bdsp = { path = "/home/manager/bess-build/bdsp" }
-EOF
+# The checkout's own cargo config (e.g. rustflags) plus the bdsp path patch.
+{ cat "$src/.cargo/config.toml" 2>/dev/null; printf '\n[patch."ssh://git@github.com/bunchyearth23/bdsp"]\nbdsp = { path = "/home/manager/bess-build/bdsp" }\n'; } |
+  ssh -o BatchMode=yes $host "cat > ~/$base/src/.cargo/config.toml"
 set +e
 ssh -o BatchMode=yes $host "cd ~/$base/src && rm -rf out && mkdir -p out && CARGO_TARGET_DIR=~/$base/target $(printf '%q ' "$@")"
 status=$?

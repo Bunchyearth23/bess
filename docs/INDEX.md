@@ -70,6 +70,7 @@ Identifiers are stable. W states change only on explicit user instruction; check
 | D-035 | accepted | Restore the user's missing scratch sound controls through physical or explicit DSP equivalents, while keeping the retired Descriptor voice absent. Preserve sound adjustments and layer levels across part changes; save them with the project. Neutral defaults preserve the corrected physical voice. See the [control inventory and evidence](reports/BESS-SOUND-CONTROLS-2026-09-28.md). |
 
 | D-036 | accepted | User explicitly requests the physical engine for Automation resynthesis and removal of every other synthesis model/processing route. Only original source A and physical B remain in listening, WAV and BeamNG export. Old projects migrate to physical B; required missing metadata gives an explicit error with A still available. This supersedes D-023–D-026 separation of imported and scratch renderers, and the offline reference retained under D-034. Preserve historical reports as evidence, not available product modes. |
+| D-037 | accepted | 2026-09-29 user (Q-005): release and dev builds target `x86-64-v3` (AVX2/FMA) through `.cargo/config.toml`; BESS no longer runs on CPUs without AVX2. `tools/dev17.sh` forwards the checkout's cargo config to dev17. |
 
 ## Work items
 
@@ -221,6 +222,8 @@ Integrated continuation (2026-09-28): physical scratch is active, with conservat
 - [x] W-006.26 Live-only listening rooms (partitioned FFT convolution, Garage/Open road/Parking hall, default Off bit-identical, never in exports). W-006.6 stays open: MUSHRA acceptance not run. [Report](reports/BESS-REALISM-BATCH-2026-09-29.md).
 - [x] W-007.1 Computed dyno curve (`src/dyno.rs`, WOT sweep, brake torque = gas − friction) plotted in the builder; computed peak sizes the clutch unless set by hand. NA 169.7 Nm / 89.6 kW, turbo 222.2 Nm / 103.2 kW on the default I4.
 - [x] W-007.2 `EngineTuning` optional overrides + single `resolve()` feeding cylinders, manifolds and turbo; derived values bit-identical (29/29 hashes), old projects round-trip, never hashed into the seed; no UI. Cam duration/lift shared by both valves until the cycle separates them.
+- [ ] W-006.27 Engine acoustics, radiation and tone at 48 kHz output with 2 physics substeps (Q-005): measured −12 % V12 on a prototype; changes sound (RMS −0.44 dB, orders ±0.8 dB, some octave bands up to 3 dB). Waiting for the user's listening pass.
+- [ ] W-006.28 Coupled sound calibration for `experimental.wave_coupling` (Q-006): a fixed level constant for the coupled path measured on the default engines, so enabling it does not drop the level 2–3 dB (up to 15 dB on equal-length I4). Waiting for the user's listening pass.
 - [ ] W-007.3 Tuning UI within D-033: done — 10 `EngineTuning` overrides in the part sections with derived display, per-field/group resets, dyno previous-curve overlay and pin reference, "sound only" tags (risk batch). Left: separate exhaust cam overrides once `cycle.rs` separates the cams; visual check of the overlay by the user.
 
 ## Risks and questions
@@ -239,8 +242,8 @@ Integrated continuation (2026-09-28): physical scratch is active, with conservat
 | Q-002 | answered | P3 | Knock slider range | 2026-09-29 user: reduce the range. Now RON 95 (0) → RON 85 (1). Alone it does not make knock sporadic: even RON 95 saturates the 12° authority at 3000 rpm WOT because of the end-gas temperature bias (X-026); re-check after X-026 |
 | Q-003 | answered | P3 | "Export BeamNG" block in scratch mode | 2026-09-29 user: keep it hidden until scratch BeamNG export exists |
 | Q-004 | answered | P3 | Scope of "Reset sound shaping" | 2026-09-29 user: keep resets per section; combustion/geometry have their own reset |
-| Q-005 | open | P2 | CPU: build with `target-cpu=x86-64-v2` (bit-exact on 88 outputs, a further −5 %, needs a 2009+ CPU), `x86-64-v3` (−7 %, ≤ 1 LSB of 24 bits on 15/48 clips, needs AVX2/FMA), and/or run engine acoustics at 48 kHz (−12 %, RMS −0.44 dB, orders ±0.8 dB, some octave bands up to 3 dB)? | User decision |
-| Q-006 | open | P2 | With wave coupling on, output is 2–3 dB quieter on defaults and up to 15 dB on equal-length I4: add a coupled sound calibration, or keep the uncoupled one? Also accept the 1/L test tolerance widened from 10 % to 15 %? | User decision before default-on |
+| Q-005 | answered | P2 | CPU options | 2026-09-29 user: `x86-64-v3` build (applied: `.cargo/config.toml` rustflags; dev17 V12 6.99 → 6.28–6.43 µs, ≈ −10 %; 17/48 proof clips differ by ≤ 1 LSB of 24 bits, −169 dB) and engine acoustics at 48 kHz (W-006.27, not started: user listens first) |
+| Q-006 | answered | P2 | Coupled sound calibration; 1/L tolerance | 2026-09-29 user: add a coupled sound calibration (W-006.28, not started); keep the 10 % 1/L requirement — the test is back to 10 % and `#[ignore]`d until X-028 meets it |
 | X-007 | mitigated | P2 | Parameter smoothing and A/B fade tested in the hybrid chain | Extended listening still needed |
 | X-004 | open | P1 | Thunderhawk stops at 4,989 rpm; 0.5 corpus limits vary from 3,557 to 7,487. JBeam damage threshold is not a rev limiter | Respect each bank's range; extend only with source evidence |
 | X-005 | open | P1 | Declared cylinders/layout recovered from twelve `.car` files, but firing order, bank phasing, headers and active parts remain unknown; header acoustics are aggregated | Reliable engine data and in-game test; see 0.8.2 report |
