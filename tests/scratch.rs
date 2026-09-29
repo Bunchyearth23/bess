@@ -346,11 +346,16 @@ mod physical {
         // step the cylinders backwards, failing the engine permanently.
         render(&mut bench, 96_000);
         bench.set(params, Settings::default(), controls, 0);
-        render(&mut bench, 144_000);
-        let rpm = bench.state().rpm;
+        // The starter air floor must not wind the idle integrator down: the
+        // release used to dip to ~464 rpm before recovering.
+        let mut lowest = f32::MAX;
+        for _ in 0..30 {
+            render(&mut bench, 4_800);
+            lowest = lowest.min(bench.state().rpm);
+        }
         assert!(
-            rpm > scratch.idle_rpm * 0.7,
-            "engine must keep running after the starter is released, got {rpm} rpm"
+            lowest > scratch.idle_rpm * 0.7,
+            "engine must keep idling after the starter is released, dipped to {lowest} rpm"
         );
     }
 }

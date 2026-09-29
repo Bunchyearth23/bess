@@ -6,6 +6,7 @@ use crate::engine_build::Fuel;
 const ECU_PERIOD_S: f64 = 0.030;
 const IDLE_BYPASS_BASE: f64 = 0.060;
 const IDLE_BYPASS_MAX: f64 = 0.35;
+const STARTER_BYPASS: f64 = 0.10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlError;
@@ -186,15 +187,18 @@ impl Controller {
         let raw = IDLE_BYPASS_BASE + proportional + candidate;
         // Conditional integration prevents saturation from storing a long
         // throttle surge. No measured-engine claims for these initial PI gains.
-        if (0.0..=IDLE_BYPASS_MAX).contains(&raw)
+        // The starter's air floor is a saturation too: winding down beneath it
+        // during the start flare dropped the bypass to zero on release.
+        let floor = if input.starter { STARTER_BYPASS } else { 0. };
+        if (floor..=IDLE_BYPASS_MAX).contains(&raw)
             || (raw > IDLE_BYPASS_MAX && error < 0.)
-            || (raw < 0. && error > 0.)
+            || (raw < floor && error > 0.)
         {
             self.integral = candidate.clamp(-IDLE_BYPASS_BASE, IDLE_BYPASS_MAX - IDLE_BYPASS_BASE);
         }
         self.bypass = (IDLE_BYPASS_BASE + proportional + self.integral).clamp(0., IDLE_BYPASS_MAX);
         if input.starter {
-            self.bypass = self.bypass.max(0.10);
+            self.bypass = self.bypass.max(STARTER_BYPASS);
         }
         self.spark_shift_rad = (10. - 30. * error).clamp(0., 20.).to_radians();
     }
