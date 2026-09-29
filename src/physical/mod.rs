@@ -14,5 +14,6 @@ pub mod manifolds;
 mod mechanical;
 pub mod thermo;
 pub mod tone;
+pub mod wave_junction;
 
 mod radiation;

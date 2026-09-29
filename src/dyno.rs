@@ -56,6 +56,11 @@ pub fn key(scratch: &Scratch) -> Scratch {
     };
     key.inertia = Scratch::default().inertia;
     key.experimental = Default::default();
+    // X-017 prototype: with coupled waves the primary length moves torque.
+    if scratch.experimental.wave_coupling {
+        key.experimental.wave_coupling = true;
+        key.sound.primary_length_scale = sound.primary_length_scale;
+    }
     key
 }
 

@@ -10,6 +10,7 @@ use super::{
     config::CylinderConfig,
     gas::{DischargeCurve, GasProperties, HarmonicCam, Valve},
     thermo::{self, EnergyInput, EnergyLedger, GasState, SliderCrank, ThermoError, Wiebe},
+    wave_junction::WavePort,
 };
 use std::f64::consts::{PI, TAU};
 
@@ -152,6 +153,7 @@ pub struct CycleCylinder {
     heat_transfer_scale: f64,
     heat_coefficient: f64,
     coefficient_clock: u32,
+    exhaust_port: Option<WavePort>,
 }
 
 impl CycleCylinder {
@@ -219,6 +221,7 @@ impl CycleCylinder {
             heat_transfer_scale: 1.,
             heat_coefficient: 100.,
             coefficient_clock: 0,
+            exhaust_port: None,
         })
     }
 
@@ -229,6 +232,13 @@ impl CycleCylinder {
         }
         self.heat_transfer_scale = scale;
         Ok(())
+    }
+
+    /// X-017 hook: solve the NEXT `step`'s exhaust valve jointly with this
+    /// pipe port (passive wave/valve junction). Consumed by that step; None,
+    /// the default, is the legacy prescribed-flow path.
+    pub fn set_exhaust_port(&mut self, port: Option<WavePort>) {
+        self.exhaust_port = port;
     }
 
     pub fn gas_state(&self) -> Option<GasState> {
@@ -301,6 +311,7 @@ impl CycleCylinder {
     /// Advance one externally timed step, at most 1/16 kHz and 0.1 radian.
     /// For the 96 kHz engine use dt=1/96000; halted crankshaft is supported.
     pub fn step(&mut self, input: CycleInput) -> Result<CycleOutput, ThermoError> {
+        let exhaust_port = self.exhaust_port.take();
         if !input.angle_rad.is_finite()
             || input.angle_rad.abs() > 1e12
             || !(0.0..=30000.0).contains(&input.rpm)
@@ -354,8 +365,19 @@ impl CycleCylinder {
         let intake_lift = self.valve_lift(local0, true, input.intake_phase_rad);
         let exhaust_lift = self.valve_lift(local0, false, 0.);
         let intake_requested = self.port_flow(gas, input.intake, intake_lift, true) * input.dt_s;
-        let exhaust_requested =
-            self.port_flow(gas, input.exhaust, exhaust_lift, false) * input.dt_s;
+        let exhaust_requested = match exhaust_port {
+            None => self.port_flow(gas, input.exhaust, exhaust_lift, false),
+            // A seated valve cannot see the wave; skip the joint solve.
+            Some(_) if exhaust_lift == 0. => 0.,
+            Some(port) => {
+                let at = |pressure_pa| Reservoir {
+                    pressure_pa,
+                    ..input.exhaust
+                };
+                port.solve(|p| self.port_flow(gas, at(p), exhaust_lift, false))
+                    .0
+            }
+        } * input.dt_s;
         let intake_in = intake_requested.max(0.).min(input.intake_mass_limit_kg);
         let exhaust_in = exhaust_requested.max(0.).min(input.exhaust_mass_limit_kg);
         let requested_out = (-intake_requested).max(0.) + (-exhaust_requested).max(0.);
