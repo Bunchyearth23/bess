@@ -1189,8 +1189,9 @@ mod mechanical_tests {
         assert!(controlled > off * 5., "{off} → {controlled}");
         // Where the end gas does not autoignite, knock on is bit-identical.
         // (At ON 70 the imposed-speed start transient knocks once here.)
+        // (Since the X-024 runners, ON 82.5 knocks once in that transient.)
         let (_, idle_off, _) = knock_band(0., 0.05, 0., true);
-        let (_, idle_on, events) = knock_band(0.5, 0.05, 0., true);
+        let (_, idle_on, events) = knock_band(0.3, 0.05, 0., true);
         assert_eq!(events, 0);
         for (a, b) in idle_off.iter().zip(&idle_on) {
             assert_eq!(a.mechanical.to_bits(), b.mechanical.to_bits());
@@ -1273,10 +1274,12 @@ mod mechanical_tests {
     }
     #[test]
     fn knock_control_makes_events_sporadic_within_its_authority() {
-        // 6000/1.0 at ON 82.5 needs ≈ 7° of the 12° retard authority.
-        let free = knock_stats(0.5, 6000., 1., false);
-        let controlled = knock_stats(0.5, 6000., 1., true);
-        println!("6000/1.0 knock 0.5: {free:?} -> {controlled:?}");
+        // Since the X-024 runners fill the cylinder better at high speed, only
+        // ≈ RON 95 stays within the 12° authority at 6000/1.0 (≈ 9.6° retard,
+        // 100 → 1 events per 100 cycles); lower octane saturates it (X-025).
+        let free = knock_stats(1e-4, 6000., 1., false);
+        let controlled = knock_stats(1e-4, 6000., 1., true);
+        println!("6000/1.0 RON 95: {free:?} -> {controlled:?}");
         assert!(controlled[0] < free[0] * 0.5, "{free:?} -> {controlled:?}");
         assert!(controlled[1] > 0. && controlled[1] <= 12.);
         assert!(controlled.iter().all(|v| v.is_finite()));

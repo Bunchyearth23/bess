@@ -152,13 +152,14 @@ const TIP_RADIUS_M: f32 = 0.025;
 // Fixed calibrations, referenced to 10 g/s, 20 m/s, 340 m/s, 300 m/s tip and
 // a 1 kHz band, set jointly with the tonal PA_TO_SAMPLE of `IntakeAcoustic`
 // against the pre-2026-09-29 fixed layer (default I4, `final_proof`; X-023).
-// DUCT: +2 dB; WOT / high rpm RMS +1.3 / +1.8 dB over that layer, peaks +3.3.
+// DUCT: re-set −4 dB after the X-024 intake runners raised WOT flow; NA WOT /
+// high rpm RMS +2.4 / +3.1 dB over that layer, peaks +5.6 / +5.7 (cruise −7).
 // HISS: a fully audible jet (peak under AIRBOX_HZ) of 10 g/s at 340 m/s; the
 // 0.2 mm idle gap keeps ~5e-4 of that amplitude, a 1.5 mm cruise gap ~4 %:
 // ~5 dB under duct and tone at 2000 / 0.3, about half of a quiet idle.
 // Edge tone and whine unchanged (whine -13 dB re turbo intake at 4500 / 1.0).
 const FLOW_REF: f32 = 0.01;
-const DUCT: f32 = 0.0199;
+const DUCT: f32 = 0.0126;
 const HISS: f32 = 2.0;
 const WHISTLE: f32 = 0.015;
 const WHINE: f32 = 9.2e-5;

@@ -26,7 +26,7 @@ ssh -o BatchMode=yes $host "cat > ~/$base/src/.cargo/config.toml" <<'EOF'
 bdsp = { path = "/home/manager/bess-build/bdsp" }
 EOF
 set +e
-ssh -o BatchMode=yes $host "cd ~/$base/src && mkdir -p out && CARGO_TARGET_DIR=~/$base/target $(printf '%q ' "$@")"
+ssh -o BatchMode=yes $host "cd ~/$base/src && rm -rf out && mkdir -p out && CARGO_TARGET_DIR=~/$base/target $(printf '%q ' "$@")"
 status=$?
 set -e
 pull=${DEV17_PULL:-$(dirname "$src")/dev17-out/$name}
