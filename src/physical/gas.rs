@@ -129,8 +129,16 @@ impl Orifice {
         };
         let g = properties.gamma;
         let ratio = downstream / upstream;
-        let critical = (2.0 / (g + 1.0)).powf(g / (g - 1.0));
-        let factor = if ratio <= critical {
+        // For the valid 1.01 <= gamma <= 2 the critical ratio lies in
+        // 0.444..0.607: decide clear cases without its powf (same branch).
+        let choked = if ratio > 0.61 {
+            false
+        } else if ratio < 0.44 {
+            true
+        } else {
+            ratio <= (2.0 / (g + 1.0)).powf(g / (g - 1.0))
+        };
+        let factor = if choked {
             g.sqrt() * (2.0 / (g + 1.0)).powf((g + 1.0) / (2.0 * (g - 1.0)))
         } else {
             // expm1 avoids cancellation as downstream pressure approaches upstream.
@@ -487,6 +495,10 @@ mod tests {
                     }
                 }
             }
+        }
+        for g in (0..=990).map(|i| 1.01 + i as f64 * 1e-3) {
+            let critical = (2.0 / (g + 1.0)).powf(g / (g - 1.0));
+            assert!((0.44..=0.61).contains(&critical), "{g}: {critical}");
         }
     }
 
