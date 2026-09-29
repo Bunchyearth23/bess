@@ -520,8 +520,6 @@ impl Engine {
                     .set_supply_limit(induction.outgoing_budget_kg())
                     .map_err(|_| ())?;
             }
-            let intake = self.manifolds.intake();
-            let intake_composition = self.manifolds.intake_composition();
             let exhaust_composition = [
                 self.manifolds.exhaust_composition(0),
                 self.manifolds.exhaust_composition(1),
@@ -537,13 +535,19 @@ impl Engine {
             let mut peak: f64 = 0.;
             let mut reciprocating = 0.;
             // Retard the inlet at closed-throttle idle to reduce overlap/EGR;
-            // advance it progressively with speed under load. This changes
+            // under load follow the schedule below. This changes
             // valve flow, never combustion gain or an imposed idle speed.
             let idle_vvt = (1. - controller.throttle / 0.2).clamp(0., 1.)
                 * ((2000. - self.rpm) / 800.).clamp(0., 1.);
+            // Under load, advance (earlier IVC, better trapping) through the
+            // mid range and return to the late-closing base cam towards
+            // redline, where runner ram fills the cylinder after BDC; the
+            // usual intake-phaser full-load schedule (Heywood §6.8, VANOS/VVT-i).
+            let redline = f64::from(self.scratch.redline_rpm);
+            let load_advance = (self.rpm / 2000.).clamp(0., 1.)
+                * ((0.9 * redline - self.rpm) / (0.35 * redline)).clamp(0., 1.);
             let vvt_target = if self.scratch.build.vvt {
-                (20. * idle_vvt - 15. * (self.rpm / 5000.).clamp(0., 1.) * (1. - idle_vvt))
-                    .to_radians()
+                (20. * idle_vvt - 15. * load_advance * (1. - idle_vvt)).to_radians()
             } else {
                 0.
             };
@@ -572,13 +576,16 @@ impl Engine {
                         angle_rad: angle,
                         rpm: self.rpm,
                         dt_s: dt,
-                        intake,
+                        intake: self.manifolds.runner(i),
                         exhaust: boundary,
-                        intake_fresh_air_fraction: intake_composition.fresh_air_fraction,
-                        intake_fuel_fraction: intake_composition.fuel_fraction,
+                        intake_fresh_air_fraction: self
+                            .manifolds
+                            .runner_composition(i)
+                            .fresh_air_fraction,
+                        intake_fuel_fraction: self.manifolds.runner_composition(i).fuel_fraction,
                         exhaust_fresh_air_fraction: exhaust_composition[bank].fresh_air_fraction,
                         exhaust_fuel_fraction: exhaust_composition[bank].fuel_fraction,
-                        intake_mass_limit_kg: budgets.intake_kg / n as f64,
+                        intake_mass_limit_kg: self.manifolds.runner_budget_kg(i),
                         exhaust_mass_limit_kg: budgets.exhaust_kg[bank]
                             / self.bank_counts[bank].max(1) as f64,
                         fuel_multiplier: controller.fuel_multiplier,
@@ -596,7 +603,7 @@ impl Engine {
                     })
                     .map_err(|_| ())?;
                 add_exchange(
-                    &mut flows.intake,
+                    &mut flows.runner[i],
                     -output.intake_mass_kg,
                     -output.intake_enthalpy_j,
                 );
@@ -605,8 +612,8 @@ impl Engine {
                     output.exhaust_mass_kg,
                     output.exhaust_enthalpy_j,
                 );
-                flows.intake_species.fresh_air_kg += (-output.intake_fresh_air_kg).max(0.);
-                flows.intake_species.fuel_kg += (-output.intake_fuel_kg).max(0.);
+                flows.runner_species[i].fresh_air_kg += (-output.intake_fresh_air_kg).max(0.);
+                flows.runner_species[i].fuel_kg += (-output.intake_fuel_kg).max(0.);
                 flows.exhaust_species[bank].fresh_air_kg += output.exhaust_fresh_air_kg.max(0.);
                 flows.exhaust_species[bank].fuel_kg += output.exhaust_fuel_kg.max(0.);
                 *cylinder_flow += output.exhaust_mass_flow_kg_s / substeps as f64;
@@ -714,6 +721,18 @@ impl Engine {
                 } else {
                     exhaust[0]
                 };
+                let outlet = if total > 0. {
+                    (0..2)
+                        .map(|b| {
+                            self.manifolds.tailpipe_pressure_pa(b)
+                                * manifold.exhaust_mass_flow_kg_s[b].max(0.)
+                        })
+                        .sum::<f64>()
+                        / total
+                } else {
+                    self.manifolds.tailpipe_pressure_pa(0)
+                };
+                induction.set_turbine_outlet_pa(outlet).map_err(|_| ())?;
                 let turbo = induction
                     .step_with_species(
                         dt,
@@ -725,6 +744,9 @@ impl Engine {
                     )
                     .map_err(|_| ())?;
                 correction += turbo.charge_ledger.numerical_correction_j.abs();
+                self.manifolds
+                    .set_wastegate(induction.wastegate())
+                    .map_err(|_| ())?;
                 compressor_flow += turbo.compressor_mass_flow_kg_s / substeps as f64;
                 let removed_heat = manifold
                     .exhaust_mass_flow_kg_s
@@ -734,6 +756,7 @@ impl Engine {
                     .map_err(|_| ())?;
             }
             correction += manifold.intake_ledger.numerical_correction_j.abs()
+                + manifold.runner_correction_j.abs()
                 + manifold
                     .exhaust_ledger
                     .iter()

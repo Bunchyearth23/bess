@@ -30,6 +30,8 @@ pub struct InductionStep {
     /// Signed instantaneous accepted flow, atmosphere -> charge positive.
     pub compressor_mass_flow_kg_s: f64,
     pub surge_reverse_mass_kg: f64,
+    /// Impeller work on reverse flow, carried out through the inlet.
+    pub surge_work_j: f64,
     /// Absolute difference between requested and accepted compressor mass.
     pub compressor_mass_guard_kg: f64,
     pub compressor_fresh_air_kg: f64,
@@ -55,6 +57,12 @@ pub struct Induction {
     duct_area_m2: f64,
     bov: BlowOff,
     enabled: bool,
+    turbine_area_m2: f64,
+    /// Swing-valve area in parallel with the turbine nozzle.
+    wastegate_area_m2: f64,
+    /// 0 shut … 1 fully open, set by the boost-referenced actuator.
+    wastegate: f64,
+    turbine_outlet_pa: f64,
 }
 impl Induction {
     pub fn new(
@@ -84,7 +92,23 @@ impl Induction {
             duct_area_m2: 0.0015 * (total_displacement_m3 / 0.002).powf(2.0 / 3.0),
             bov: build.blow_off,
             enabled: build.aspiration != Aspiration::Natural,
+            turbine_area_m2: tuning.turbine_area_m2,
+            wastegate_area_m2: tuning.wastegate_area_m2,
+            wastegate: 0.0,
+            turbine_outlet_pa: ATMOSPHERE.pressure_pa,
         })
+    }
+    /// Wastegate opening for the exhaust network's turbine-bypass area.
+    pub fn wastegate(&self) -> f64 {
+        self.wastegate
+    }
+    /// Turbine exit (downstream catalyst/muffler volume) for the next step.
+    pub fn set_turbine_outlet_pa(&mut self, pressure_pa: f64) -> Result<(), ThermoError> {
+        if !(1000.0..=1e7).contains(&pressure_pa) {
+            return Err(ThermoError::InvalidInput);
+        }
+        self.turbine_outlet_pa = pressure_pa;
+        Ok(())
     }
     pub fn supply(&self) -> Reservoir {
         Reservoir {
@@ -172,9 +196,25 @@ impl Induction {
         let old_energy = self.shaft_energy_j;
         let mut result = InductionStep::default();
         let g = thermo::gamma(exhaust.temperature_k);
-        let pressure_ratio = (exhaust.pressure_pa / ATMOSPHERE.pressure_pa).max(1.0);
+        let pressure_ratio = (exhaust.pressure_pa / self.turbine_outlet_pa).max(1.0);
+        // Spring-preloaded actuator on charge pressure: cracks at 90 % of the
+        // target and is fully open at 110 %, the proportional band of a
+        // conventional internal wastegate (no ECU duty cycle modelled).
+        let boost = self.charge.pressure_pa() - ATMOSPHERE.pressure_pa;
+        let wastegate = if self.enabled && self.max_boost_pa > 0.0 {
+            ((boost / self.max_boost_pa - 0.9) / 0.2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Nozzle and gate see the same pressure ratio: flow splits by area.
+        let turbine_share = if self.turbine_area_m2 > 0.0 {
+            self.turbine_area_m2 / (self.turbine_area_m2 + wastegate * self.wastegate_area_m2)
+        } else {
+            1.0
+        };
         if self.enabled {
             result.turbine_energy_j = exhaust_mass_flow_kg_s.max(0.0)
+                * turbine_share
                 * dt
                 * (thermo::specific_heat_cv(exhaust.temperature_k) + thermo::GAS_CONSTANT)
                 * exhaust.temperature_k
@@ -184,7 +224,14 @@ impl Induction {
         let available = old_energy + result.turbine_energy_j;
         let omega = (2.0 * available / self.inertia).sqrt();
         let speed_ratio = (omega / 18000.0).min(1.0);
-        let head = self.max_boost_pa * speed_ratio * speed_ratio;
+        // Peak (surge-line) pressure rise at the speed limit: 4 × target, a
+        // compressor of PR ≈ 4 at 172k rpm. Surge flow ∝ ω and head ∝ ω², so
+        // this places the target at half speed and widens the constant-boost
+        // flow range surge → choke to ≈2.7×, the span of a WOT line from
+        // ~2500 rpm to redline (at 1.6× or less the line fell into surge
+        // below and choke above it). The wastegate, not the overspeed guard,
+        // then holds boost.
+        let head = 4.0 * self.max_boost_pa * speed_ratio * speed_ratio;
         let density = ATMOSPHERE.pressure_pa / (thermo::GAS_CONSTANT * ATMOSPHERE.temperature_k);
         // d(mdot)/dt = (A/L)*(compressor pressure rise - charge pressure rise).
         // The positive-slope part of the cubic is unstable against plenum
@@ -225,9 +272,13 @@ impl Induction {
         result.compressor_mass_flow_kg_s = dm / dt;
         result.surge_reverse_mass_kg = (-dm).max(0.0);
         result.compressor_mass_guard_kg = (requested - dm).abs();
-        result.compressor_energy_j = dm.max(0.0) * work_per_kg;
+        // The impeller also works on surge backflow (the returned gas leaves
+        // hot through the inlet, an external boundary): deep surge brakes the
+        // shaft instead of freewheeling. Reported separately for audits.
+        result.surge_work_j = ((-dm).max(0.0) * work_per_kg).min(available);
+        result.compressor_energy_j = dm.max(0.0) * work_per_kg + result.surge_work_j;
         result.compressor_enthalpy_j = if dm >= 0.0 {
-            dm * thermo::specific_enthalpy(300.0) + result.compressor_energy_j
+            dm * thermo::specific_enthalpy(300.0) + dm * work_per_kg
         } else {
             dm * thermo::specific_enthalpy(self.charge.temperature_k())
         };
@@ -302,6 +353,7 @@ impl Induction {
         self.species = next_species;
         self.shaft_energy_j = next_energy;
         self.compressor_flow_kg_s = dm / dt;
+        self.wastegate = wastegate;
         result.shaft_energy_change_j = next_energy - old_energy;
         Ok(result)
     }

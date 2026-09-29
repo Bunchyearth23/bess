@@ -1,7 +1,13 @@
 //! Conservative lumped intake and exhaust volumes, with explicit external ports.
 //! Dimensions, Cd and loss coefficients are engineering estimates, not flow maps.
-//! Individual throttles currently share one equivalent intake volume: this is
-//! not independent cylinder runners. Exhaust has up to two separate collectors.
+//! Individual throttles currently share one equivalent intake volume. Each
+//! cylinder draws through its own runner: a lumped inertance (the runner gas
+//! column) feeding a port volume of half the runner, the one-segment π model of
+//! a pipe (first mode ≈ 0.225 c/L vs the exact quarter-wave 0.25 c/L). This is
+//! what gives a 0D model inertial ram and Helmholtz tuning (Engelman 1953;
+//! Heywood, *Internal Combustion Engine Fundamentals*, §7.6); the column's
+//! kinetic energy is not a separate ledger term, as for the compressor duct.
+//! Exhaust has up to two separate collectors.
 use super::{
     cylinder::Reservoir,
     gas::{GasProperties, Orifice},
@@ -181,7 +187,11 @@ impl Exchange {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Flows {
+    /// Direct exchange with the plenum (audits); cylinders use `runner`.
     pub intake: Exchange,
+    /// Cylinder `i` ↔ its runner port volume, and its incoming constituents.
+    pub runner: [Exchange; 12],
+    pub runner_species: [Species; 12],
     pub exhaust: [Exchange; 2],
     /// Incoming constituents only; outgoing species use old manifold fractions.
     pub intake_species: Species,
@@ -247,6 +257,8 @@ pub struct ManifoldStep {
     /// Positive tailpipe -> atmosphere, the true outside-system gas boundary.
     pub external_tailpipe_mass_flow_kg_s: [f64; 2],
     pub intake_ledger: EnergyLedger,
+    /// Summed numerical corrections of the runner port volumes.
+    pub runner_correction_j: f64,
     pub exhaust_ledger: [EnergyLedger; 2],
     pub tailpipe_ledger: [EnergyLedger; 2],
     /// Only the external ports; cylinder exchange is excluded.
@@ -259,11 +271,23 @@ pub struct ManifoldStep {
 #[derive(Clone)]
 pub struct Manifolds {
     intake: GasState,
+    runners: [GasState; 12],
+    runner_species: [Species; 12],
+    /// Plenum → port mass flow, the momentum state of each runner column.
+    runner_flow_kg_s: [f64; 12],
+    runner_count: usize,
+    runner_area_m2: f64,
+    runner_length_m: f64,
     exhaust: [GasState; 2],
     tailpipe: [GasState; 2],
     throttle_area_m2: f64,
     exhaust_area_m2: f64,
     exhaust_cd: f64,
+    /// Turbocharged: collector → turbine nozzle ∥ wastegate → catalyst/muffler
+    /// volume → pipe. Zero turbine area keeps the single lumped restriction.
+    turbine_area_m2: f64,
+    wastegate_area_m2: f64,
+    wastegate: f64,
     active_bank_mask: [bool; 2],
     supply: Reservoir,
     supply_mass_limit_kg: f64,
@@ -380,6 +404,12 @@ impl Manifolds {
         }
         let intake_volume = tuning.plenum_volume_m3;
         let collector_volume = (displacement_m3 * 0.4).max(0.0001);
+        let runner = state(
+            tuning.runner_area_m2 * tuning.runner_length_m * 0.5,
+            ATMOSPHERE.pressure_pa,
+            310.0,
+        )
+        .map_err(|e| format!("{e:?}"))?;
         let intake =
             state(intake_volume, ATMOSPHERE.pressure_pa, 310.0).map_err(|e| format!("{e:?}"))?;
         let exhaust =
@@ -412,11 +442,23 @@ impl Manifolds {
         };
         Ok(Self {
             intake,
+            runners: [runner; 12],
+            runner_species: [Species {
+                fresh_air_kg: runner.mass_kg(),
+                fuel_kg: 0.0,
+            }; 12],
+            runner_flow_kg_s: [0.0; 12],
+            runner_count: cylinders as usize,
+            runner_area_m2: tuning.runner_area_m2,
+            runner_length_m: tuning.runner_length_m,
             exhaust: [exhaust; 2],
             tailpipe: [tailpipe; 2],
             throttle_area_m2: tuning.throttle_area_m2,
             exhaust_area_m2,
             exhaust_cd: 0.85 / (1.0_f64 + cat_loss + muffler_loss).sqrt(),
+            turbine_area_m2: tuning.turbine_area_m2,
+            wastegate_area_m2: tuning.wastegate_area_m2,
+            wastegate: 0.0,
             active_bank_mask: [true, false],
             supply: ATMOSPHERE,
             supply_mass_limit_kg: f64::INFINITY,
@@ -436,7 +478,8 @@ impl Manifolds {
         })
     }
     /// Configure before the simulation starts. Each collector retains its own
-    /// physical volume; the total tailpipe area is divided between active banks.
+    /// physical volume and its own `exhaust_mm` pipe (dual exhaust, as the
+    /// acoustic tails); one turbine's nozzle/wastegate area is shared.
     pub fn set_active_banks(&mut self, banks: usize) -> Result<(), ThermoError> {
         if !(1..=2).contains(&banks) {
             return Err(ThermoError::InvalidInput);
@@ -458,6 +501,18 @@ impl Manifolds {
     pub fn intake_composition(&self) -> Composition {
         self.intake_species.composition(self.intake.mass_kg())
     }
+    /// Port volume at the intake valve of cylinder `i`.
+    pub fn runner(&self, i: usize) -> Reservoir {
+        reservoir(self.runners[i])
+    }
+    pub fn runner_composition(&self, i: usize) -> Composition {
+        self.runner_species[i].composition(self.runners[i].mass_kg())
+    }
+    /// Cylinder `i` may draw half the safe port budget; the rest is reserved
+    /// for reverse flow into the plenum.
+    pub fn runner_budget_kg(&self, i: usize) -> f64 {
+        removable(self.runners[i]) * 0.5
+    }
     pub fn exhaust_composition(&self, bank: usize) -> Composition {
         self.exhaust_species[bank.min(1)].composition(self.exhaust[bank.min(1)].mass_kg())
     }
@@ -467,6 +522,10 @@ impl Manifolds {
     pub fn total_species(&self) -> Species {
         Species {
             fresh_air_kg: self.intake_species.fresh_air_kg
+                + self.runner_species[..self.runner_count]
+                    .iter()
+                    .map(|s| s.fresh_air_kg)
+                    .sum::<f64>()
                 + self
                     .exhaust_species
                     .iter()
@@ -478,6 +537,10 @@ impl Manifolds {
                     .map(|s| s.fresh_air_kg)
                     .sum::<f64>(),
             fuel_kg: self.intake_species.fuel_kg
+                + self.runner_species[..self.runner_count]
+                    .iter()
+                    .map(|s| s.fuel_kg)
+                    .sum::<f64>()
                 + self.exhaust_species.iter().map(|s| s.fuel_kg).sum::<f64>()
                 + self.tailpipe_species.iter().map(|s| s.fuel_kg).sum::<f64>(),
         }
@@ -523,16 +586,27 @@ impl Manifolds {
     pub fn exhaust_bank(&self, bank: usize) -> Reservoir {
         reservoir(self.exhaust[bank.min(1)])
     }
+    pub fn tailpipe_pressure_pa(&self, bank: usize) -> f64 {
+        self.tailpipe[bank.min(1)].pressure_pa()
+    }
     pub fn exhaust_mass_kg(&self, bank: usize) -> f64 {
         self.exhaust[bank.min(1)].mass_kg()
     }
     pub fn total_mass_kg(&self) -> f64 {
         self.intake.mass_kg()
+            + self.runners[..self.runner_count]
+                .iter()
+                .map(|g| g.mass_kg())
+                .sum::<f64>()
             + self.exhaust.iter().map(|g| g.mass_kg()).sum::<f64>()
             + self.tailpipe.iter().map(|g| g.mass_kg()).sum::<f64>()
     }
     pub fn total_internal_energy_j(&self) -> f64 {
         self.intake.internal_energy_j()
+            + self.runners[..self.runner_count]
+                .iter()
+                .map(|g| g.internal_energy_j())
+                .sum::<f64>()
             + self
                 .exhaust
                 .iter()
@@ -557,6 +631,14 @@ impl Manifolds {
                 }
             }),
         }
+    }
+    /// Wastegate opening 0–1 for the next step (turbocharged builds only).
+    pub fn set_wastegate(&mut self, opening: f64) -> Result<(), ThermoError> {
+        if !(0.0..=1.0).contains(&opening) {
+            return Err(ThermoError::InvalidInput);
+        }
+        self.wastegate = opening;
+        Ok(())
     }
     pub fn set_supply(&mut self, supply: Reservoir) -> Result<(), ThermoError> {
         if !(10000.0..=1e6).contains(&supply.pressure_pa)
@@ -630,6 +712,10 @@ impl Manifolds {
             || !throttle.is_finite()
             || !idle_bypass.is_finite()
             || !flows.intake.valid()
+            || flows.runner.iter().any(|f| !f.valid())
+            || flows.runner[self.runner_count..]
+                .iter()
+                .any(|f| f.mass_in_kg != 0.0 || f.mass_out_kg != 0.0)
             || flows.exhaust.iter().any(|f| !f.valid())
             || (0..2).any(|i| {
                 !self.active_bank_mask[i]
@@ -643,12 +729,70 @@ impl Manifolds {
         }
         let budgets = self.outgoing_budgets();
         if flows.intake.mass_out_kg > budgets.intake_kg * (1.0 + 1e-12)
+            || (0..self.runner_count)
+                .any(|i| flows.runner[i].mass_out_kg > self.runner_budget_kg(i) * (1.0 + 1e-12))
             || (0..2).any(|i| flows.exhaust[i].mass_out_kg > budgets.exhaust_kg[i] * (1.0 + 1e-12))
         {
             return Err(ThermoError::InvalidInput);
         }
         let mut result = ManifoldStep::default();
-        let mut working = self.clone(); // three Copy gas states, no heap allocation
+        let mut working = self.clone(); // Copy gas states, no heap allocation
+        // Runner columns: dṁ/dt = (A/L)(p_plenum − p_port) − (A/L)·K ṁ|ṁ|/(2ρA²),
+        // entry/bend loss K = 0.5 (sharp-edged plenum entry, Idelchik) taken
+        // semi-implicitly. Inertia lets flow overshoot pressure equilibrium:
+        // that is the ram effect, so only mass/thermal budgets limit it.
+        let plenum = self.intake();
+        let plenum_h = thermo::specific_enthalpy(plenum.temperature_k);
+        let plenum_composition = self.intake_composition();
+        let share = (removable(self.intake) * 0.5 - flows.intake.mass_out_kg).max(0.0)
+            / self.runner_count.max(1) as f64;
+        let mut plenum_exchange = Exchange::default();
+        let mut plenum_species = Species::default();
+        for i in 0..self.runner_count {
+            let port = self.runner(i);
+            let upstream = if plenum.pressure_pa >= port.pressure_pa {
+                plenum
+            } else {
+                port
+            };
+            let density = upstream.pressure_pa / (thermo::GAS_CONSTANT * upstream.temperature_k);
+            let gain = dt * self.runner_area_m2 / self.runner_length_m;
+            let old = self.runner_flow_kg_s[i];
+            let loss = 0.5 * old.abs() / (2.0 * density * self.runner_area_m2.powi(2));
+            let flow = (old + gain * (plenum.pressure_pa - port.pressure_pa)) / (1.0 + gain * loss);
+            let dm = (flow * dt)
+                .min(share)
+                .max(-(removable(self.runners[i]) - flows.runner[i].mass_out_kg).max(0.0));
+            working.runner_flow_kg_s[i] = dm / dt;
+            let port_h = thermo::specific_enthalpy(port.temperature_k);
+            let port_composition = self.runner_composition(i);
+            plenum_exchange.add_signed(-dm, port_h);
+            plenum_species.fresh_air_kg += (-dm).max(0.0) * port_composition.fresh_air_fraction;
+            plenum_species.fuel_kg += (-dm).max(0.0) * port_composition.fuel_fraction;
+            let mut input = flows.runner[i];
+            input.add_signed(dm, plenum_h);
+            let ledger = working.runners[i].step(
+                self.runners[i].volume_m3(),
+                EnergyInput {
+                    mass_in_kg: input.mass_in_kg,
+                    enthalpy_in_j: input.enthalpy_in_j,
+                    mass_out_kg: input.mass_out_kg,
+                    ..Default::default()
+                },
+            )?;
+            result.runner_correction_j += ledger.numerical_correction_j;
+            working.runner_species[i] = self.runner_species[i].transport(
+                self.runners[i].mass_kg(),
+                ledger.mass_out_kg,
+                Species {
+                    fresh_air_kg: flows.runner_species[i].fresh_air_kg
+                        + dm.max(0.0) * plenum_composition.fresh_air_fraction,
+                    fuel_kg: flows.runner_species[i].fuel_kg
+                        + dm.max(0.0) * plenum_composition.fuel_fraction,
+                },
+                ledger.mass_in_kg,
+            )?;
+        }
         let intake_flux = if boundaries {
             rate(
                 self.supply,
@@ -660,9 +804,12 @@ impl Manifolds {
             0.0
         };
         let intake_flux = intake_flux
-            .max(-(removable(self.intake) - flows.intake.mass_out_kg))
+            .max(-(removable(self.intake) - flows.intake.mass_out_kg - plenum_exchange.mass_out_kg))
             .min(self.supply_mass_limit_kg);
         let mut intake_input = flows.intake;
+        intake_input.mass_in_kg += plenum_exchange.mass_in_kg;
+        intake_input.enthalpy_in_j += plenum_exchange.enthalpy_in_j;
+        intake_input.mass_out_kg += plenum_exchange.mass_out_kg;
         intake_input.add_signed(
             intake_flux,
             thermo::specific_enthalpy(self.supply.temperature_k),
@@ -688,8 +835,10 @@ impl Manifolds {
         };
         let incoming_species = Species {
             fresh_air_kg: flows.intake_species.fresh_air_kg
+                + plenum_species.fresh_air_kg
                 + intake_flux.max(0.0) * self.supply_composition.fresh_air_fraction,
             fuel_kg: flows.intake_species.fuel_kg
+                + plenum_species.fuel_kg
                 + intake_flux.max(0.0) * self.supply_composition.fuel_fraction,
         };
         working.intake_species = self.intake_species.transport(
@@ -717,12 +866,18 @@ impl Manifolds {
                 continue;
             }
             let mut input = *exchange;
-            let out = rate(
-                self.exhaust_bank(i),
-                reservoir(self.tailpipe[i]),
-                self.exhaust_area_m2 / active_banks as f64,
-                self.exhaust_cd,
-            ) * dt;
+            // Turbine nozzle Cd 0.9; the aftertreatment loss moves downstream.
+            let (area, cd, tail_cd) = if self.turbine_area_m2 > 0.0 {
+                (
+                    (self.turbine_area_m2 + self.wastegate * self.wastegate_area_m2)
+                        / active_banks as f64,
+                    0.9,
+                    self.exhaust_cd,
+                )
+            } else {
+                (self.exhaust_area_m2, self.exhaust_cd, 0.9)
+            };
+            let out = rate(self.exhaust_bank(i), reservoir(self.tailpipe[i]), area, cd) * dt;
             let cfl_mass = self.tailpipe[i].mass_kg() / TAIL_SPECIES_CELLS as f64 * 0.25;
             let bounded_out = out
                 .min(removable(self.exhaust[i]) - exchange.mass_out_kg)
@@ -763,8 +918,8 @@ impl Manifolds {
                 rate(
                     reservoir(self.tailpipe[i]),
                     ATMOSPHERE,
-                    self.exhaust_area_m2 / active_banks as f64,
-                    0.9,
+                    self.exhaust_area_m2,
+                    tail_cd,
                 ) * dt
             } else {
                 0.0
@@ -1069,6 +1224,31 @@ mod tests {
         assert!((m.total_mass_kg() - mass).abs() < 1e-14);
         assert!((m.total_internal_energy_j() - energy).abs() < 1e-8);
         assert!(m.intake().temperature_k > 310.0);
+    }
+    #[test]
+    fn runner_column_conserves_and_rams_past_equilibrium() {
+        let mut m = setup();
+        let (mass, energy) = (m.total_mass_kg(), m.total_internal_energy_j());
+        let (mut drawn, mut enthalpy, mut peak) = (0.0, 0.0, 0.0_f64);
+        for i in 0..4000 {
+            let mut f = Flows::default();
+            // A 2 ms intake event on cylinder one, then the valve shuts.
+            if i < 192 {
+                let dm = m.runner_budget_kg(0) * 0.02;
+                f.runner[0].mass_out_kg = dm;
+                drawn += dm;
+                enthalpy += dm * thermo::specific_enthalpy(m.runner(0).temperature_k);
+            }
+            let s = m.step_closed(DT, f).unwrap();
+            assert!(s.runner_correction_j.abs() < 1e-9);
+            if i >= 192 {
+                peak = peak.max(m.runner(0).pressure_pa - m.intake().pressure_pa);
+            }
+        }
+        assert!((m.total_mass_kg() - mass + drawn).abs() < 1e-14);
+        assert!((m.total_internal_energy_j() - energy + enthalpy).abs() < 1e-8);
+        // The moving column piles up against the shut valve: ram overshoot.
+        assert!(peak > 500.0, "{peak} Pa");
     }
     #[test]
     fn cylinder_pumping_makes_vacuum_and_open_throttle_restores_pressure() {

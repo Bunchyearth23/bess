@@ -221,6 +221,13 @@ pub struct ResolvedTuning {
     pub plenum_volume_m3: f64,
     pub compressor_displacement_m3: f64,
     pub turbo_inertia_kg_m2: f64,
+    /// Effective turbine nozzle area; zero without a turbocharger.
+    pub turbine_area_m2: f64,
+    /// Wastegate valve flow area in parallel with the nozzle.
+    pub wastegate_area_m2: f64,
+    /// Per-cylinder intake runner, plenum to valve seat (port included).
+    pub runner_length_m: f64,
+    pub runner_area_m2: f64,
 }
 
 impl EngineTuning {
@@ -284,8 +291,41 @@ impl EngineTuning {
                 ),
             // ponytail: geometric similarity (swept volume ∝ r³, inertia ∝ r⁵),
             // not a turbo family map; replace with measured frames if needed.
-            compressor_displacement_m3: displacement * 0.005 * turbo,
+            // Matched to the engine's WOT line at the target boost: with the
+            // 4 × target head (Induction) the surge flow at target is one
+            // swept volume per revolution at half the speed limit (≈0.054
+            // kg/s at 2 L, ≈2500 rpm at 0.8 bar) and the choke side at the
+            // limit ≈3 × that (≈0.165 kg/s, ≈6300 rpm). The former 0.005
+            // choked at ≈0.10 kg/s, so boost collapsed above 4400 rpm.
+            compressor_displacement_m3: displacement * 0.008 * turbo,
             turbo_inertia_kg_m2: rotor * turbo.powf(5. / 3.),
+            // ≈27 mm equivalent nozzle at 2 L: builds turbine backpressure
+            // (inlet ≈1.6–2 bar abs at full boost) so the wastegate cracks
+            // near 3000 rpm, the usual small-frame match.
+            turbine_area_m2: if build.aspiration == Aspiration::Natural {
+                0.
+            } else {
+                5e-4 * (displacement / 0.002) * turbo.powf(2. / 3.)
+            },
+            // ≈29 mm swing valve at 2 L.
+            wastegate_area_m2: if build.aspiration == Aspiration::Natural {
+                0.
+            } else {
+                6.5e-4 * (displacement / 0.002)
+            },
+            // 0.40 m plenum-to-valve at an 86 mm stroke (typical stock 2 L
+            // DOHC runners 0.3–0.45 m), scaled with stroke so the Helmholtz
+            // tune stays at a similar fraction of the piston-speed-limited
+            // redline; area = the intake valve heads (≈44 mm at 2 L).
+            runner_length_m: 0.40 * stroke_m / 0.086,
+            runner_area_m2: PI / 4.
+                * (bore_m
+                    * or(
+                        self.valves.intake_to_bore,
+                        if intake_valves == 1 { 0.43 } else { 0.36 },
+                    ))
+                .powi(2)
+                * f64::from(intake_valves),
         }
     }
 
