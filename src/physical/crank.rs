@@ -142,6 +142,17 @@ impl Crank {
         self.accessory_nm = if compressor { 16. } else { 0. } + if electrical { 22. } else { 0. };
     }
 
+    /// Friction torque at `rpm` with the last supplied peak pressure.
+    pub fn friction_nm(&self, rpm: f64) -> f64 {
+        let speed = 2. * self.stroke_m * rpm / 60.;
+        let model = self.friction;
+        let fmep = model.a_pa
+            + model.b * self.peak_pressure_pa
+            + model.c_pa_per_m_s * speed
+            + model.d_pa_per_m2_s2 * speed * speed;
+        fmep * self.displacement_m3 / (4. * PI)
+    }
+
     pub fn set_angle_unwrapped(&mut self, angle: f64) -> Result<(), CrankError> {
         if !angle.is_finite() || angle.abs() > 1e15 {
             return Err(CrankError::InvalidInput);
@@ -165,13 +176,7 @@ impl Crank {
         {
             return Err(CrankError::InvalidInput);
         }
-        let speed = 2. * self.stroke_m * self.state.rpm / 60.;
-        let model = self.friction;
-        let fmep = model.a_pa
-            + model.b * self.peak_pressure_pa
-            + model.c_pa_per_m_s * speed
-            + model.d_pa_per_m2_s2 * speed * speed;
-        let friction_nm = fmep * self.displacement_m3 / (4. * PI);
+        let friction_nm = self.friction_nm(self.state.rpm);
         // Approximate DC starter torque-speed line with a freewheel. It cannot
         // brake a running engine, and contributes no torque unless commanded.
         let starter_nm = if starter {

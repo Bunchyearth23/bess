@@ -95,6 +95,7 @@ struct App {
     /// Firing-order text being edited, e.g. "1-3-4-2".
     firing_text: String,
     readout: Readout,
+    dyno: Dyno,
 }
 
 /// Smoothed display values: instantaneous meters are unreadable.
@@ -129,6 +130,89 @@ impl Readout {
         self.peak_db = peak.max(self.peak_db - 20. * dt);
         let rpm = f32::from_bits(meter.rpm.load(Ordering::Relaxed));
         self.rpm += (rpm - self.rpm) * (dt / 0.15).min(1.);
+    }
+}
+/// Dyno sweep points: ~250 rpm steps over a typical idle–redline span.
+const DYNO_POINTS: usize = 25;
+/// Full-load curve of the scratch engine, swept off the UI thread.
+#[derive(Default)]
+struct Dyno {
+    curve: Option<bess::dyno::Curve>,
+    error: Option<String>,
+    /// Torque-relevant scratch settings of the latest request.
+    key: Option<Scratch>,
+    /// Debounce deadline of the next sweep.
+    due: Option<std::time::Instant>,
+    /// Bumped per change: an older sweep stops early and its result is dropped.
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    progress: Arc<std::sync::atomic::AtomicUsize>,
+    worker: Option<mpsc::Receiver<(u64, Result<bess::dyno::Curve, String>)>>,
+}
+impl Dyno {
+    fn busy(&self) -> bool {
+        self.due.is_some() || self.worker.is_some()
+    }
+    /// Debounce changes, run sweeps and collect results. The clutch sizing
+    /// torque follows the computed peak unless it was set by hand.
+    fn poll(&mut self, scratch: &Scratch, clutch: &mut f32) {
+        let now = std::time::Instant::now();
+        let key = bess::dyno::key(scratch);
+        if self.key.as_ref() != Some(&key) {
+            self.key = Some(key);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.due = Some(now + Duration::from_millis(300));
+        }
+        if let Some(key) = self.key.clone()
+            && self.due.is_some_and(|due| now >= due)
+        {
+            self.due = None;
+            let (current, progress) = (self.generation.clone(), self.progress.clone());
+            let generation = current.load(Ordering::Relaxed);
+            progress.store(0, Ordering::Relaxed);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = bess::dyno::sweep_with(&key, DYNO_POINTS, |done| {
+                    progress.store(done, Ordering::Relaxed);
+                    current.load(Ordering::Relaxed) == generation
+                });
+                let _ = tx.send((generation, result));
+            });
+            self.worker = Some(rx);
+        }
+        let Some(rx) = &self.worker else { return };
+        let (generation, result) = match rx.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => (
+                self.generation.load(Ordering::Relaxed),
+                Err("The dyno sweep stopped unexpectedly.".into()),
+            ),
+        };
+        self.worker = None;
+        if generation != self.generation.load(Ordering::Relaxed) {
+            return;
+        }
+        match result {
+            Ok(curve) => {
+                let sized = |nm: f64| (nm as f32).clamp(30., 2000.);
+                let estimate = scratch
+                    .build
+                    .performance(scratch.design.cylinders)
+                    .peak_torque_nm
+                    .clamp(30., 2000.);
+                if *clutch == estimate
+                    || self
+                        .curve
+                        .as_ref()
+                        .is_some_and(|c| *clutch == sized(c.peak_torque.0))
+                {
+                    *clutch = sized(curve.peak_torque.0);
+                }
+                self.curve = Some(curve);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
     }
 }
 impl App {
@@ -175,6 +259,7 @@ impl App {
             scratch_builder: None,
             firing_text: String::new(),
             readout: Readout::new(),
+            dyno: Dyno::default(),
         };
         if let Some(path) = initial {
             if path.extension().is_some_and(|e| e == "json") {
@@ -439,6 +524,7 @@ impl App {
         let Some(scratch) = &mut self.scratch else {
             return;
         };
+        self.dyno.poll(scratch, &mut self.driving.peak_torque_nm);
         let perf = scratch.build.performance(scratch.design.cylinders);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.strong(format!(
@@ -448,17 +534,41 @@ impl App {
                 scratch.build.bore_mm,
                 scratch.build.stroke_mm
             ));
-            ui.label(format!(
-                "≈ {:.0} Nm · {:.0} kW ({:.0} hp) · idle {:.0} / redline {:.0} rpm",
-                perf.peak_torque_nm,
-                perf.peak_power_kw,
-                perf.peak_power_kw * 1.341,
-                perf.idle_rpm,
-                perf.redline_rpm
-            ));
-            ui.small(
-                "Builder estimates; running torque comes from cylinder pressure. The torque estimate only sizes the clutch.",
-            );
+            if let Some(curve) = &self.dyno.curve {
+                let ((torque, torque_rpm), (power, power_rpm)) =
+                    (curve.peak_torque, curve.peak_power);
+                ui.label(format!(
+                    "{torque:.0} Nm @ {torque_rpm:.0} · {power:.0} kW ({:.0} hp) @ {power_rpm:.0} rpm",
+                    power * 1.341
+                ));
+            } else {
+                ui.label(format!(
+                    "≈ {:.0} Nm · {:.0} kW ({:.0} hp) · idle {:.0} / redline {:.0} rpm",
+                    perf.peak_torque_nm,
+                    perf.peak_power_kw,
+                    perf.peak_power_kw * 1.341,
+                    perf.idle_rpm,
+                    perf.redline_rpm
+                ));
+            }
+            if self.dyno.busy() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.small(format!(
+                        "Dyno sweep {}/{DYNO_POINTS}",
+                        self.dyno.progress.load(Ordering::Relaxed)
+                    ));
+                });
+            }
+            if let Some(error) = &self.dyno.error {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            if let Some(curve) = &self.dyno.curve {
+                dyno_plot(ui, curve, self.dyno.busy());
+                ui.small("Wide-open throttle, speed held: cylinder gas torque minus friction. Its peak also sizes the clutch.");
+            } else {
+                ui.small("Builder estimate until the dyno sweep of the physical engine is ready.");
+            }
         });
         let before = (scratch.design, scratch.build);
         section(ui, "Block", |ui| {
@@ -986,6 +1096,167 @@ fn wheel_adjust(
             *value = next;
             response.mark_changed();
         }
+    }
+}
+/// Full-load torque (left axis) and power (right axis) from idle to redline,
+/// with peak marks and a hover readout. `dim` while a newer sweep runs.
+fn dyno_plot(ui: &mut egui::Ui, curve: &bess::dyno::Curve, dim: bool) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8., Color32::from_rgb(9, 15, 21));
+    let plot = egui::Rect::from_min_max(
+        rect.min + egui::vec2(36., 16.),
+        rect.max - egui::vec2(36., 16.),
+    );
+    let (low, high) = (curve.rpm[0], curve.rpm[curve.rpm.len() - 1]);
+    // Axis tops are whole multiples of four round quarter steps.
+    let top =
+        |peak: f64, quarter: f64| (peak * 1.15 / (4. * quarter)).ceil().max(1.) * 4. * quarter;
+    let (torque_top, power_top) = (top(curve.peak_torque.0, 25.), top(curve.peak_power.0, 10.));
+    let x = |rpm: f64| plot.left() + ((rpm - low) / (high - low)) as f32 * plot.width();
+    let y =
+        |value: f64, top: f64| plot.bottom() - (value / top).clamp(0., 1.) as f32 * plot.height();
+    let grid = Color32::from_rgb(28, 38, 48);
+    let font = egui::FontId::proportional(10.);
+    for k in 0..=4 {
+        let f = f64::from(k) / 4.;
+        let row = y(f * torque_top, torque_top);
+        painter.hline(plot.x_range(), row, egui::Stroke::new(1_f32, grid));
+        painter.text(
+            egui::pos2(plot.left() - 4., row),
+            egui::Align2::RIGHT_CENTER,
+            format!("{:.0}", f * torque_top),
+            font.clone(),
+            Color32::GRAY,
+        );
+        painter.text(
+            egui::pos2(plot.right() + 4., row),
+            egui::Align2::LEFT_CENTER,
+            format!("{:.0}", f * power_top),
+            font.clone(),
+            Color32::GRAY,
+        );
+    }
+    painter.text(
+        egui::pos2(plot.left() - 4., rect.top() + 2.),
+        egui::Align2::RIGHT_TOP,
+        "Nm",
+        font.clone(),
+        Color32::GRAY,
+    );
+    painter.text(
+        egui::pos2(plot.right() + 4., rect.top() + 2.),
+        egui::Align2::LEFT_TOP,
+        "kW",
+        font.clone(),
+        Color32::GRAY,
+    );
+    for thousand in (low / 1000.).ceil() as u32..=(high / 1000.) as u32 {
+        let column = x(f64::from(thousand) * 1000.);
+        painter.vline(column, plot.y_range(), egui::Stroke::new(1_f32, grid));
+        painter.text(
+            egui::pos2(column, plot.bottom() + 2.),
+            egui::Align2::CENTER_TOP,
+            format!("{thousand}k"),
+            font.clone(),
+            Color32::GRAY,
+        );
+    }
+    for (rpm, label, align) in [
+        (low, "idle", egui::Align2::LEFT_BOTTOM),
+        (high, "redline", egui::Align2::RIGHT_BOTTOM),
+    ] {
+        painter.vline(
+            x(rpm),
+            plot.y_range(),
+            egui::Stroke::new(1_f32, Color32::from_rgb(90, 60, 60)),
+        );
+        painter.text(
+            egui::pos2(x(rpm), plot.top() - 1.),
+            align,
+            label,
+            font.clone(),
+            Color32::GRAY,
+        );
+    }
+    let fade = if dim { 0.35 } else { 1. };
+    let torque_color = Color32::from_rgb(75, 222, 195).gamma_multiply(fade);
+    let power_color = Color32::from_rgb(255, 170, 70).gamma_multiply(fade);
+    let ((torque, torque_rpm), (power, power_rpm)) = (curve.peak_torque, curve.peak_power);
+    // Torque peaks are labelled below their mark, power peaks above.
+    for (values, top, color, (peak, peak_rpm), label, vertical) in [
+        (
+            &curve.torque_nm,
+            torque_top,
+            torque_color,
+            curve.peak_torque,
+            format!("{torque:.0} Nm @ {torque_rpm:.0}"),
+            egui::Align::Min,
+        ),
+        (
+            &curve.power_kw,
+            power_top,
+            power_color,
+            curve.peak_power,
+            format!("{power:.0} kW ({:.0} hp) @ {power_rpm:.0}", power * 1.341),
+            egui::Align::Max,
+        ),
+    ] {
+        let points = curve
+            .rpm
+            .iter()
+            .zip(values.iter())
+            .map(|(&r, &v)| egui::pos2(x(r), y(v, top)))
+            .collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.8_f32, color)));
+        let mark = egui::pos2(x(peak_rpm), y(peak, top));
+        painter.circle_filled(mark, 3.5, color);
+        let horizontal = if mark.x > plot.center().x {
+            egui::Align::Max
+        } else {
+            egui::Align::Min
+        };
+        let offset = if vertical == egui::Align::Max {
+            -5.
+        } else {
+            5.
+        };
+        painter.text(
+            mark + egui::vec2(0., offset),
+            egui::Align2([horizontal, vertical]),
+            label,
+            font.clone(),
+            color,
+        );
+    }
+    if let Some(pointer) = response
+        .hover_pos()
+        .filter(|p| plot.x_range().contains(p.x))
+    {
+        let rpm = low + f64::from((pointer.x - plot.left()) / plot.width()) * (high - low);
+        let (torque, power) = curve.at(rpm);
+        painter.vline(
+            pointer.x,
+            plot.y_range(),
+            egui::Stroke::new(1_f32, Color32::GRAY),
+        );
+        painter.circle_filled(
+            egui::pos2(pointer.x, y(torque, torque_top)),
+            3.,
+            torque_color,
+        );
+        painter.circle_filled(egui::pos2(pointer.x, y(power, power_top)), 3., power_color);
+        painter.text(
+            egui::pos2(plot.center().x, plot.bottom() - 4.),
+            egui::Align2::CENTER_BOTTOM,
+            format!(
+                "{rpm:.0} rpm · {torque:.0} Nm · {power:.0} kW ({:.0} hp)",
+                power * 1.341
+            ),
+            egui::FontId::proportional(12.),
+            Color32::WHITE,
+        );
     }
 }
 /// Log-frequency analyser: 20 Hz–20 kHz, −100 to 0 dBFS, with a light grid.
@@ -1639,6 +1910,7 @@ impl eframe::App for App {
             if (self.bank.is_some() || self.scratch.is_some())
                 && self.frames > 20
                 && !self.capture_requested
+                && !self.dyno.busy()
                 && (!self.capture_level || level_ready)
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));

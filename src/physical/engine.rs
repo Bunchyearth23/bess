@@ -258,6 +258,10 @@ impl Engine {
     pub fn failed(&self) -> bool {
         self.failed
     }
+    /// Crank friction torque at the current speed and cylinder peak pressure.
+    pub fn friction_nm(&self) -> f64 {
+        self.crank.friction_nm(self.rpm)
+    }
 
     /// Adopt prepared sound controls without replacing the running engine.
     /// Gas, crank, thermal/controller state, noise phase and cylinders survive.
