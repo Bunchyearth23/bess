@@ -381,3 +381,51 @@ fn combustion_pressure_rise_makes_mechanics_load_dependent() {
         assert!(ratio > 1.3, "throttle {throttle}: energy ratio {ratio}");
     }
 }
+
+#[test]
+fn turbo_intake_carries_a_blade_pass_line_that_natural_aspiration_lacks() {
+    let mut turbo = Scratch::default();
+    turbo.build.aspiration = bess::engine_build::Aspiration::Turbo;
+    turbo.build.boost_bar = 0.8;
+    let command = Commands {
+        imposed_rpm: Some(3000.),
+        throttle: 0.7,
+        ..Default::default()
+    };
+    let mut engines = [turbo, Scratch::default()].map(|s| Engine::new(&s, 48000).unwrap());
+    let power = |x: &[[f32; 2]], stem: usize, hz: f64| {
+        let w = std::f64::consts::TAU * hz / 48000.;
+        let (re, im) = x.iter().enumerate().fold((0., 0.), |(re, im), (i, v)| {
+            let v = f64::from(v[stem]);
+            (re + v * (w * i as f64).cos(), im + v * (w * i as f64).sin())
+        });
+        re * re + im * im
+    };
+    for _ in 0..48000 {
+        engines.iter_mut().for_each(|e| {
+            e.next(command);
+        });
+    }
+    let (mut line, mut off, mut natural) = (0., 0., 0.);
+    // 20 ms windows: the shaft barely moves, so the line stays in one bin.
+    for _ in 0..50 {
+        let mut window = [[0.; 2]; 960];
+        let mut shaft = 0.;
+        for frame in &mut window {
+            let s = engines.each_mut().map(|e| e.next(command));
+            *frame = [s[0].intake, s[1].intake];
+            shaft += s[0].turbo_rpm / 960.;
+        }
+        // Six full inducer blades.
+        let bpf = shaft / 60. * 6.;
+        assert!((5000. ..20000.).contains(&bpf), "{bpf} Hz");
+        line += power(&window, 0, bpf);
+        off += power(&window, 0, bpf * 1.15);
+        natural += power(&window, 1, bpf);
+    }
+    assert!(engines.iter().all(|e| !e.failed()));
+    assert!(
+        line > off * 10. && line > natural * 100.,
+        "{line} {off} {natural}"
+    );
+}

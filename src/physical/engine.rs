@@ -430,7 +430,6 @@ impl Engine {
         let dt = self.dt;
         let n = self.cylinders.len();
         let mut flow = [0.; 12];
-        let mut intake_flow = 0.;
         let mut intake_flows = [0.; 12];
         let mut heat = 0.;
         let mut correction = 0.;
@@ -444,6 +443,7 @@ impl Engine {
             (0., 0., 0., 0.);
         // Opt-in: at zero the knock state is never touched (bit-identical).
         let knock = self.scratch.experimental.knock > 0.;
+        let (mut throttle_flow, mut throttle_gap, mut compressor_flow) = (0., 0., 0.);
         for _ in 0..substeps {
             self.rpm = commands.imposed_rpm.unwrap_or(self.crank.state().rpm);
             let mut controller = self
@@ -597,7 +597,6 @@ impl Engine {
                 flows.exhaust_species[bank].fresh_air_kg += output.exhaust_fresh_air_kg.max(0.);
                 flows.exhaust_species[bank].fuel_kg += output.exhaust_fuel_kg.max(0.);
                 *cylinder_flow += output.exhaust_mass_flow_kg_s / substeps as f64;
-                intake_flow += output.intake_mass_kg * self.rate;
                 intake_flows[i] += output.intake_mass_kg * self.rate;
                 torque += output.gas_torque_nm;
                 heat += output.heat_j;
@@ -646,6 +645,10 @@ impl Engine {
                 .map_err(|_| ())?;
             let mut reaction_heat = [0.; 2];
             fresh_supply += manifold.intake_mass_flow_kg_s.max(0.) / substeps as f64;
+            throttle_flow += manifold.intake_mass_flow_kg_s / substeps as f64;
+            throttle_gap = self
+                .manifolds
+                .throttle_area_m2(controller.throttle, controller.bypass);
             fresh_tailpipe += manifold
                 .external_tailpipe_mass_flow_kg_s
                 .iter()
@@ -708,6 +711,7 @@ impl Engine {
                     )
                     .map_err(|_| ())?;
                 correction += turbo.charge_ledger.numerical_correction_j.abs();
+                compressor_flow += turbo.compressor_mass_flow_kg_s / substeps as f64;
                 let removed_heat = manifold
                     .exhaust_mass_flow_kg_s
                     .map(|flow| -turbo.turbine_energy_j * flow.max(0.) / total.max(1e-20));
@@ -762,11 +766,25 @@ impl Engine {
         // A fixed acoustic calibration, independent of RPM/load/observed RMS.
         const PA_TO_SAMPLE: f32 = 1. / 3000.;
         let exhaust_audio = (bank_pressure[0] + bank_pressure[1] * self.bank_gain) * PA_TO_SAMPLE;
-        let (intake_audio, contact) = self.radiation.next(
-            self.intake_acoustic.next(&intake_flows),
-            intake_flow as f32,
-            impact as f32,
-        );
+        let supply = self
+            .induction
+            .as_ref()
+            .map_or(super::manifolds::ATMOSPHERE, Induction::supply);
+        let manifold = self.manifolds.intake();
+        let air = super::radiation::Air {
+            throttle_kg_s: throttle_flow as f32,
+            gap_m2: throttle_gap as f32,
+            bore_m2: self.manifolds.throttle_area_m2(1., 0.) as f32,
+            supply_pa: supply.pressure_pa as f32,
+            supply_k: supply.temperature_k as f32,
+            manifold_pa: manifold.pressure_pa as f32,
+            manifold_k: manifold.temperature_k as f32,
+            shaft_rpm: self.induction.as_ref().map_or(0., Induction::shaft_rpm) as f32,
+            compressor_kg_s: compressor_flow as f32,
+        };
+        let (intake_audio, contact) =
+            self.radiation
+                .next(self.intake_acoustic.next(&intake_flows), impact as f32, air);
         // Structure-borne combustion noise: summed cylinder dp/dt (Pa/s),
         // high-passed so only the fast pressure-rise content excites the block.
         // Fixed calibration; load and spark timing scale it physically.
