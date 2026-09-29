@@ -539,6 +539,12 @@ pub struct Scratch {
     pub inertia: f32,
     #[serde(default)]
     pub sound: SoundTuning,
+    /// Overrides of part-derived physics; absent from files that set none.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::engine_build::EngineTuning::is_derived"
+    )]
+    pub tuning: crate::engine_build::EngineTuning,
 }
 
 fn default_inertia() -> f32 {
@@ -579,6 +585,7 @@ impl Default for Scratch {
             standalone: default_standalone(),
             inertia: default_inertia(),
             sound: SoundTuning::default(),
+            tuning: Default::default(),
         };
         scratch.apply_design();
         scratch
@@ -597,6 +604,7 @@ impl Scratch {
             && self.experimental == other.experimental
             && self.standalone == other.standalone
             && self.inertia == other.inertia
+            && self.tuning == other.tuning
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -616,6 +624,7 @@ impl Scratch {
         }
         self.experimental.validate()?;
         self.sound.validate()?;
+        self.tuning.validate()?;
         self.standalone.validate()
     }
     /// Derive every sound and bench setting from the built engine, as a
@@ -785,6 +794,8 @@ impl Scratch {
     }
     pub fn life(&self) -> Life {
         // FNV-1a over the engine's construction: same parts, same imbalance.
+        // `tuning` is left out on purpose: an override must not redraw the
+        // dispersions (honest A/B), and old projects keep their seed.
         let key = serde_json::to_string(&(self.design, self.build)).unwrap_or_default();
         let seed = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)

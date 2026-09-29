@@ -1,8 +1,8 @@
 //! Explicit SI translation of builder parts for the first cylinder prototype.
 //!
 //! Rod ratio, valve diameters/lift and cam mapping are design estimates, not
-//! measurements of a real engine. They remain visible here for calibration.
-use crate::engine_build::EngineBuild;
+//! measurements of a real engine; they live in `EngineTuning::resolve`.
+use crate::engine_build::{EngineBuild, EngineTuning, ResolvedTuning};
 
 #[derive(Clone, Copy, Debug)]
 pub struct CylinderConfig {
@@ -25,35 +25,34 @@ pub struct CylinderConfig {
 }
 
 impl CylinderConfig {
+    /// Parts only, no overrides.
     pub fn from_build(build: &EngineBuild) -> Result<Self, String> {
+        Self::from_tuning(build, &EngineTuning::default().resolve(build, 1))
+    }
+
+    pub fn from_tuning(build: &EngineBuild, tuning: &ResolvedTuning) -> Result<Self, String> {
         build.validate()?;
-        let cam = f64::from(build.cam);
-        let bore_m = f64::from(build.bore_mm) * 0.001;
-        let stroke_m = f64::from(build.stroke_mm) * 0.001;
-        let intake_valves = u32::from(build.valves).div_ceil(2);
-        let exhaust_valves = u32::from(build.valves) / 2;
-        let lift_m = 0.009 + 0.004 * cam;
+        let lift_m = tuning.lift_m;
         let lash_m = 0.0002;
-        let nominal_duration_at_050_deg = 200. + 60. * cam;
+        let nominal_duration_at_050_deg = tuning.duration_at_050_deg;
         // For harmonic lift L/2*(1+cos(2π*offset/duration)), convert the
         // duration at 0.050 inches net lift to a duration at the cam seat.
         let half_width = (2. * (0.00127 + lash_m) / lift_m - 1.).acos();
         let seat_duration_deg = nominal_duration_at_050_deg * std::f64::consts::PI / half_width;
-        let lsa = 114. - 8. * cam;
         let setup = Self {
-            bore_m,
-            stroke_m,
-            rod_m: stroke_m * 1.75,
+            bore_m: f64::from(build.bore_mm) * 0.001,
+            stroke_m: f64::from(build.stroke_mm) * 0.001,
+            rod_m: tuning.rod_m,
             compression_ratio: f64::from(build.compression),
-            intake_valves,
-            exhaust_valves,
-            intake_diameter_m: bore_m * if intake_valves == 1 { 0.43 } else { 0.36 },
-            exhaust_diameter_m: bore_m * if exhaust_valves == 1 { 0.37 } else { 0.31 },
+            intake_valves: tuning.intake_valves,
+            exhaust_valves: tuning.exhaust_valves,
+            intake_diameter_m: tuning.intake_diameter_m,
+            exhaust_diameter_m: tuning.exhaust_diameter_m,
             lift_m,
             lash_m,
             seat_duration_deg,
-            intake_center_deg: 360. + lsa,
-            exhaust_center_deg: 360. - lsa,
+            intake_center_deg: tuning.intake_center_deg,
+            exhaust_center_deg: tuning.exhaust_center_deg,
             nominal_duration_at_050_deg,
             wall_temperature_k: 450.,
         };

@@ -7,7 +7,7 @@ use super::{
     gas::{GasProperties, Orifice},
     thermo::{self, EnergyInput, EnergyLedger, GasState, ThermoError},
 };
-use crate::engine_build::{Catalyst, EngineBuild, Muffler, Throttle};
+use crate::engine_build::{Catalyst, EngineBuild, Muffler, ResolvedTuning};
 use std::f64::consts::PI;
 const TAIL_SPECIES_CELLS: usize = 16;
 
@@ -368,13 +368,17 @@ fn advect_tail(
 }
 
 impl Manifolds {
-    pub fn new(build: &EngineBuild, cylinders: u32, displacement_m3: f64) -> Result<Self, String> {
+    pub fn new(
+        build: &EngineBuild,
+        tuning: &ResolvedTuning,
+        cylinders: u32,
+        displacement_m3: f64,
+    ) -> Result<Self, String> {
         build.validate()?;
         if !(1..=12).contains(&cylinders) || !(1e-6..=0.5).contains(&displacement_m3) {
             return Err("Invalid manifold cylinder count/displacement".into());
         }
-        let individual = build.throttle == Throttle::Individual;
-        let intake_volume = displacement_m3 * if individual { 0.35 } else { 1.25 };
+        let intake_volume = tuning.plenum_volume_m3;
         let collector_volume = (displacement_m3 * 0.4).max(0.0001);
         let intake =
             state(intake_volume, ATMOSPHERE.pressure_pa, 310.0).map_err(|e| format!("{e:?}"))?;
@@ -406,15 +410,11 @@ impl Manifolds {
             Muffler::Baffled => 1.6,
             Muffler::ReverseFlow => 2.5,
         };
-        // 55 mm equivalent throttle at 2 L, with area scaled to displacement.
-        let throttle_area = PI * 0.055_f64.powi(2) / 4.0
-            * (displacement_m3 / 0.002).powf(2.0 / 3.0)
-            * if individual { 1.35 } else { 1.0 };
         Ok(Self {
             intake,
             exhaust: [exhaust; 2],
             tailpipe: [tailpipe; 2],
-            throttle_area_m2: throttle_area,
+            throttle_area_m2: tuning.throttle_area_m2,
             exhaust_area_m2,
             exhaust_cd: 0.85 / (1.0_f64 + cat_loss + muffler_loss).sqrt(),
             active_bank_mask: [true, false],
@@ -822,9 +822,17 @@ impl Manifolds {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_build::EngineTuning;
     const DT: f64 = 1.0 / 96000.0;
     fn setup() -> Manifolds {
-        Manifolds::new(&EngineBuild::default(), 4, 0.002).unwrap()
+        let build = EngineBuild::default();
+        Manifolds::new(
+            &build,
+            &EngineTuning::default().resolve(&build, 4),
+            4,
+            0.002,
+        )
+        .unwrap()
     }
     #[test]
     fn lone_second_bank_matches_first_bank_without_phantom_ports() {
@@ -1097,15 +1105,12 @@ mod tests {
     #[test]
     fn narrow_restrictive_exhaust_raises_backpressure() {
         let simulate = |diameter| {
-            let mut m = Manifolds::new(
-                &EngineBuild {
-                    exhaust_mm: diameter,
-                    ..Default::default()
-                },
-                4,
-                0.002,
-            )
-            .unwrap();
+            let build = EngineBuild {
+                exhaust_mm: diameter,
+                ..Default::default()
+            };
+            let tuning = EngineTuning::default().resolve(&build, 4);
+            let mut m = Manifolds::new(&build, &tuning, 4, 0.002).unwrap();
             for _ in 0..20000 {
                 let mut f = Flows::default();
                 f.exhaust[0].add_signed(0.05 * DT, thermo::specific_enthalpy(800.0));

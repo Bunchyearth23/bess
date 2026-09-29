@@ -17,7 +17,7 @@ use super::{
     manifolds::{ATMOSPHERE, Composition, Exchange, Species},
     thermo::{self, EnergyInput, EnergyLedger, GasState, ThermoError},
 };
-use crate::engine_build::{Aspiration, BlowOff, EngineBuild};
+use crate::engine_build::{Aspiration, BlowOff, EngineBuild, ResolvedTuning};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InductionStep {
@@ -57,7 +57,11 @@ pub struct Induction {
     enabled: bool,
 }
 impl Induction {
-    pub fn new(build: &EngineBuild, total_displacement_m3: f64) -> Result<Self, String> {
+    pub fn new(
+        build: &EngineBuild,
+        tuning: &ResolvedTuning,
+        total_displacement_m3: f64,
+    ) -> Result<Self, String> {
         build.validate()?;
         if !(1e-6..=0.5).contains(&total_displacement_m3) {
             return Err("Invalid induction displacement".into());
@@ -73,13 +77,9 @@ impl Induction {
                 fuel_kg: 0.0,
             },
             shaft_energy_j: 0.0,
-            inertia: if build.aspiration == Aspiration::TwinTurbo {
-                1.2e-5
-            } else {
-                2.0e-5
-            },
+            inertia: tuning.turbo_inertia_kg_m2,
             max_boost_pa: f64::from(build.boost_bar) * 1e5,
-            compressor_displacement_m3: total_displacement_m3 * 0.005,
+            compressor_displacement_m3: tuning.compressor_displacement_m3,
             compressor_flow_kg_s: 0.0,
             duct_area_m2: 0.0015 * (total_displacement_m3 / 0.002).powf(2.0 / 3.0),
             bov: build.blow_off,
@@ -310,17 +310,15 @@ impl Induction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_build::EngineTuning;
     const DT: f64 = 1.0 / 96000.0;
     fn turbo(bov: BlowOff) -> Induction {
-        Induction::new(
-            &EngineBuild {
-                aspiration: Aspiration::Turbo,
-                blow_off: bov,
-                ..Default::default()
-            },
-            0.002,
-        )
-        .unwrap()
+        let build = EngineBuild {
+            aspiration: Aspiration::Turbo,
+            blow_off: bov,
+            ..Default::default()
+        };
+        Induction::new(&build, &EngineTuning::default().resolve(&build, 4), 0.002).unwrap()
     }
     const EXHAUST: Reservoir = Reservoir {
         pressure_pa: 220000.0,
@@ -330,7 +328,9 @@ mod tests {
     fn throttle_peer_flux_conserves_joint_charge_and_manifold_mass_energy() {
         use super::super::manifolds::{Flows, Manifolds};
         let mut t = turbo(BlowOff::None);
-        let mut m = Manifolds::new(&EngineBuild::default(), 4, 0.002).unwrap();
+        let build = EngineBuild::default();
+        let tuning = EngineTuning::default().resolve(&build, 4);
+        let mut m = Manifolds::new(&build, &tuning, 4, 0.002).unwrap();
         let mass = t.charge_mass_kg() + m.total_mass_kg();
         let energy = t.charge_internal_energy_j() + m.total_internal_energy_j();
         let mut added_m = 0.0;

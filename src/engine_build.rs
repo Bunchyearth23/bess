@@ -149,6 +149,180 @@ impl Default for EngineBuild {
     }
 }
 
+/// Optional overrides of quantities otherwise derived from the parts; `None` =
+/// derived. Held by `Scratch`, not `EngineBuild`, so the per-design seed and
+/// old projects stay bit-identical (W-007, D-037).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineTuning {
+    pub cam: CamTuning,
+    pub valves: ValveTuning,
+    pub bottom: BottomTuning,
+    pub intake: IntakeTuning,
+    pub turbo: TurboTuning,
+}
+
+/// One profile drives both cams until the cycle model separates them (S6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CamTuning {
+    /// At 0.050″ net lift.
+    pub duration_deg: Option<f32>,
+    pub lift_mm: Option<f32>,
+    pub lsa_deg: Option<f32>,
+    /// Intake centreline = LSA − advance.
+    pub intake_advance_deg: Option<f32>,
+}
+
+/// Head diameters as fractions of the bore, so they follow bore changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ValveTuning {
+    pub intake_to_bore: Option<f32>,
+    pub exhaust_to_bore: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BottomTuning {
+    pub rod_to_stroke: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntakeTuning {
+    /// Equivalent single throttle, all individual throttles combined.
+    pub throttle_mm: Option<f32>,
+    /// Plenum volume / total displacement.
+    pub plenum_ratio: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurboTuning {
+    /// Compressor swept volume × size; rotor inertia × size^(5/3).
+    pub size: Option<f32>,
+}
+
+/// Concrete SI values, derived or fixed, consumed by the physical engine.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedTuning {
+    pub intake_valves: u32,
+    pub exhaust_valves: u32,
+    pub duration_at_050_deg: f64,
+    pub lift_m: f64,
+    /// Four-stroke crank degrees, firing TDC = 0, overlap TDC = 360.
+    pub intake_center_deg: f64,
+    pub exhaust_center_deg: f64,
+    pub intake_diameter_m: f64,
+    pub exhaust_diameter_m: f64,
+    pub rod_m: f64,
+    pub throttle_area_m2: f64,
+    pub plenum_volume_m3: f64,
+    pub compressor_displacement_m3: f64,
+    pub turbo_inertia_kg_m2: f64,
+}
+
+impl EngineTuning {
+    pub fn is_derived(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The only home of the part → quantity estimates (design choices, not
+    /// measurements). `cylinders` sizes intake and turbo to total displacement.
+    pub fn resolve(&self, build: &EngineBuild, cylinders: u32) -> ResolvedTuning {
+        use std::f64::consts::PI;
+        let or = |value: Option<f32>, derived: f64| value.map_or(derived, f64::from);
+        let cam = f64::from(build.cam);
+        let bore_m = f64::from(build.bore_mm) * 0.001;
+        let stroke_m = f64::from(build.stroke_mm) * 0.001;
+        let intake_valves = u32::from(build.valves).div_ceil(2);
+        let exhaust_valves = u32::from(build.valves) / 2;
+        let lsa = or(self.cam.lsa_deg, 114. - 8. * cam);
+        let displacement = PI * bore_m.powi(2) * stroke_m / 4. * f64::from(cylinders);
+        let individual = build.throttle == Throttle::Individual;
+        let turbo = or(self.turbo.size, 1.);
+        let rotor = if build.aspiration == Aspiration::TwinTurbo {
+            1.2e-5
+        } else {
+            2.0e-5
+        };
+        ResolvedTuning {
+            intake_valves,
+            exhaust_valves,
+            duration_at_050_deg: or(self.cam.duration_deg, 200. + 60. * cam),
+            lift_m: self
+                .cam
+                .lift_mm
+                .map_or(0.009 + 0.004 * cam, |mm| f64::from(mm) * 0.001),
+            intake_center_deg: 360. + lsa - or(self.cam.intake_advance_deg, 0.),
+            exhaust_center_deg: 360. - lsa,
+            intake_diameter_m: bore_m
+                * or(
+                    self.valves.intake_to_bore,
+                    if intake_valves == 1 { 0.43 } else { 0.36 },
+                ),
+            exhaust_diameter_m: bore_m
+                * or(
+                    self.valves.exhaust_to_bore,
+                    if exhaust_valves == 1 { 0.37 } else { 0.31 },
+                ),
+            rod_m: stroke_m * or(self.bottom.rod_to_stroke, 1.75),
+            throttle_area_m2: match self.intake.throttle_mm {
+                Some(mm) => PI * (f64::from(mm) * 0.001).powi(2) / 4.0,
+                // 55 mm equivalent throttle at 2 L, with area scaled to displacement.
+                None => {
+                    PI * 0.055_f64.powi(2) / 4.0
+                        * (displacement / 0.002).powf(2.0 / 3.0)
+                        * if individual { 1.35 } else { 1.0 }
+                }
+            },
+            plenum_volume_m3: displacement
+                * or(
+                    self.intake.plenum_ratio,
+                    if individual { 0.35 } else { 1.25 },
+                ),
+            // ponytail: geometric similarity (swept volume ∝ r³, inertia ∝ r⁵),
+            // not a turbo family map; replace with measured frames if needed.
+            compressor_displacement_m3: displacement * 0.005 * turbo,
+            turbo_inertia_kg_m2: rotor * turbo.powf(5. / 3.),
+        }
+    }
+
+    /// Numeric ranges only (D-028): a valve that cannot fit is a warning, not an error.
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, value, min, max) in [
+            ("Cam duration", self.cam.duration_deg, 180., 300.),
+            ("Cam lift", self.cam.lift_mm, 7., 16.),
+            ("Lobe separation", self.cam.lsa_deg, 102., 120.),
+            ("Intake cam advance", self.cam.intake_advance_deg, -4., 10.),
+            (
+                "Intake valve / bore",
+                self.valves.intake_to_bore,
+                0.25,
+                0.55,
+            ),
+            (
+                "Exhaust valve / bore",
+                self.valves.exhaust_to_bore,
+                0.17,
+                0.53,
+            ),
+            ("Rod / stroke", self.bottom.rod_to_stroke, 1.4, 2.2),
+            ("Throttle diameter", self.intake.throttle_mm, 30., 110.),
+            ("Plenum / displacement", self.intake.plenum_ratio, 0.3, 3.),
+            ("Turbo size", self.turbo.size, 0.5, 2.),
+        ] {
+            if let Some(value) = value
+                && !(min..=max).contains(&value)
+            {
+                return Err(format!("{label}: expected {min}–{max}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Figures shown on the builder's summary and fed to the driving bench.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Performance {
