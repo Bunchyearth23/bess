@@ -193,8 +193,14 @@ impl Engine {
         let controller = Controller::new(rpm, f64::from(scratch.redline_rpm), scratch.build.fuel)
             .map_err(|e| e.to_string())?;
         let acoustic = Acoustic::new(rate, &scratch.design, &scratch.build, &scratch.sound);
-        let intake_acoustic =
-            IntakeAcoustic::new(rate, n, &scratch.build, displacement, &scratch.sound);
+        let intake_acoustic = IntakeAcoustic::new(
+            rate,
+            n,
+            &scratch.build,
+            &tuning,
+            displacement,
+            &scratch.sound,
+        );
         let tone = Tone::new(rate, &scratch.sound);
         let mechanics = Modes::new(
             rate as f32,
@@ -787,9 +793,13 @@ impl Engine {
             shaft_rpm: self.induction.as_ref().map_or(0., Induction::shaft_rpm) as f32,
             compressor_kg_s: compressor_flow as f32,
         };
-        let (intake_audio, contact) =
-            self.radiation
-                .next(self.intake_acoustic.next(&intake_flows), impact as f32, air);
+        // The same butterfly aperture and jet drive the throttle junction and hiss.
+        let pulse = self.intake_acoustic.next(
+            &intake_flows,
+            f64::from(air.gap_m2 / air.bore_m2),
+            f64::from(air.jet_m_s()),
+        );
+        let (intake_audio, contact) = self.radiation.next(pulse, impact as f32, air);
         // Structure-borne combustion noise: summed cylinder dp/dt (Pa/s),
         // high-passed so only the fast pressure-rise content excites the block.
         // Fixed calibration; load and spark timing scale it physically.

@@ -102,6 +102,29 @@ pub(crate) struct Air {
     pub compressor_kg_s: f32,
 }
 
+impl Air {
+    /// Isentropic throttle jet speed from the pressure ratio, sonic when
+    /// choked; zero at ratio 1. Either flow direction.
+    pub fn jet_m_s(&self) -> f32 {
+        let (high, low, temperature) = if self.supply_pa >= self.manifold_pa {
+            (self.supply_pa, self.manifold_pa, self.supply_k)
+        } else {
+            (self.manifold_pa, self.supply_pa, self.manifold_k)
+        };
+        let ratio = (low / high).clamp(0., 1.);
+        if ratio > CHOKE {
+            2. * CP_AIR * temperature * (1. - ratio.powf(0.2857))
+        } else {
+            2.8 / 2.4 * R_AIR * temperature
+        }
+        .sqrt()
+    }
+    fn pressure_ratio(&self) -> f32 {
+        let (a, b) = (self.supply_pa, self.manifold_pa);
+        (a.min(b) / a.max(b)).clamp(0., 1.)
+    }
+}
+
 const R_AIR: f32 = 287.;
 const CP_AIR: f32 = 1005.;
 // Critical pressure ratio for γ = 1.4; below it the throttle jet is sonic.
@@ -111,9 +134,15 @@ const CHOKE: f32 = 0.528;
 // firing orders, for every operating point.
 const SHEDDING: f32 = 0.21 / 0.15;
 // Jet-thickness Strouhal. A sub-millimetre gap peaks ultrasonically; only its
-// low tail passes the airbox, so the band centre is clamped at HISS_HZ.
+// rising low tail passes the airbox, so the audible maximum sits where that
+// tail meets the airbox roll-off: the band centre is clamped at AIRBOX_HZ and
+// the power scaled by the audible fraction. (The former 8 kHz clamp kept the
+// ultrasonic power and put 26 % of the idle intake in 4-8 kHz; X-009.)
 const JET_ST: f32 = 0.2;
-const HISS_HZ: f32 = 8000.;
+// Airbox + filter element as one 2nd-order low-pass. A ~8 L box (~0.2 m) is a
+// lumped compliance up to ~c/2L = 0.9 kHz; box modes and the paper element
+// leak and absorb above it, taken as a roll-off one octave higher. Estimate.
+const AIRBOX_HZ: f32 = 2000.;
 // Edge tone of the underexpanded jet on the plate, about a quarter bore away.
 const EDGE_ST: f32 = 0.1 / 0.25;
 // The inducer sees the 6 full blades of a 6+6 splitter wheel; the second
@@ -121,12 +150,16 @@ const EDGE_ST: f32 = 0.1 / 0.25;
 const BLADES: f32 = 6.;
 const TIP_RADIUS_M: f32 = 0.025;
 // Fixed calibrations, referenced to 10 g/s, 20 m/s, 340 m/s, 300 m/s tip and
-// a 1 kHz band. Default Scratch, 48 kHz voice: breath RMS 2.2e-4 at 850 rpm /
-// 0.1 (hiss) and 2.2e-3 at 3000 / 0.7 (duct), keeping total intake within
-// 2.2 dB of the former fixed 900 Hz breath. Whine: -17 dB re turbo intake.
+// a 1 kHz band, set jointly with the tonal PA_TO_SAMPLE of `IntakeAcoustic`
+// against the pre-2026-09-29 fixed layer (default I4, `final_proof`; X-023).
+// DUCT: +2 dB; WOT / high rpm RMS +1.3 / +1.8 dB over that layer, peaks +3.3.
+// HISS: a fully audible jet (peak under AIRBOX_HZ) of 10 g/s at 340 m/s; the
+// 0.2 mm idle gap keeps ~5e-4 of that amplitude, a 1.5 mm cruise gap ~4 %:
+// ~5 dB under duct and tone at 2000 / 0.3, about half of a quiet idle.
+// Edge tone and whine unchanged (whine -13 dB re turbo intake at 4500 / 1.0).
 const FLOW_REF: f32 = 0.01;
-const DUCT: f32 = 0.0158;
-const HISS: f32 = 0.0286;
+const DUCT: f32 = 0.0199;
+const HISS: f32 = 2.0;
 const WHISTLE: f32 = 0.015;
 const WHINE: f32 = 9.2e-5;
 
@@ -161,7 +194,7 @@ impl Radiation {
             centre: [1000.; 4],
             airbox: StateVariableFilter::new(
                 rate,
-                2800_f32.min(rate * 0.35),
+                AIRBOX_HZ.min(rate * 0.35),
                 0.707,
                 SvfMode::Lowpass,
             ),
@@ -196,30 +229,27 @@ impl Radiation {
         let mut target = [0.; 4];
         let mut centre = self.centre;
         if flow > 0. && bore > 0. {
-            // Duct dipole: acoustic power ∝ U⁶, so amplitude ∝ U³, spread over
-            // a constant-Q band whose white-noise power grows with its centre.
+            // Duct dipole in the plane-wave band (below the 1.84 c / (pi d)
+            // ≈ 3.7 kHz cut-on of a 55 mm duct): power ∝ U⁴ (Nelson & Morfey
+            // 1981), amplitude ∝ U², not the free-field U³. Spread over a
+            // constant-Q band whose white-noise power grows with its centre.
             let density = air.supply_pa / (R_AIR * air.supply_k);
             let duct = (flow / (density * air.bore_m2)).min(400.);
             centre[0] = (SHEDDING * duct / bore).clamp(20., limit);
-            target[0] = DUCT * (duct / 20.).powi(3) * (1000. / centre[0]).sqrt();
-            // Throttle jet: isentropic speed from the pressure ratio, sonic
-            // when choked. Lighthill power ∝ ṁU⁷ at fixed flow; zero at ratio 1.
-            let (high, low, temperature) = if air.supply_pa >= air.manifold_pa {
-                (air.supply_pa, air.manifold_pa, air.supply_k)
-            } else {
-                (air.manifold_pa, air.supply_pa, air.manifold_k)
-            };
-            let ratio = (low / high).clamp(0., 1.);
-            let jet = if ratio > CHOKE {
-                2. * CP_AIR * temperature * (1. - ratio.powf(0.2857))
-            } else {
-                2.8 / 2.4 * R_AIR * temperature
-            }
-            .sqrt();
+            target[0] = DUCT * (duct / 20.).powi(2) * (1000. / centre[0]).sqrt();
+            // Throttle jet: Lighthill power ∝ ṁU⁷ at fixed flow; zero at ratio 1.
+            let jet = air.jet_m_s();
+            let ratio = air.pressure_ratio();
             let gap = air.gap_m2.clamp(1e-9, air.bore_m2) / (std::f32::consts::PI * bore);
-            centre[1] = (JET_ST * jet / gap).clamp(20., HISS_HZ.min(limit));
+            // Below its peak the jet spectrum rises as f², so the airbox passes
+            // (f_airbox / f_peak)³ of its power. The ultrasonic rest of a thin
+            // idle jet is not folded into the audible band.
+            let peak = JET_ST * jet / gap;
+            let corner = AIRBOX_HZ.min(limit);
+            centre[1] = peak.clamp(20., corner);
+            let audible = (corner / peak).min(1.).powf(1.5);
             let drive = (flow / FLOW_REF).sqrt() * (jet / 340.).powf(3.5);
-            target[1] = HISS * drive * (1000. / centre[1]).sqrt();
+            target[1] = HISS * drive * audible * (1000. / centre[1]).sqrt();
             centre[2] = (EDGE_ST * jet / bore).clamp(20., limit);
             target[2] = WHISTLE * drive * ((CHOKE - ratio) / CHOKE).clamp(0., 1.);
         }
@@ -359,18 +389,40 @@ mod tests {
         let slow = intake(air(0.02, 101000., 1.), 48000);
         let fast = intake(air(0.08, 101000., 1.), 48000);
         let (slow, fast) = (&slow[4800..], &fast[4800..]);
-        // 4x air speed: U³ is +36 dB before the constant-Q bandwidth term.
-        // Measured +35.3 dB, mean-square frequency x3.8.
+        // 4x air speed: plane-wave U² is +24 dB; the constant-Q band keeps
+        // total power independent of its centre.
         let db = 20. * (rms(fast) / rms(slow)).log10();
         let bright = brightness(fast) / brightness(slow);
-        assert!(db > 24. && bright > 2.5, "{db} dB, x{bright}");
+        assert!(db > 18. && bright > 2.5, "{db} dB, x{bright}");
     }
     #[test]
     fn throttle_hiss_needs_a_pressure_drop_at_equal_flow() {
-        let part = intake(air(0.02, 55000., 0.05), 48000);
+        // 30 % open at 55 kPa: 4 mm jet, peak ~15 kHz, 5 % of its amplitude
+        // audible.
+        let part = intake(air(0.02, 55000., 0.3), 48000);
         let open = intake(air(0.02, 101000., 1.), 48000);
         let db = 20. * (rms(&part[4800..]) / rms(&open[4800..])).log10();
         assert!(db > 12., "{db} dB");
+    }
+    #[test]
+    fn a_thin_jet_hides_its_hiss_ultrasonically() {
+        // Same flow and pressure drop through a 0.7 mm gap: peak ~90 kHz,
+        // (2 / 90)^1.5 of the amplitude reaches the band; no 4-8 kHz pile-up.
+        let wide = intake(air(0.02, 55000., 0.3), 48000);
+        let thin = intake(air(0.02, 55000., 0.05), 48000);
+        let db = 20. * (rms(&thin[4800..]) / rms(&wide[4800..])).log10();
+        let x = &thin[4800..];
+        let high: f32 = (40..80)
+            .map(|k| dft_power(x, k as f32 * 100., 48000.))
+            .sum();
+        let all: f32 = (1..240)
+            .map(|k| dft_power(x, k as f32 * 100., 48000.))
+            .sum();
+        println!(
+            "thin vs wide {db:.1} dB, thin 4-8 kHz share {:.3}",
+            high / all
+        );
+        assert!(db < -6. && high < all * 0.1, "{db} dB, {}", high / all);
     }
     fn dft_power(x: &[f32], hz: f32, rate: f32) -> f32 {
         let w = std::f32::consts::TAU * hz / rate;

@@ -2,7 +2,7 @@
 //! snorkel, or from each trumpet with individual throttles. Linear acoustic
 //! perturbations ride on the 0D mean state. This is not 1D CFD.
 use crate::{
-    engine_build::{EngineBuild, Throttle},
+    engine_build::{EngineBuild, ResolvedTuning, Throttle},
     scratch::SoundTuning,
 };
 use bdsp::delay::DelayLine;
@@ -12,11 +12,13 @@ use std::f64::consts::PI;
 const C: f64 = 350.;
 // Open valve: cylinder volume and valve orifice absorb part of each wave.
 const OPEN_REFLECTION: f64 = 0.4;
-// Radiated Pa at 1 m to output sample, fixed. Centred on the former 750 Hz /
-// x0.06 summed-flow layer (default I4, 96 kHz, 2 s RMS): 0.119 Pa at 850 rpm /
-// 0.1 and 2.50 Pa at 3000 / 0.7 land -4.2 and +4.2 dB from it. The spread is
-// radiation (d/dt) plus the ~99 Hz plenum mode meeting 100 Hz firing.
-const PA_TO_SAMPLE: f64 = 1.08e-3;
+// Radiated Pa at 1 m to output sample, fixed, set jointly with the flow-noise
+// constants in `radiation` (X-023). The throttle junction (isolating the
+// plenum at part load) and the resolved 55 mm bore (was 60 mm, detuning the
+// ~99 Hz plenum mode off 100 Hz firing) together cost 7 dB at 3000 / 0.7;
+// +7 dB over the former 1.08e-3 puts the tone there back on the former layer
+// (-29 dBFS in `final_proof`); WOT / high rpm stay duct-noise dominated.
+const PA_TO_SAMPLE: f64 = 2.42e-3;
 
 struct Tube {
     forward: DelayLine,
@@ -85,6 +87,18 @@ pub struct IntakeAcoustic {
     previous_volume_flow: f64,
 }
 
+/// Throttle as a series resistance R on the duct (impedance Z = rho c / A):
+/// k = Z / (Z + R). Borda-Carnot loss of the jet re-expanding into the bore,
+/// dp = rho u² (1 - s)² / 2 with u = Q / (s A), linearised about the mean jet
+/// speed: R / Z = (u / c) (1 - s)² / s. Wide open (s -> 1) is transparent, a
+/// nearly closed plate isolates the plenum. R >= 0 keeps any k(t) passive.
+/// Geometric area, no vena contracta; the plate inertance is omitted.
+fn throttle_transmission(open: f64, jet_m_s: f64) -> f64 {
+    let open = open.clamp(1e-6, 1.);
+    let r = jet_m_s.max(0.) / C * (1. - open).powi(2) / open;
+    if r.is_finite() { 1. / (1. + r) } else { 1. }
+}
+
 fn loss(length_m: f64) -> f64 {
     // T60 0.12 s of travel time, as in the exhaust primaries.
     0.001_f64.powf(length_m / C / 0.12)
@@ -96,10 +110,13 @@ fn open_end(rate: f64, radius_m: f64) -> f64 {
 }
 
 impl IntakeAcoustic {
+    /// Throttle bore and plenum volume come from `EngineTuning::resolve`, the
+    /// values `Manifolds` uses, so part overrides move both together.
     pub fn new(
         rate: u32,
         cylinders: usize,
         build: &EngineBuild,
+        parts: &ResolvedTuning,
         displacement_m3: f64,
         tuning: &SoundTuning,
     ) -> Self {
@@ -110,9 +127,8 @@ impl IntakeAcoustic {
         // Individual throttles: short runners open through trumpets (the old
         // voice used 0.18 m against 0.38 m for a plenum).
         let length_scale = if individual { 0.5 } else { 1. };
-        // Throttle bore ~60 mm for 2 L; area follows displacement.
-        let throttle_radius = 0.03 * (displacement_m3 / 0.002).sqrt();
-        let throttle_area = PI * throttle_radius.powi(2);
+        let throttle_area = parts.throttle_area_m2;
+        let throttle_radius = (throttle_area / PI).sqrt();
         let duct = 0.35;
         let snorkel = 0.25;
         let length = f64::from(tuning.intake_length_m) * length_scale;
@@ -126,11 +142,11 @@ impl IntakeAcoustic {
                     mouth: 0.,
                 })
                 .collect(),
-            // Plenum volume as in `Manifolds`; airbox about four displacements.
+            // Airbox about four displacements.
             airbox: (!individual).then(|| Airbox {
                 duct: Tube::new(rate, throttle_area),
                 snorkel: Tube::new(rate, throttle_area),
-                compliance: [1.25, 4.].map(|v| v * displacement_m3 * rate / C),
+                compliance: [parts.plenum_volume_m3, 4. * displacement_m3].map(|v| v * rate / C),
                 pressure: [0.; 2],
                 delay: [duct, snorkel].map(|l| l * rate / C),
                 loss: [loss(duct), loss(snorkel)],
@@ -156,7 +172,9 @@ impl IntakeAcoustic {
     }
 
     /// Valve mass flows (kg/s, into the cylinder) to radiated pressure.
-    pub fn next(&mut self, flow_kg_s: &[f64; 12]) -> f32 {
+    /// `open`: throttle aperture / bore area; `jet_m_s`: throttle jet speed.
+    pub fn next(&mut self, flow_kg_s: &[f64; 12], open: f64, jet_m_s: f64) -> f32 {
+        let throttle = throttle_transmission(open, jet_m_s);
         self.length_m += self.length_slew * (self.target_length_m - self.length_m);
         let delay = self.length_m * self.rate / C;
         let runner_loss = loss(self.length_m);
@@ -171,8 +189,10 @@ impl IntakeAcoustic {
             let snorkel = a.snorkel.read(a.delay[1], self.filter, a.loss[1]);
             // Compliant junction, areas as admittances (rho*c cancels):
             // V/c dp/dt = sum A (2 a - p), backward Euler, passive.
-            let mut weighted = a.duct.area * duct[1];
-            let mut area = a.duct.area;
+            // The duct joins through the throttle resistance: admittance k A.
+            let throttle_area = throttle * a.duct.area;
+            let mut weighted = throttle_area * duct[1];
+            let mut area = throttle_area;
             for (arrival, r) in arrivals.iter().zip(&self.runners) {
                 weighted += r.tube.area * arrival[0];
                 area += r.tube.area;
@@ -183,8 +203,11 @@ impl IntakeAcoustic {
                 + 2. * (a.duct.area * duct[0] + a.snorkel.area * snorkel[1]))
                 / (a.compliance[1] + a.duct.area + a.snorkel.area);
             a.mouth += a.mouth_filter * (snorkel[0] - a.mouth);
-            a.duct
-                .write(a.pressure[0] - duct[1], a.pressure[1] - duct[0]);
+            // Duct end behind the resistor: k (p - a) + (1 - k) a; k = 0 is rigid.
+            a.duct.write(
+                throttle * (a.pressure[0] - duct[1]) + (1. - throttle) * duct[1],
+                a.pressure[1] - duct[0],
+            );
             a.snorkel.write(a.pressure[1] - snorkel[1], -a.mouth);
             volume_flow = a.snorkel.area * (snorkel[0] + a.mouth);
             for (f, arrival) in far.iter_mut().zip(&arrivals) {
@@ -192,9 +215,10 @@ impl IntakeAcoustic {
             }
         } else {
             for ((f, arrival), r) in far.iter_mut().zip(&arrivals).zip(&mut self.runners) {
+                // Each trumpet throttle: the same resistance before the open end.
                 r.mouth += self.trumpet_filter * (arrival[0] - r.mouth);
-                *f = -r.mouth;
-                volume_flow += r.tube.area * (arrival[0] + r.mouth);
+                *f = (1. - throttle) * arrival[0] - throttle * r.mouth;
+                volume_flow += throttle * r.tube.area * (arrival[0] + r.mouth);
             }
         }
         for (i, r) in self.runners.iter_mut().enumerate() {
@@ -232,7 +256,8 @@ mod tests {
             intake_length_m: length,
             ..Default::default()
         };
-        IntakeAcoustic::new(rate, 4, &build, 0.002, &tuning)
+        let parts = crate::engine_build::EngineTuning::default().resolve(&build, 4);
+        IntakeAcoustic::new(rate, 4, &build, &parts, 0.002, &tuning)
     }
     fn impulse(n: &mut IntakeAcoustic, samples: u32) -> Vec<f64> {
         (0..samples)
@@ -241,7 +266,7 @@ mod tests {
                 if i == 0 {
                     flow[0] = 0.01;
                 }
-                let y = f64::from(n.next(&flow));
+                let y = f64::from(n.next(&flow, 1., 0.));
                 assert!(y.is_finite());
                 y
             })
@@ -276,7 +301,7 @@ mod tests {
                 for length in [0.15, 1.5] {
                     let mut n = network(rate, throttle, length);
                     for _ in 0..1000 {
-                        assert_eq!(n.next(&[0.; 12]), 0.);
+                        assert_eq!(n.next(&[0.; 12], 1., 0.), 0.);
                     }
                     let x = impulse(&mut n, rate);
                     let early = energy(&x[..x.len() / 4]);
@@ -326,10 +351,10 @@ mod tests {
                         flow[cylinder] = 0.03 * (phase * PI).sin();
                     }
                 }
-                let a = f64::from(split.next(&flow));
+                let a = f64::from(split.next(&flow, 1., 0.));
                 let mut sum = [0.; 12];
                 sum[0] = flow.iter().sum();
-                let b = f64::from(summed.next(&sum));
+                let b = f64::from(summed.next(&sum, 1., 0.));
                 if i > 24000 {
                     difference += (a - b).powi(2);
                     power += a * a;
@@ -356,10 +381,74 @@ mod tests {
         assert_eq!(n.length_m, before);
         assert_eq!(n.runners[0].tube.forward.read_at(10.), wave);
         for _ in 0..2400 {
-            n.next(&[0.; 12]);
+            n.next(&[0.; 12], 1., 0.);
         }
         let target = f64::from(1.2_f32);
         let remaining = (target - n.length_m) / (target - before);
         assert!((remaining - (-1_f64).exp()).abs() < 1e-6);
+    }
+
+    // 3000 rpm I4 valve pulses, 1 s at 48 kHz; radiated energy of the last half.
+    fn pulsed(n: &mut IntakeAcoustic, throttle: impl Fn(usize) -> (f64, f64)) -> f64 {
+        let mut power = 0.;
+        for i in 0..48000 {
+            let cycle = (i % 1920) as f64 / 1920.;
+            let mut flow = [0.; 12];
+            for (k, cylinder) in [0, 2, 3, 1].into_iter().enumerate() {
+                let phase = (cycle - k as f64 * 0.25).rem_euclid(1.) * 4.;
+                if phase < 1. {
+                    flow[cylinder] = 0.03 * (phase * PI).sin();
+                }
+            }
+            let (open, jet) = throttle(i);
+            let y = f64::from(n.next(&flow, open, jet));
+            assert!(y.is_finite());
+            if i >= 24000 {
+                power += y * y;
+            }
+        }
+        power
+    }
+
+    #[test]
+    fn closing_the_throttle_isolates_the_plenum_at_equal_pulsation() {
+        // Borda-Carnot k: wide open 1; 30 % at 150 m/s 1 / 1.7; 1.3 % choked 0.015.
+        assert_eq!(throttle_transmission(1., 300.), 1.);
+        assert!((throttle_transmission(0.3, 150.) - 1. / 1.7).abs() < 1e-9);
+        assert!(throttle_transmission(0.013, 318.) < 0.02);
+        for throttle in [Throttle::Single, Throttle::Individual] {
+            let db: Vec<f64> = [(1., 0.), (0.3, 150.), (0.013, 318.)]
+                .map(|(open, jet)| {
+                    let n = &mut network(48000, throttle, 0.38);
+                    10. * pulsed(n, |_| (open, jet)).log10()
+                })
+                .to_vec();
+            println!("{throttle:?}: open / 30 % / idle {db:.1?} dB");
+            assert!(
+                db[0] > db[1] + 3. && db[1] > db[2] + 10.,
+                "{throttle:?} {db:?}"
+            );
+            assert!(db[0] - db[2] > 25., "{throttle:?} {db:?}");
+        }
+    }
+
+    #[test]
+    fn a_moving_throttle_stays_passive_and_decays() {
+        // Snap open/closed at 20 Hz while pulsing, then silence: tails decay.
+        for throttle in [Throttle::Single, Throttle::Individual] {
+            let mut n = network(48000, throttle, 0.38);
+            pulsed(&mut n, |i| {
+                if i / 1200 % 2 == 0 {
+                    (1., 0.)
+                } else {
+                    (0.01, 318.)
+                }
+            });
+            let tail: Vec<f64> = (0..48000)
+                .map(|i| f64::from(n.next(&[0.; 12], (i % 2) as f64, 200.)))
+                .collect();
+            let (early, late) = (energy(&tail[..4800]), energy(&tail[43200..]));
+            assert!(late < early * 1e-8, "{throttle:?}: {late}/{early}");
+        }
     }
 }
