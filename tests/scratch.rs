@@ -313,4 +313,44 @@ mod physical {
             "starter must not jump to idle RPM"
         );
     }
+
+    #[test]
+    fn held_starter_brings_a_stopped_engine_to_a_self_sustaining_idle() {
+        let scratch = Scratch::default();
+        let controls = Controls {
+            mode: Mode::Simulated,
+            gear: 0,
+            automatic: false,
+            throttle: 0.,
+            ..Default::default()
+        };
+        let params = Parameters::default();
+        let mut model = ScratchModel::build(&scratch, 48_000).unwrap();
+        model
+            .physical
+            .as_mut()
+            .unwrap()
+            .next(bess::physical::engine::Commands {
+                imposed_rpm: Some(0.),
+                throttle: 0.,
+                ..Default::default()
+            });
+        let mut bench = Bench::from_scratch(48_000, params, Settings::default(), controls, model);
+        render(&mut bench, 48);
+        let held = Settings {
+            starter: true,
+            ..Default::default()
+        };
+        bench.set(params, held, controls, 0);
+        // Cranking against compression used to stop the crank mid-step and
+        // step the cylinders backwards, failing the engine permanently.
+        render(&mut bench, 96_000);
+        bench.set(params, Settings::default(), controls, 0);
+        render(&mut bench, 144_000);
+        let rpm = bench.state().rpm;
+        assert!(
+            rpm > scratch.idle_rpm * 0.7,
+            "engine must keep running after the starter is released, got {rpm} rpm"
+        );
+    }
 }

@@ -703,7 +703,10 @@ impl Engine {
                     )
                     .map_err(|_| ())?;
                 self.rpm = state.rpm;
-                self.angle = state.angle_unwrapped;
+                // Cylinders were fed the start-RPM prediction. When compression
+                // stops the crank mid-step (cranking, stall) the integrated angle
+                // falls short of it; never step the cylinders backwards.
+                self.angle = state.angle_unwrapped.max(angle);
             } else {
                 self.angle = angle;
             }

@@ -175,7 +175,7 @@ impl Crank {
         // Approximate DC starter torque-speed line with a freewheel. It cannot
         // brake a running engine, and contributes no torque unless commanded.
         let starter_nm = if starter {
-            (self.displacement_m3 * 30_000.).clamp(12., 400.)
+            (self.displacement_m3 * 75_000.).clamp(30., 600.)
                 * (1. - self.state.rpm / 400.).clamp(0., 1.)
         } else {
             0.
