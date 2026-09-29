@@ -8,6 +8,7 @@ use crate::{
         Commands as PhysicalCommands, Engine as PhysicalEngine, Sample as PhysicalSample,
     },
     project::Parameters,
+    room::{Room, RoomReverb},
     scratch::{ScratchModel, ScratchVoice},
 };
 use bdsp::svf::{StateVariableFilter, SvfMode};
@@ -250,6 +251,8 @@ struct Listener {
     /// Smoothed exhaust gain, engine gain, cabin, outside and overall weights.
     weights: [f32; 5],
     slew: f32,
+    /// Live listening only; `None` in every render and export.
+    room: Option<Box<RoomReverb>>,
     /// Attenuate upcoming peaks before they arrive, without cutting their tops.
     limiter: crate::output_limiter::OutputLimiter,
 }
@@ -272,6 +275,7 @@ impl Listener {
             ground_delay: ((0.00028 * rate).round() as usize).clamp(1, 127),
             weights: [1., 0.16, 0., 0., 1.],
             slew: 1. / (rate * 0.05),
+            room: None,
             limiter: crate::output_limiter::OutputLimiter::new(rate as u32),
         }
     }
@@ -297,7 +301,12 @@ impl Listener {
         self.ground_index = (self.ground_index + 1) % self.ground.len();
         let far = self.air.next_sample(x + 0.7 * reflected) * 0.6;
         let near = x * (1. - cabin - outside) + inside * cabin + far * outside;
-        self.limit(near * overall * Self::MAKEUP_GAIN)
+        let x = near * overall * Self::MAKEUP_GAIN;
+        let x = match &mut self.room {
+            Some(room) => room.next(x),
+            None => x,
+        };
+        self.limit(x)
     }
     /// Leave room for the output resampler. The 3 ms anticipation lets the gain
     /// fall before a peak arrives, preserving the waveform's local shape.
@@ -444,6 +453,18 @@ impl Bench {
     }
     pub fn set_audition_mix(&mut self, mix: AuditionMix) {
         self.audition_mix = mix;
+    }
+    /// Give the scratch listener a room (default `Off`). Only the live audio
+    /// path calls this; renders and exports keep a room-free listener.
+    pub fn enable_room(&mut self) {
+        if let Some(listener) = &mut self.listener {
+            listener.room = Some(Box::new(RoomReverb::new(self.rate)));
+        }
+    }
+    pub fn set_room(&mut self, room: Room, mix: f32) {
+        if let Some(reverb) = self.listener.as_mut().and_then(|l| l.room.as_mut()) {
+            reverb.set(room, mix);
+        }
     }
     pub fn set_beamng_camera(&mut self, camera: BeamNgCamera) {
         self.beamng_camera = camera;

@@ -18,6 +18,7 @@ pub mod physical;
 pub mod project;
 pub mod realtime;
 pub mod render;
+pub mod room;
 pub mod scratch;
 pub mod standalone;
 #[cfg(test)]

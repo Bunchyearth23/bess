@@ -13,6 +13,8 @@ hound = "3.5"
 rfd = "0.15"
 crossbeam-channel = "0.5"
 rtrb = "0.3"
+# Already built for bdsp; room convolution uses it directly.
+rustfft = "6.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -501,6 +501,7 @@ dependencies = [
  "image",
  "rfd",
  "rtrb",
+ "rustfft",
  "serde",
  "serde_json",
  "sha2",

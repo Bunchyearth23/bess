@@ -8,6 +8,7 @@ use bess::{
         AudioReader, AudioWorker, CommandSender, DenormalGuard, PipeStats, RenderEngine,
         command_ring,
     },
+    room::Room,
     scratch::{Scratch, ScratchModel, ScratchVoice},
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -168,7 +169,11 @@ impl Audio {
         scratch: &Scratch,
         driving: Controls,
     ) -> Result<Self, String> {
-        Self::open(|rate| RenderEngine::scratch(rate, params, settings, driving, scratch))
+        Self::open(|rate| {
+            let mut engine = RenderEngine::scratch(rate, params, settings, driving, scratch)?;
+            engine.bench.enable_room();
+            Ok(engine)
+        })
     }
     fn open(make: impl FnOnce(u32) -> Result<RenderEngine, String>) -> Result<Self, String> {
         let host = cpal::default_host();
@@ -216,6 +221,7 @@ impl Audio {
                 let command: Command = command;
                 engine.bench.set_audition_mix(command.audition_mix);
                 engine.bench.set_beamng_camera(command.camera);
+                engine.bench.set_room(command.room, command.room_mix);
                 engine.bench.set(
                     command.params,
                     command.settings,
@@ -444,4 +450,6 @@ pub struct Command {
     pub restart: u64,
     pub audition_mix: AuditionMix,
     pub camera: BeamNgCamera,
+    pub room: Room,
+    pub room_mix: f32,
 }
