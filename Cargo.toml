@@ -21,3 +21,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = 3
+# X-014: -5 % per physical step on the V12, output bit-identical.
+lto = "fat"
+codegen-units = 1
