@@ -3,6 +3,7 @@
 use crate::{
     acoustics::{ExhaustLayout, ExhaustNetwork, Geometry},
     engine_build::{Catalyst, Crossover, EngineBuild, Headers, Muffler},
+    physical::wave_junction::WavePort,
     scratch::{EngineDesign, SoundTuning},
 };
 use bdsp::delay::DelayLine;
@@ -39,6 +40,12 @@ pub struct Acoustic {
     mean_slew: f64,
     length_slew: f64,
     crossover: Option<([DelayLine; 2], f64, f64)>,
+    // Per-sample state shared by `begin` and `finish` (fixed size, no heap).
+    speeds: [f64; 2],
+    densities: [f64; 2],
+    arrivals: [f64; 12],
+    returns: [f64; 12],
+    tail_incoming: [f32; 2],
 }
 
 impl Acoustic {
@@ -145,6 +152,11 @@ impl Acoustic {
                 }
                 _ => None,
             },
+            speeds: [0.; 2],
+            densities: [0.; 2],
+            arrivals: [0.; 12],
+            returns: [0.; 12],
+            tail_incoming: [0.; 2],
         }
     }
 
@@ -191,6 +203,19 @@ impl Acoustic {
         pressures_pa: [f64; 2],
         reaction_w: [f64; 2],
     ) -> [f32; 2] {
+        self.begin(temperatures_k, pressures_pa, Some(flow_kg_s));
+        self.finish(flow_kg_s, reaction_w)
+    }
+
+    /// Read every wave arriving this sample, before the valve flows are known.
+    /// `mean_flow` None convects on the previous sample's flow (the coupled
+    /// path, where this sample's flow is solved against these arrivals).
+    pub fn begin(
+        &mut self,
+        temperatures_k: [f64; 2],
+        pressures_pa: [f64; 2],
+        mean_flow: Option<&[f64; 12]>,
+    ) {
         self.tick += 1;
         for primary in &mut self.primaries {
             primary.length_m += self.length_slew * (primary.target_length_m - primary.length_m);
@@ -213,36 +238,21 @@ impl Acoustic {
                 primary.loss = 0.001_f64.powf((primary.length_m / speed) / 0.12);
             }
         }
-        let speeds = self.temperatures.map(|t| (1.33 * 287. * t).sqrt());
-        let densities = std::array::from_fn::<_, 2, _>(|b| {
+        self.speeds = self.temperatures.map(|t| (1.33 * 287. * t).sqrt());
+        self.densities = std::array::from_fn::<_, 2, _>(|b| {
             pressures_pa[b].max(10000.) / (287. * self.temperatures[b])
         });
-        let mut arrivals = [0.; 12];
-        let mut returns = [0.; 12];
-        let mut weighted = [0.; 2];
-        let mut admittance = [0.; 2];
-        let mut tail_y = [0.; 2];
         // Read every port before scattering. Reading the tail's previous
         // sample here and advancing it again at launch adds a spurious delay.
-        let tail_incoming = self.tails.each_mut().map(ExhaustNetwork::prepare_inlet);
-        for b in 0..2 {
-            let c = speeds[b];
-            let rho = densities[b];
-            tail_y[b] = self.tail_area / (rho * c);
-            admittance[b] = tail_y[b];
-            weighted[b] = tail_y[b] * f64::from(tail_incoming[b]);
-            // Volume source from chemical heat release: Qdot*(gamma-1)/(rho*c²).
-            // Junction admittances convert this volume velocity to pressure.
-            weighted[b] += reaction_w[b] * 0.33 / (rho * c * c) * 0.5;
-        }
+        self.tail_incoming = self.tails.each_mut().map(ExhaustNetwork::prepare_inlet);
         for (i, p) in self.primaries.iter_mut().enumerate() {
-            let b = p.bank;
-            let c = speeds[b];
-            let rho = densities[b];
+            let c = self.speeds[p.bank];
+            let rho = self.densities[p.bank];
             // Convect acoustic perturbations on the mean flow. Moving the
             // entire delay read head with each valve pulse frequency-modulates
             // waves already in the pipe and counts that pulse twice.
-            p.mean_flow += self.mean_slew * (flow_kg_s[i] - p.mean_flow);
+            let flow = mean_flow.map_or(p.previous_flow, |f| f[i]);
+            p.mean_flow += self.mean_slew * (flow - p.mean_flow);
             let velocity = (p.mean_flow / (rho * p.area_m2)).clamp(-0.3 * c, 0.3 * c);
             let f = f64::from(
                 p.forward
@@ -254,10 +264,48 @@ impl Acoustic {
             );
             p.forward_state += self.filter * (f - p.forward_state);
             p.backward_state += self.filter * (r - p.backward_state);
-            arrivals[i] = p.forward_state * p.loss;
-            returns[i] = p.backward_state * p.loss;
-            self.feedback[i] = returns[i];
-            let y = p.area_m2 / (rho * c);
+            self.arrivals[i] = p.forward_state * p.loss;
+            self.returns[i] = p.backward_state * p.loss;
+            self.feedback[i] = self.returns[i];
+        }
+    }
+
+    /// Valve-end port of primary `cylinder` for this sample, after `begin`,
+    /// on the 0D mean pressure `mean_pa`: port pressure = mean + offset +
+    /// Z·outflow (kg/s). The offset holds twice the arriving wave and the flow
+    /// high-pass memory; Z = c/A is the characteristic impedance for mass flow.
+    pub fn port(&self, cylinder: usize, mean_pa: f64) -> WavePort {
+        let p = &self.primaries[cylinder];
+        let z = self.speeds[p.bank] / p.area_m2;
+        WavePort {
+            pressure_at_zero_flow_pa: mean_pa
+                + 2. * self.returns[cylinder]
+                + z * (self.pole * p.ac_flow - p.previous_flow),
+            impedance: z,
+            guess_inflow_kg_s: -p.previous_flow,
+        }
+    }
+
+    /// Scatter and launch with this sample's cylinder outflows (kg/s).
+    pub fn finish(&mut self, flow_kg_s: &[f64; 12], reaction_w: [f64; 2]) -> [f32; 2] {
+        let (speeds, densities, tail_incoming) = (self.speeds, self.densities, self.tail_incoming);
+        let (arrivals, returns) = (self.arrivals, self.returns);
+        let mut weighted = [0.; 2];
+        let mut admittance = [0.; 2];
+        let mut tail_y = [0.; 2];
+        for b in 0..2 {
+            let c = speeds[b];
+            let rho = densities[b];
+            tail_y[b] = self.tail_area / (rho * c);
+            admittance[b] = tail_y[b];
+            weighted[b] = tail_y[b] * f64::from(tail_incoming[b]);
+            // Volume source from chemical heat release: Qdot*(gamma-1)/(rho*c²).
+            // Junction admittances convert this volume velocity to pressure.
+            weighted[b] += reaction_w[b] * 0.33 / (rho * c * c) * 0.5;
+        }
+        for (i, p) in self.primaries.iter().enumerate() {
+            let b = p.bank;
+            let y = p.area_m2 / (densities[b] * speeds[b]);
             weighted[b] += y * arrivals[i];
             admittance[b] += y;
         }
@@ -521,6 +569,91 @@ mod tests {
                     "{rate}: non-decaying response {late}/{early}"
                 );
             }
+        }
+    }
+
+    /// Closed loop: every primary ends at an open valve on a fixed-pressure
+    /// cylinder (source held constant), in the subsonic regime where the
+    /// orifice loads the port strongly (a = Z·dF/dp > 1). A brief cylinder
+    /// pressure pulse must ring down with the joint solve. `implicit` false
+    /// replays the rejected scheme (orifice on mean + previous sample's wave,
+    /// prescribed-flow port) for comparison only.
+    fn valve_loop(rate: u32, scale: f32, implicit: bool) -> (f64, f64, f64) {
+        use crate::physical::gas::{GasProperties, Orifice};
+        let design = PRESETS.iter().find(|p| p.0 == "V8 cross-plane").unwrap().1;
+        let tuning = SoundTuning {
+            primary_length_scale: scale,
+            ..Default::default()
+        };
+        let mut network = Acoustic::new(rate, &design, &EngineBuild::default(), &tuning);
+        let orifice = Orifice {
+            area_m2: 6e-4,
+            discharge_coefficient: 0.7,
+        };
+        let gas = GasProperties {
+            gas_constant_j_kg_k: 287.,
+            gamma: 1.33,
+        };
+        let (mean, mut flow, mut delayed) = (105e3, [0.; 12], [0.; 12]);
+        let (mut early, mut late, mut slope) = (0., 0., 0_f64);
+        let n = rate as usize;
+        for sample in 0..n {
+            network.begin([673.; 2], [mean; 2], None);
+            let cylinder = if (n / 4..n / 4 + 20).contains(&sample) {
+                111e3
+            } else {
+                108e3
+            };
+            let inflow = |p: f64| orifice.mass_flow_from_states(p, 673., cylinder, 900., gas);
+            for (i, f) in flow.iter_mut().enumerate().take(8) {
+                let port = network.port(i, mean);
+                *f = if implicit {
+                    -port.solve(inflow).0
+                } else {
+                    let flow = -inflow(mean + delayed[i]);
+                    delayed[i] = network.valve_pressure(i);
+                    flow
+                };
+                if sample == n / 8 {
+                    let p = port.pressure_at_zero_flow_pa + port.impedance * *f;
+                    slope = slope.max(port.impedance * (inflow(p + 1.) - inflow(p - 1.)) / 2.);
+                }
+            }
+            let out = network.finish(&flow, [0.; 2]);
+            let energy: f64 = out.iter().map(|x| f64::from(*x).powi(2)).sum();
+            if (n / 4..n / 2).contains(&sample) {
+                early += energy;
+            }
+            if sample >= n * 3 / 4 {
+                late += energy;
+            }
+        }
+        (early, late, slope)
+    }
+
+    #[test]
+    fn joint_valve_port_rings_down_under_strong_orifice_loading() {
+        for rate in [48000, 96000] {
+            for scale in [0.5, 1., 2.] {
+                let (early, late, a) = valve_loop(rate, scale, true);
+                println!(
+                    "{rate} Hz, primary x{scale}: a = {a:.2}, late/early {:.2e}",
+                    late / early
+                );
+                assert!(a > 1., "operating point must load the port: a = {a}");
+                assert!(
+                    early > 0. && late < early * 1e-5,
+                    "{rate}/{scale}: {late}/{early}"
+                );
+            }
+            let (early, late, _) = valve_loop(rate, 1., false);
+            println!(
+                "{rate} Hz rejected delayed scheme: late/early {:.2e}",
+                late / early
+            );
+            // Negative control: the same loop sustains its tone (0.75–0.99
+            // measured), so this test discriminates the rejected coupling.
+            assert!(late > early * 0.1, "{rate}: {late}/{early}");
         }
     }
 

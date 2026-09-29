@@ -178,8 +178,10 @@ fn turbo_v12_control_changes_and_restart_allocate_nothing() {
     scratch.build.aspiration = Aspiration::TwinTurbo;
     scratch.build.crossover = Crossover::X;
     scratch.apply_design();
-    for afterfire in [0., 1.] {
+    // The X-017 wave/valve junction must also stay allocation-free.
+    for (afterfire, coupled) in [(0., false), (1., false), (0., true)] {
         scratch.experimental.afterfire = afterfire;
+        scratch.experimental.wave_coupling = coupled;
         let mut engine = Engine::new(&scratch, 96000).unwrap();
         ALLOCATIONS.with(|v| v.set(0));
         TRACK.with(|v| v.set(true));

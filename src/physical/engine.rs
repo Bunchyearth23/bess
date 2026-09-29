@@ -455,6 +455,17 @@ impl Engine {
         // Opt-in: at zero the knock state is never touched (bit-identical).
         let knock = self.scratch.experimental.knock > 0.;
         let (mut throttle_flow, mut throttle_gap, mut compressor_flow) = (0., 0., 0.);
+        // X-017 opt-in: read the arriving primary waves first, so each valve
+        // flow is solved jointly with its port (`wave_junction`).
+        let coupled = self.scratch.experimental.wave_coupling;
+        if coupled {
+            let exhaust = [0, 1].map(|b| self.manifolds.exhaust_bank(b));
+            self.acoustic.begin(
+                exhaust.map(|r| r.temperature_k),
+                exhaust.map(|r| r.pressure_pa),
+                None,
+            );
+        }
         for _ in 0..substeps {
             self.rpm = commands.imposed_rpm.unwrap_or(self.crank.state().rpm);
             let mut controller = self
@@ -571,6 +582,8 @@ impl Engine {
                     let cut_slots = (4. * afterfire_intensity).ceil() as i64;
                     spark_enabled &= (cycle + i as i64).rem_euclid(8) >= cut_slots;
                 }
+                let port = coupled.then(|| self.acoustic.port(i, boundary.pressure_pa));
+                self.cylinders[i].set_exhaust_port(port);
                 let output = self.cylinders[i]
                     .step(CycleInput {
                         angle_rad: angle,
@@ -794,12 +807,17 @@ impl Engine {
             self.manifolds.exhaust_bank(0),
             self.manifolds.exhaust_bank(1),
         ];
-        let bank_pressure = self.acoustic.next(
-            &flow,
-            exhaust.map(|r| r.temperature_k),
-            exhaust.map(|r| r.pressure_pa),
-            afterfire.map(|q| q * self.rate),
-        );
+        let bank_pressure = if coupled {
+            self.acoustic
+                .finish(&flow, afterfire.map(|q| q * self.rate))
+        } else {
+            self.acoustic.next(
+                &flow,
+                exhaust.map(|r| r.temperature_k),
+                exhaust.map(|r| r.pressure_pa),
+                afterfire.map(|q| q * self.rate),
+            )
+        };
         // A fixed acoustic calibration, independent of RPM/load/observed RMS.
         const PA_TO_SAMPLE: f32 = 1. / 3000.;
         let exhaust_audio = (bank_pressure[0] + bank_pressure[1] * self.bank_gain) * PA_TO_SAMPLE;

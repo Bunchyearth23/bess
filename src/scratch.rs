@@ -56,6 +56,9 @@ pub struct ExperimentalSpec {
     pub afterfire: f32,
     /// End-gas knock intensity, 0 = off. Also lowers the effective octane.
     pub knock: f32,
+    /// X-017 prototype: exhaust valves solved jointly with their primary
+    /// waves (passive junction), so waves feed back on torque. Off = legacy.
+    pub wave_coupling: bool,
 }
 
 impl Default for ExperimentalSpec {
@@ -79,6 +82,7 @@ impl Default for ExperimentalSpec {
             direct_injection: false,
             afterfire: 0.,
             knock: 0.,
+            wave_coupling: false,
         }
     }
 }
