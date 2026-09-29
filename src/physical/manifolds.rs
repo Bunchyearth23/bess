@@ -847,8 +847,7 @@ impl Manifolds {
             / self.runner_count.max(1) as f64;
         let mut plenum_exchange = Exchange::default();
         let mut plenum_species = Species::default();
-        for i in 0..self.runner_count {
-            let (port, port_removable) = runners[i];
+        for (i, &(port, port_removable)) in runners.iter().enumerate().take(self.runner_count) {
             let old_runner = self.runners[i];
             let port_mixture = old_runner.mixture();
             let (upstream, upstream_mixture) = if plenum.pressure_pa >= port.pressure_pa {
