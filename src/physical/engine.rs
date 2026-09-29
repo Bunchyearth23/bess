@@ -559,10 +559,22 @@ impl Engine {
             };
             self.intake_phase += (vvt_target - self.intake_phase) * (dt / 0.05).min(1.);
             let ignition_retard = f64::from(self.scratch.sound.ignition_retard_deg).to_radians();
-            let variation = f64::from(self.scratch.build.cam)
-                * 0.4
-                * f64::from(self.scratch.sound.cycle_variation);
-            let burn_duration_scale = f64::from(self.scratch.sound.combustion_duration);
+            // Fields common to every cylinder of this substep, validated once.
+            let shared = CycleInput {
+                angle_rad: angle,
+                rpm: self.rpm,
+                dt_s: dt,
+                fuel_multiplier: controller.fuel_multiplier,
+                intake_phase_rad: self.intake_phase,
+                variation: f64::from(self.scratch.build.cam)
+                    * 0.4
+                    * f64::from(self.scratch.sound.cycle_variation),
+                burn_duration_scale: f64::from(self.scratch.sound.combustion_duration),
+                ..Default::default()
+            };
+            if !shared.shared_valid() {
+                return Err(());
+            }
             for (i, cylinder_flow) in flow.iter_mut().enumerate().take(n) {
                 let bank = self.banks[i];
                 // The conservative 0D system supplies the valve mass flow.
@@ -587,10 +599,7 @@ impl Engine {
                 let (intake, intake_composition, intake_budget) = self.manifolds.runner_port(i);
                 let (_, exhaust_composition, exhaust_budget) = exhaust_ports[bank];
                 let output = self.cylinders[i]
-                    .step(CycleInput {
-                        angle_rad: angle,
-                        rpm: self.rpm,
-                        dt_s: dt,
+                    .step_shared_checked(CycleInput {
                         intake,
                         exhaust: boundary,
                         intake_fresh_air_fraction: intake_composition.fresh_air_fraction,
@@ -600,16 +609,13 @@ impl Engine {
                         intake_mass_limit_kg: intake_budget,
                         exhaust_mass_limit_kg: exhaust_budget
                             / self.bank_counts[bank].max(1) as f64,
-                        fuel_multiplier: controller.fuel_multiplier,
                         spark_enabled,
                         spark_shift_rad: controller.spark_shift_rad
                             + self.spark_shift[i]
                             + ignition_retard
                             // Zero unless knock is enabled (bit-identical off).
                             + self.knock.retard[i],
-                        intake_phase_rad: self.intake_phase,
-                        variation,
-                        burn_duration_scale,
+                        ..shared
                     })
                     .map_err(|_| ())?;
                 add_exchange(

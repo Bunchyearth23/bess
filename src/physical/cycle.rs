@@ -58,6 +58,43 @@ pub struct CycleInput {
     pub burn_duration_scale: f64,
 }
 
+impl CycleInput {
+    /// Checks of the fields an engine substep shares across its cylinders
+    /// (crank, timing, fuel and burn commands). `step` runs them itself;
+    /// `step_shared_checked` leaves them to a caller that ran them once.
+    pub fn shared_valid(&self) -> bool {
+        self.angle_rad.is_finite()
+            && self.angle_rad.abs() <= 1e12
+            && (0.0..=30000.0).contains(&self.rpm)
+            && (1e-9..=1. / 16000.).contains(&self.dt_s)
+            && (0.0..=3.0).contains(&self.fuel_multiplier)
+            && (0.0..=1.0).contains(&self.variation)
+            && (0.5..=1.5).contains(&self.burn_duration_scale)
+            && self.intake_phase_rad.is_finite()
+    }
+
+    /// Per-cylinder checks: reservoirs, compositions, budgets, spark shift.
+    fn cylinder_valid(&self) -> bool {
+        self.spark_shift_rad.is_finite()
+            && (0.0..=10.0).contains(&self.intake_mass_limit_kg)
+            && (0.0..=10.0).contains(&self.exhaust_mass_limit_kg)
+            && [
+                self.intake_fresh_air_fraction,
+                self.intake_fuel_fraction,
+                self.exhaust_fresh_air_fraction,
+                self.exhaust_fuel_fraction,
+            ]
+            .iter()
+            .all(|f| (0.0..=1.).contains(f))
+            && self.intake_fresh_air_fraction + self.intake_fuel_fraction <= 1. + 1e-12
+            && self.exhaust_fresh_air_fraction + self.exhaust_fuel_fraction <= 1. + 1e-12
+            && [self.intake, self.exhaust].iter().all(|r| {
+                (100.0..=1e7).contains(&r.pressure_pa)
+                    && (200.0..=3500.0).contains(&r.temperature_k)
+            })
+    }
+}
+
 impl Default for CycleInput {
     fn default() -> Self {
         Self {
@@ -319,33 +356,19 @@ impl CycleCylinder {
     /// Advance one externally timed step, at most 1/16 kHz and 0.1 radian.
     /// For the 96 kHz engine use dt=1/96000; halted crankshaft is supported.
     pub fn step(&mut self, input: CycleInput) -> Result<CycleOutput, ThermoError> {
+        if !input.shared_valid() {
+            self.exhaust_port = None;
+            return Err(ThermoError::InvalidInput);
+        }
+        self.step_shared_checked(input)
+    }
+
+    /// `step` for an input whose `shared_valid()` the caller has checked, e.g.
+    /// once per engine substep for fields common to all cylinders. The
+    /// per-cylinder fields are still validated here.
+    pub fn step_shared_checked(&mut self, input: CycleInput) -> Result<CycleOutput, ThermoError> {
         let exhaust_port = self.exhaust_port.take();
-        if !input.angle_rad.is_finite()
-            || input.angle_rad.abs() > 1e12
-            || !(0.0..=30000.0).contains(&input.rpm)
-            || !(1e-9..=1. / 16000.).contains(&input.dt_s)
-            || !(0.0..=3.0).contains(&input.fuel_multiplier)
-            || !(0.0..=1.0).contains(&input.variation)
-            || !(0.5..=1.5).contains(&input.burn_duration_scale)
-            || !input.spark_shift_rad.is_finite()
-            || !input.intake_phase_rad.is_finite()
-            || !(0.0..=10.0).contains(&input.intake_mass_limit_kg)
-            || !(0.0..=10.0).contains(&input.exhaust_mass_limit_kg)
-            || [
-                input.intake_fresh_air_fraction,
-                input.intake_fuel_fraction,
-                input.exhaust_fresh_air_fraction,
-                input.exhaust_fuel_fraction,
-            ]
-            .iter()
-            .any(|f| !(0.0..=1.).contains(f))
-            || input.intake_fresh_air_fraction + input.intake_fuel_fraction > 1. + 1e-12
-            || input.exhaust_fresh_air_fraction + input.exhaust_fuel_fraction > 1. + 1e-12
-            || [input.intake, input.exhaust].iter().any(|r| {
-                !(100.0..=1e7).contains(&r.pressure_pa)
-                    || !(200.0..=3500.0).contains(&r.temperature_k)
-            })
-        {
+        if !input.cylinder_valid() {
             return Err(ThermoError::InvalidInput);
         }
         let previous = if self.gas.is_some() {
