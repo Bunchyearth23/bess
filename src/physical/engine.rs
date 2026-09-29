@@ -97,6 +97,9 @@ pub struct Engine {
     intake_phase: f64,
     afterfire_armed: bool,
     afterfire_remaining_s: f64,
+    /// Summed cylinder pressure at the previous output sample; NaN before any.
+    pressure_previous: f64,
+    combustion_highpass: [StateVariableFilter; 2],
     mechanics: StateVariableFilter,
     tone: Tone,
     previous_mechanics: Option<StateVariableFilter>,
@@ -228,6 +231,10 @@ impl Engine {
             intake_phase: 0.,
             afterfire_armed: false,
             afterfire_remaining_s: 0.,
+            pressure_previous: f64::NAN,
+            // Fourth-order Butterworth high-pass at 500 Hz.
+            combustion_highpass: [0.5412, 1.3066]
+                .map(|q| StateVariableFilter::new(rate as f32, 500., q, SvfMode::Highpass)),
             mechanics,
             tone,
             previous_mechanics: None,
@@ -350,6 +357,10 @@ impl Engine {
         self.intake_phase = 0.;
         self.afterfire_armed = false;
         self.afterfire_remaining_s = 0.;
+        self.pressure_previous = f64::NAN;
+        self.combustion_highpass
+            .iter_mut()
+            .for_each(StateVariableFilter::reset);
     }
 
     pub fn next(&mut self, commands: Commands) -> Sample {
@@ -399,6 +410,7 @@ impl Engine {
         let mut correction = 0.;
         let mut torque = 0.;
         let mut impact = 0.;
+        let mut pressure = 0.;
         let mut fuel_cut = false;
         let mut misfires = self.last.misfires;
         let mut afterfire = [0.; 2];
@@ -482,6 +494,7 @@ impl Engine {
             let budgets = self.manifolds.outgoing_budgets();
             let mut flows = Flows::default();
             torque = 0.;
+            pressure = 0.;
             let mut peak: f64 = 0.;
             let mut reciprocating = 0.;
             // Retard the inlet at closed-throttle idle to reduce overlap/EGR;
@@ -563,6 +576,7 @@ impl Engine {
                 correction += output.ledger.numerical_correction_j.abs()
                     + output.wall_numerical_correction_j.abs();
                 peak = peak.max(output.pressure_pa);
+                pressure += output.pressure_pa;
                 misfires += u64::from(output.misfired);
                 // First two slider-crank acceleration terms, estimated moving mass.
                 if commands.imposed_rpm.is_none() {
@@ -711,6 +725,22 @@ impl Engine {
         let (intake_audio, contact) =
             self.radiation
                 .next(self.intake_ac as f32, intake_flow as f32, impact as f32);
+        // Structure-borne combustion noise: summed cylinder dp/dt (Pa/s),
+        // high-passed so only the fast pressure-rise content excites the block.
+        // Fixed calibration; load and spark timing scale it physically.
+        const PA_S_TO_SAMPLE: f64 = 7e-12;
+        let dp_dt = if self.pressure_previous.is_nan() {
+            0.
+        } else {
+            (pressure - self.pressure_previous) * self.rate
+        };
+        self.pressure_previous = pressure;
+        let combustion = self
+            .combustion_highpass
+            .iter_mut()
+            .fold((dp_dt * PA_S_TO_SAMPLE) as f32, |x, f| f.next_sample(x));
+        // TODO(modal bank): route `combustion` to the block input.
+        let contact = contact + combustion;
         let mut mechanical = self.mechanics.next_sample(contact);
         let normalized_rpm = ((self.rpm as f32 - self.scratch.idle_rpm)
             / (self.scratch.redline_rpm - self.scratch.idle_rpm))
