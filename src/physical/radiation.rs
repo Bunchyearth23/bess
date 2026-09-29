@@ -85,7 +85,6 @@ impl Modes {
 }
 
 pub(crate) struct Radiation {
-    intake_body: StateVariableFilter,
     breath: StateVariableFilter,
     breath_airbox: StateVariableFilter,
     flow_envelope: f32,
@@ -99,7 +98,6 @@ impl Radiation {
     pub fn new(rate: u32, seed: u64) -> Self {
         let rate = rate as f32;
         Self {
-            intake_body: StateVariableFilter::new(rate, 750., 0.707, SvfMode::Lowpass),
             breath: StateVariableFilter::new(rate, 900., 0.8, SvfMode::Bandpass),
             breath_airbox: StateVariableFilter::new(
                 rate,
@@ -121,7 +119,8 @@ impl Radiation {
         self.seed ^= self.seed << 17;
         (self.seed >> 40) as f32 / 8388608. - 1.
     }
-    pub fn next(&mut self, flow_ac: f32, flow: f32, impact: f32) -> (f32, f32) {
+    /// `pulse`: radiated intake pressure from `IntakeAcoustic`, as a sample.
+    pub fn next(&mut self, pulse: f32, flow: f32, impact: f32) -> (f32, f32) {
         self.flow_envelope += (flow.abs().min(0.2) - self.flow_envelope) * self.flow_step;
         self.contact_envelope = self.contact_envelope * self.contact_decay + impact;
         let air_noise = self.noise() * self.noise_scale;
@@ -129,8 +128,7 @@ impl Radiation {
         let breath = self
             .breath_airbox
             .next_sample(self.breath.next_sample(air_noise));
-        let intake =
-            self.intake_body.next_sample(flow_ac) * 0.06 + breath * self.flow_envelope * 0.4;
+        let intake = pulse + breath * self.flow_envelope * 0.4;
         // The existing material/pitch resonator receives a short contact burst,
         // with a small coherent onset. No free-running tone or independent hiss.
         let mechanical = impact * 0.12 + contact_noise * self.contact_envelope * 0.14;

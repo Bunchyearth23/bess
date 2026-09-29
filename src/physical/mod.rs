@@ -9,6 +9,7 @@ pub mod cylinder;
 pub mod engine;
 pub mod gas;
 pub mod induction;
+pub mod intake_acoustic;
 pub mod manifolds;
 pub mod thermo;
 pub mod tone;
