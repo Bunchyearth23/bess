@@ -249,6 +249,7 @@ fn idle_controller_settles_near_target_without_cyclic_fuel_cut() {
         }
     }
     let mean = rpm_sum / f64::from(samples);
+    println!("idle mean {mean:.1} rpm");
     assert!(
         (mean - target).abs() < target * 0.1,
         "idle mean {mean:.2} vs target {target:.2}"

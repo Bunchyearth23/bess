@@ -1,6 +1,7 @@
 //! Piston slap and opt-in knock observation. Never feeds the gas or crank
 //! solver, except the knock-control spark retard (`Knock::retard`).
 //! Inline `[_; 12]` state only: no heap on the audio path.
+use super::thermo::Mixture;
 use crate::engine_build::BlockMaterial;
 use std::f64::consts::{PI, TAU};
 
@@ -117,9 +118,10 @@ impl Slap {
 
 /// Douaud–Eyzat pre-exponential multiplier, 1 = published (CFR engine, PRF).
 /// Calibration point: set from a measured knock-limited spark map. With 1,
-/// the default build at WOT and ON 95 (knock → 0) needs ≈ 11° retard at
-/// 3000 rpm, 6° at 4000, 2.4° at 5000, none at 6000, and exceeds the 12°
-/// authority at ≤ 2000 rpm: likely pessimistic at low speed (X-025).
+/// the default build at WOT and ON 95 (knock → 0) settles at ≈ 7.6° retard
+/// at 3000 rpm, 4.9° at 4000, 2.9° at 5000, none at 6000, and saturates the
+/// 12° authority at 2000 rpm (42 events per 100 cycles): still likely
+/// pessimistic at low speed (X-025, after the X-026 gas properties).
 const DELAY_CALIBRATION: f64 = 1.;
 
 /// Livengood–Wu end-gas autoignition with the Douaud–Eyzat delay, then an
@@ -137,8 +139,10 @@ pub(crate) struct Knock {
     /// Detected events since construction, all cylinders.
     pub events: u64,
     integral: [f64; 12],
-    /// Unburned-charge reference at compression BDC (K, Pa); NaN outside.
+    /// Unburned end gas (K, Pa) at the previous substep; NaN outside.
     reference: [(f64, f64); 12],
+    /// Unburned charge composition, frozen at spark.
+    unburned: [Mixture; 12],
     knocked: [bool; 12],
     amplitude: [f64; 12],
     phase: [f64; 12],
@@ -161,6 +165,7 @@ impl Knock {
             events: 0,
             integral: [0.; 12],
             reference: [(f64::NAN, f64::NAN); 12],
+            unburned: [Mixture::AIR; 12],
             knocked: [false; 12],
             amplitude: [0.; 12],
             phase: [0.; 12],
@@ -179,7 +184,9 @@ impl Knock {
     }
     /// One cylinder, one substep. `phase` is crank angle from its firing TDC;
     /// `burn` the Wiebe burned fraction while a burn is active;
-    /// `temperature_k` the single-zone gas (all unburned charge before spark).
+    /// `temperature_k`/`mixture` the single-zone gas (all unburned charge
+    /// before spark).
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         i: usize,
@@ -187,14 +194,16 @@ impl Knock {
         burn: Option<f64>,
         pressure_pa: f64,
         temperature_k: f64,
+        mixture: Mixture,
         dt: f64,
     ) {
         self.amplitude[i] *= self.decay;
         self.retard[i] = (self.retard[i] - self.recovery * dt).max(0.);
         // Speed of sound falls as the burned gas expands: the ring drifts down.
-        self.omega[i] =
-            TAU * 1.84 * (super::thermo::gamma(temperature_k) * 287. * temperature_k).sqrt()
-                / (PI * self.bore_m);
+        self.omega[i] = TAU
+            * 1.84
+            * (mixture.gamma(temperature_k) * mixture.gas_constant() * temperature_k).sqrt()
+            / (PI * self.bore_m);
         self.phase[i] = (self.phase[i] + self.omega[i] * dt) % TAU;
         // Livengood–Wu integrates from intake closing. Here from compression
         // BDC; the BDC–IVC share is < 1e-3 (charge < 450 K, < 2 bar).
@@ -205,16 +214,20 @@ impl Knock {
             self.knocked[i] = false;
             return;
         }
-        // Unburned end gas: isentropic from the BDC charge (residuals and
-        // intake heating included), γ 1.32 of a gasoline–air mixture. Not the
-        // single-zone T: its air cv compresses at γ ≈ 1.39 (+55 K at spark).
-        // A spark after TDC (no BDC state this cycle) references the spark.
-        // No end-gas wall loss (slightly hot).
-        if self.reference[i].0.is_nan() {
-            self.reference[i] = (temperature_k, pressure_pa);
-        }
-        let (t0, p0) = self.reference[i];
-        let end_gas = t0 * (pressure_pa / p0).max(1e-3).powf(0.32 / 1.32);
+        // Before spark the single zone is the unburned charge, with its own
+        // fuel–air–residual properties and wall heat (X-026). After spark the
+        // end gas follows that charge's isentrope from the last unburned
+        // state, integrated per substep at its γ(T); no end-gas wall loss
+        // (slightly hot). A spark after TDC starts from the spark state.
+        let end_gas = if burn.is_none() || self.reference[i].0.is_nan() {
+            self.unburned[i] = mixture;
+            temperature_k
+        } else {
+            let (t0, p0) = self.reference[i];
+            let g = self.unburned[i].gamma(t0);
+            t0 * (pressure_pa / p0).max(1e-3).powf((g - 1.) / g)
+        };
+        self.reference[i] = (end_gas, pressure_pa);
         let burned = burn.unwrap_or(0.);
         if self.knocked[i] || burned >= 0.98 {
             return;
@@ -267,7 +280,15 @@ mod tests {
             }
         }
         let mut k = Knock::new(48000., 96000., 0.086, 1.);
-        k.step(0, 0.1, Some(0.2), 4e6, 2500., 1. / 96000.);
+        k.step(
+            0,
+            0.1,
+            Some(0.2),
+            4e6,
+            2500.,
+            Mixture::PRODUCTS,
+            1. / 96000.,
+        );
         assert!(k.pressure().is_finite());
     }
     #[test]
@@ -278,9 +299,9 @@ mod tests {
         // burn knocks once; then out of the compression window it resets.
         let cycle = |k: &mut Knock| {
             for _ in 0..200 {
-                k.step(0, 0.1, Some(0.2), 6e6, 1000., dt);
+                k.step(0, 0.1, Some(0.2), 6e6, 1000., Mixture::PRODUCTS, dt);
             }
-            k.step(0, 3., None, 1e5, 1000., dt);
+            k.step(0, 3., None, 1e5, 1000., Mixture::PRODUCTS, dt);
         };
         cycle(&mut k);
         assert_eq!(k.events, 1);
@@ -295,12 +316,12 @@ mod tests {
         // Knock-free: 1°/s back towards the base spark, never past it.
         let before = k.retard[0];
         for _ in 0..96000 {
-            k.step(0, 3., None, 1e5, 400., dt);
+            k.step(0, 3., None, 1e5, 400., Mixture::PRODUCTS, dt);
         }
         let recovered = (before - k.retard[0]).to_degrees();
         assert!((recovered - 1.).abs() < 1e-6, "{recovered}°");
         for _ in 0..96000 * 12 {
-            k.step(0, 3., None, 1e5, 400., dt);
+            k.step(0, 3., None, 1e5, 400., Mixture::PRODUCTS, dt);
         }
         assert_eq!(k.retard[0], 0.);
         assert_eq!(k.events, 11);

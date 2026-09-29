@@ -53,3 +53,44 @@ fn curve_follows_compression_and_cam() {
     let moved = (0..7).any(|i| (cam.torque_nm[i] / base.torque_nm[i] - 1.).abs() > 0.03);
     assert!(moved);
 }
+
+#[test]
+#[ignore = "measurement table: cargo test --release --test dyno preset_curves -- --ignored --nocapture"]
+fn preset_curves() {
+    use bess::scratch::PRESETS;
+    let preset = |name: &str| {
+        let mut s = Scratch {
+            design: PRESETS.iter().find(|p| p.0 == name).unwrap().1,
+            ..Default::default()
+        };
+        s.apply_design();
+        s
+    };
+    let mut turbo = Scratch::default();
+    turbo.build.aspiration = Aspiration::Turbo;
+    turbo.build.boost_bar = 0.8;
+    for (label, scratch) in [
+        ("NA I4", Scratch::default()),
+        ("turbo I4", turbo),
+        ("V8", preset("V8 cross-plane")),
+        ("V12", preset("V12 60°")),
+    ] {
+        let c = dyno::sweep(&scratch, 13).unwrap();
+        let row = |v: &[f64]| {
+            v.iter()
+                .map(|x| format!("{x:.1}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!(
+            "{label}: peak {:.1} Nm @ {:.0}, {:.1} kW @ {:.0}\n  rpm {}\n  Nm {}\n  MAP {}",
+            c.peak_torque.0,
+            c.peak_torque.1,
+            c.peak_power.0,
+            c.peak_power.1,
+            row(&c.rpm),
+            row(&c.torque_nm),
+            row(&c.map_kpa)
+        );
+    }
+}

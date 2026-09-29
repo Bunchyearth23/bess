@@ -13,9 +13,9 @@
 //! auditing the complete system. No sound gain participates in these equations.
 use super::{
     cylinder::Reservoir,
-    gas::{GasProperties, Orifice},
+    gas::Orifice,
     manifolds::{ATMOSPHERE, Composition, Exchange, Species},
-    thermo::{self, EnergyInput, EnergyLedger, GasState, ThermoError},
+    thermo::{EnergyInput, EnergyLedger, GasState, Mixture, ThermoError},
 };
 use crate::engine_build::{Aspiration, BlowOff, EngineBuild, ResolvedTuning};
 
@@ -75,11 +75,16 @@ impl Induction {
             return Err("Invalid induction displacement".into());
         }
         let volume = (total_displacement_m3 * 0.75).max(0.0002);
-        let mass =
-            ATMOSPHERE.pressure_pa * volume / (thermo::GAS_CONSTANT * ATMOSPHERE.temperature_k);
+        let charge = GasState::at_pressure(
+            volume,
+            ATMOSPHERE.pressure_pa,
+            ATMOSPHERE.temperature_k,
+            Mixture::AIR,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let mass = charge.mass_kg();
         Ok(Self {
-            charge: GasState::new(mass, ATMOSPHERE.temperature_k, volume)
-                .map_err(|e| format!("{e:?}"))?,
+            charge,
             species: Species {
                 fresh_air_kg: mass,
                 fuel_kg: 0.0,
@@ -136,9 +141,10 @@ impl Induction {
     }
     /// Aggregate throttle demand must respect this budget before charge stepping.
     pub fn outgoing_budget_kg(&self) -> f64 {
-        let umin = thermo::specific_internal_energy(200.0);
+        let mixture = self.charge.mixture();
+        let umin = mixture.internal_energy(200.0);
         ((self.charge.internal_energy_j() - self.charge.mass_kg() * umin)
-            / (thermo::specific_enthalpy(self.charge.temperature_k()) - umin))
+            / (mixture.enthalpy(self.charge.temperature_k()) - umin))
             .max(0.0)
             .min(self.charge.mass_kg() * 0.9)
             * 0.25
@@ -195,7 +201,8 @@ impl Induction {
         }
         let old_energy = self.shaft_energy_j;
         let mut result = InductionStep::default();
-        let g = thermo::gamma(exhaust.temperature_k);
+        // Turbine inlet gas taken as products (its tracers are not passed in).
+        let g = Mixture::PRODUCTS.gamma(exhaust.temperature_k);
         let pressure_ratio = (exhaust.pressure_pa / self.turbine_outlet_pa).max(1.0);
         // Spring-preloaded actuator on charge pressure: cracks at 90 % of the
         // target and is fully open at 110 %, the proportional band of a
@@ -216,7 +223,7 @@ impl Induction {
             result.turbine_energy_j = exhaust_mass_flow_kg_s.max(0.0)
                 * turbine_share
                 * dt
-                * (thermo::specific_heat_cv(exhaust.temperature_k) + thermo::GAS_CONSTANT)
+                * (Mixture::PRODUCTS.cv(exhaust.temperature_k) + Mixture::PRODUCTS.gas_constant())
                 * exhaust.temperature_k
                 * (1.0 - pressure_ratio.powf(-(g - 1.0) / g))
                 * 0.65;
@@ -232,7 +239,8 @@ impl Induction {
         // below and choke above it). The wastegate, not the overspeed guard,
         // then holds boost.
         let head = 4.0 * self.max_boost_pa * speed_ratio * speed_ratio;
-        let density = ATMOSPHERE.pressure_pa / (thermo::GAS_CONSTANT * ATMOSPHERE.temperature_k);
+        let air = Mixture::AIR;
+        let density = ATMOSPHERE.pressure_pa / (air.gas_constant() * ATMOSPHERE.temperature_k);
         // d(mdot)/dt = (A/L)*(compressor pressure rise - charge pressure rise).
         // The positive-slope part of the cubic is unstable against plenum
         // compliance; the reverse branch lets the charge discharge upstream.
@@ -247,7 +255,7 @@ impl Induction {
         // WOT, 1.55× at the limit), as on measured maps; with inlet-density
         // similarity alone the low-rpm WOT and part-load points sat left of
         // the peak and deep-surged (30–70 kPa at 10–30 Hz). Reverse flow is unchanged.
-        let ga = thermo::gamma(300.0);
+        let ga = air.gamma(300.0);
         let exit_density = |ratio: f64| ratio.powf(1.0 - (ga - 1.0) / (ga * 0.7));
         let surge = exit_density(1.0 + head / ATMOSPHERE.pressure_pa)
             / exit_density(1.0 + 4.0 * self.max_boost_pa / ATMOSPHERE.pressure_pa);
@@ -277,7 +285,8 @@ impl Induction {
         let next_flow = self.compressor_flow_kg_s
             + 0.5 * dt * (first + acceleration(self.compressor_flow_kg_s + dt * first));
         let compressor_ratio = (self.charge.pressure_pa() / ATMOSPHERE.pressure_pa).max(1.0);
-        let work_per_kg = (thermo::specific_heat_cv(300.0) + thermo::GAS_CONSTANT)
+        let ga = air.gamma(300.0);
+        let work_per_kg = (air.cv(300.0) + air.gas_constant())
             * 300.0
             * (compressor_ratio.powf((ga - 1.0) / ga) - 1.0)
             / 0.7;
@@ -298,9 +307,9 @@ impl Induction {
         result.surge_work_j = ((-dm).max(0.0) * work_per_kg).min(available);
         result.compressor_energy_j = dm.max(0.0) * work_per_kg + result.surge_work_j;
         result.compressor_enthalpy_j = if dm >= 0.0 {
-            dm * thermo::specific_enthalpy(300.0) + dm * work_per_kg
+            dm * air.enthalpy(300.0) + dm * work_per_kg
         } else {
-            dm * thermo::specific_enthalpy(self.charge.temperature_k())
+            dm * self.charge.mixture().enthalpy(self.charge.temperature_k())
         };
         let old_composition = self.supply_composition();
         result.compressor_fresh_air_kg = if dm >= 0.0 {
@@ -323,10 +332,9 @@ impl Induction {
                 self.charge.temperature_k(),
                 ATMOSPHERE.pressure_pa,
                 300.0,
-                GasProperties {
-                    gas_constant_j_kg_k: thermo::GAS_CONSTANT,
-                    gamma: thermo::gamma(self.charge.temperature_k()),
-                },
+                self.charge
+                    .mixture()
+                    .properties(self.charge.temperature_k()),
             )
             .max(0.0)
                 * dt
@@ -339,7 +347,8 @@ impl Induction {
             BlowOff::Recirculating => result.recirculated_bov_mass_kg = bov_mass,
             BlowOff::None => {}
         }
-        result.bov_enthalpy_j = bov_mass * thermo::specific_enthalpy(self.charge.temperature_k());
+        result.bov_enthalpy_j =
+            bov_mass * self.charge.mixture().enthalpy(self.charge.temperature_k());
         result.bov_species = Species {
             fresh_air_kg: bov_mass * old_composition.fresh_air_fraction,
             fuel_kg: bov_mass * old_composition.fuel_fraction,
@@ -369,6 +378,8 @@ impl Induction {
             },
             result.charge_ledger.mass_in_kg,
         )?;
+        // Fixed volume: the new composition changes T/p, never energy.
+        next_charge.set_mixture(next_species.composition(next_charge.mass_kg()).mixture());
         self.charge = next_charge;
         self.species = next_species;
         self.shaft_energy_j = next_energy;
@@ -631,7 +642,9 @@ mod tests {
                         Exchange {
                             mass_in_kg: dm,
                             mass_out_kg: dm,
-                            enthalpy_in_j: dm * thermo::specific_enthalpy(t.supply().temperature_k),
+                            enthalpy_in_j: dm
+                                * Mixture::from_fractions(0.0, 0.02)
+                                    .enthalpy(t.supply().temperature_k),
                         },
                         incoming,
                     ),
