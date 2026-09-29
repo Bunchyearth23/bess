@@ -579,7 +579,9 @@ impl Engine {
                         spark_enabled,
                         spark_shift_rad: controller.spark_shift_rad
                             + self.spark_shift[i]
-                            + f64::from(self.scratch.sound.ignition_retard_deg).to_radians(),
+                            + f64::from(self.scratch.sound.ignition_retard_deg).to_radians()
+                            // Zero unless knock is enabled (bit-identical off).
+                            + self.knock.retard[i],
                         intake_phase_rad: self.intake_phase,
                         variation: f64::from(self.scratch.build.cam)
                             * 0.4
@@ -616,6 +618,7 @@ impl Engine {
                 if knock {
                     self.knock.step(
                         i,
+                        phase,
                         output.burn_fraction,
                         output.pressure_pa,
                         output.temperature_k,
@@ -1088,10 +1091,25 @@ mod mechanical_tests {
         assert!(part > closed * 1.2 && loaded > part * 1.2);
     }
     /// Fraction of mechanical energy in 5–9 kHz (two-pole-pair SVF band).
-    fn knock_band(knock: f32, throttle: f64, advance: f32) -> (f64, Vec<Sample>) {
+    /// `control` false zeroes the knock-control retard step.
+    fn knock_band(
+        knock: f32,
+        throttle: f64,
+        advance: f32,
+        control: bool,
+    ) -> (f64, Vec<Sample>, u64) {
         let mut scratch = Scratch::default();
         scratch.experimental.knock = knock;
         scratch.sound.ignition_retard_deg = -advance;
+        let mut engine = Engine::new(&scratch, 96_000).unwrap();
+        if !control {
+            engine.knock.retard_step = 0.;
+        }
+        let command = Commands {
+            imposed_rpm: Some(4000.),
+            throttle,
+            ..Default::default()
+        };
         let mut filters = [
             StateVariableFilter::new(96000., 5000., 0.707, SvfMode::Highpass),
             StateVariableFilter::new(96000., 5000., 0.707, SvfMode::Highpass),
@@ -1099,34 +1117,135 @@ mod mechanical_tests {
             StateVariableFilter::new(96000., 9000., 0.707, SvfMode::Lowpass),
         ];
         let (mut band, mut total, mut samples) = (0., 0., Vec::new());
-        run(&scratch, 4000., throttle, |_, s| {
-            let x = filters
-                .iter_mut()
-                .fold(s.mechanical, |x, f| f.next_sample(x));
-            band += f64::from(x).powi(2);
-            total += f64::from(s.mechanical).powi(2);
-            samples.push(s);
-        });
-        (band / total, samples)
+        for i in 0..96_000 * 2 {
+            let s = engine.next(command);
+            assert!(!engine.failed() && s.mechanical.is_finite());
+            if i >= 96_000 {
+                let x = filters
+                    .iter_mut()
+                    .fold(s.mechanical, |x, f| f.next_sample(x));
+                band += f64::from(x).powi(2);
+                total += f64::from(s.mechanical).powi(2);
+                samples.push(s);
+            }
+        }
+        (band / total, samples, engine.knock.events)
+    }
+    fn mean_torque(samples: &[Sample]) -> f64 {
+        samples.iter().map(|s| s.torque_nm).sum::<f64>() / samples.len() as f64
     }
     #[test]
     fn knock_rings_5_to_9_khz_only_in_the_observation_and_off_is_inert() {
-        let (off, quiet) = knock_band(0., 1., 15.);
-        let (on, knocking) = knock_band(1., 1., 15.);
-        println!("5–9 kHz share: off {off:.3}, knock {on:.3}");
-        // Measured: 0.012 → 0.222.
+        let (off, quiet, _) = knock_band(0., 1., 15., true);
+        let (on, knocking, _) = knock_band(1., 1., 15., false);
+        let (controlled, retarded, _) = knock_band(1., 1., 15., true);
+        println!("5–9 kHz share: off {off:.3}, knock {on:.3}, with control {controlled:.3}");
         assert!(on > off * 5. && on > 0.1, "{off} → {on}");
-        // Gas, crank and exhaust never see the ring; only mechanics differ.
+        // Without control, gas, crank and exhaust never see the ring.
         for (a, b) in quiet.iter().zip(&knocking) {
             assert_eq!(a.exhaust.to_bits(), b.exhaust.to_bits());
             assert_eq!(a.torque_nm.to_bits(), b.torque_nm.to_bits());
             assert_eq!(a.heat_j.to_bits(), b.heat_j.to_bits());
         }
+        // Control reaches the gas only through spark retard. From 15° past
+        // MBT, 12° retard recovers torque (measured 175.67 → 178.06 N·m); at
+        // ON 70 the authority cannot silence the ring (0.011 → 0.263).
+        let (base, late) = (mean_torque(&quiet), mean_torque(&retarded));
+        println!("torque {base:.2} → {late:.2} N·m with control");
+        assert!(late > base && late < base * 1.1, "{base} → {late}");
+        assert!(controlled > off * 5., "{off} → {controlled}");
         // Where the end gas does not autoignite, knock on is bit-identical.
-        let (_, idle_off) = knock_band(0., 0.05, 0.);
-        let (_, idle_on) = knock_band(1., 0.05, 0.);
+        // (At ON 70 the imposed-speed start transient knocks once here.)
+        let (_, idle_off, _) = knock_band(0., 0.05, 0., true);
+        let (_, idle_on, events) = knock_band(0.5, 0.05, 0., true);
+        assert_eq!(events, 0);
         for (a, b) in idle_off.iter().zip(&idle_on) {
             assert_eq!(a.mechanical.to_bits(), b.mechanical.to_bits());
+            assert_eq!(a.torque_nm.to_bits(), b.torque_nm.to_bits());
+            assert_eq!(a.exhaust.to_bits(), b.exhaust.to_bits());
         }
+    }
+    /// Knock events per 100 cylinder cycles, mean control retard (°), mean
+    /// torque (N·m) and mechanical 5–9 kHz share over 4 s after 2 s settling.
+    fn knock_stats(knock: f32, rpm: f64, throttle: f64, control: bool) -> [f64; 4] {
+        let mut scratch = Scratch::default();
+        scratch.experimental.knock = knock;
+        let rate = 48_000;
+        let mut engine = Engine::new(&scratch, rate).unwrap();
+        if !control {
+            engine.knock.retard_step = 0.;
+        }
+        let command = Commands {
+            imposed_rpm: Some(rpm),
+            throttle,
+            ..Default::default()
+        };
+        let mut filters = [
+            StateVariableFilter::new(48000., 5000., 0.707, SvfMode::Highpass),
+            StateVariableFilter::new(48000., 5000., 0.707, SvfMode::Highpass),
+            StateVariableFilter::new(48000., 9000., 0.707, SvfMode::Lowpass),
+            StateVariableFilter::new(48000., 9000., 0.707, SvfMode::Lowpass),
+        ];
+        let n = engine.cylinders.len();
+        let (settle, window) = (2 * rate as usize, 4 * rate as usize);
+        let (mut events, mut retard, mut torque, mut band, mut total) = (0, 0., 0., 0., 0.);
+        for k in 0..settle + window {
+            let s = engine.next(command);
+            assert!(!engine.failed() && s.mechanical.is_finite() && s.torque_nm.is_finite());
+            let x = filters
+                .iter_mut()
+                .fold(s.mechanical, |x, f| f.next_sample(x));
+            if k == settle {
+                events = engine.knock.events;
+            }
+            if k >= settle {
+                retard += engine.knock.retard[..n].iter().sum::<f64>() / n as f64;
+                torque += s.torque_nm;
+                band += f64::from(x).powi(2);
+                total += f64::from(s.mechanical).powi(2);
+            }
+        }
+        let cycles = n as f64 * rpm / 120. * 4.;
+        let w = window as f64;
+        [
+            (engine.knock.events - events) as f64 / cycles * 100.,
+            (retard / w).to_degrees(),
+            torque / w,
+            band / total,
+        ]
+    }
+    #[test]
+    #[ignore = "measurement table: cargo test --release knock_statistics -- --ignored --nocapture"]
+    fn knock_statistics() {
+        for knock in [0.5, 1.] {
+            for (rpm, throttle) in [(2000., 1.), (3000., 0.7), (4000., 1.), (6000., 1.)] {
+                let off = knock_stats(0., rpm, throttle, true);
+                let free = knock_stats(knock, rpm, throttle, false);
+                let controlled = knock_stats(knock, rpm, throttle, true);
+                println!(
+                    "knock {knock} {rpm}/{throttle}: events/100 cyc {:.1} -> {:.1}, retard {:.2}°, \
+                     torque {:.2} -> {:.2} N·m ({:+.2} %), 5–9 kHz share off {:.3} free {:.3} controlled {:.3}",
+                    free[0],
+                    controlled[0],
+                    controlled[1],
+                    free[2],
+                    controlled[2],
+                    (controlled[2] / free[2] - 1.) * 100.,
+                    off[3],
+                    free[3],
+                    controlled[3],
+                );
+            }
+        }
+    }
+    #[test]
+    fn knock_control_makes_events_sporadic_within_its_authority() {
+        // 6000/1.0 at ON 82.5 needs ≈ 7° of the 12° retard authority.
+        let free = knock_stats(0.5, 6000., 1., false);
+        let controlled = knock_stats(0.5, 6000., 1., true);
+        println!("6000/1.0 knock 0.5: {free:?} -> {controlled:?}");
+        assert!(controlled[0] < free[0] * 0.5, "{free:?} -> {controlled:?}");
+        assert!(controlled[1] > 0. && controlled[1] <= 12.);
+        assert!(controlled.iter().all(|v| v.is_finite()));
     }
 }

@@ -1,4 +1,5 @@
-//! Piston slap and opt-in knock observation. Never feeds the gas or crank solver.
+//! Piston slap and opt-in knock observation. Never feeds the gas or crank
+//! solver, except the knock-control spark retard (`Knock::retard`).
 //! Inline `[_; 12]` state only: no heap on the audio path.
 use crate::engine_build::BlockMaterial;
 use std::f64::consts::{PI, TAU};
@@ -114,11 +115,29 @@ impl Slap {
     }
 }
 
+/// Douaud–Eyzat pre-exponential multiplier, 1 = published (CFR engine, PRF).
+/// Calibration point: set from a measured knock-limited spark map. With 1,
+/// the default build at WOT and ON 95 (knock → 0) needs ≈ 11° retard at
+/// 3000 rpm, 6° at 4000, 2.4° at 5000, none at 6000, and exceeds the 12°
+/// authority at ≤ 2000 rpm: likely pessimistic at low speed (X-025).
+const DELAY_CALIBRATION: f64 = 1.;
+
 /// Livengood–Wu end-gas autoignition with the Douaud–Eyzat delay, then an
 /// observation-only first circumferential chamber mode. Opt-in (intensity > 0).
+/// A knock-sensor ECU loop retards each knocking cylinder's spark (`retard`),
+/// the only path by which knock reaches the gas solver.
 pub(crate) struct Knock {
+    /// Per-cylinder knock-control retard, rad, positive = later spark.
+    pub retard: [f64; 12],
+    /// Retard added per detected event, rad (tests set 0 to disable control).
+    pub retard_step: f64,
+    retard_limit: f64,
+    /// Knock-free advance recovery, rad/s.
+    recovery: f64,
+    /// Detected events since construction, all cylinders.
+    pub events: u64,
     integral: [f64; 12],
-    /// End-gas reference at spark (K, Pa); NaN outside a burn.
+    /// Unburned-charge reference at compression BDC (K, Pa); NaN outside.
     reference: [(f64, f64); 12],
     knocked: [bool; 12],
     amplitude: [f64; 12],
@@ -133,6 +152,13 @@ pub(crate) struct Knock {
 impl Knock {
     pub fn new(rate: f64, step_rate: f64, bore_m: f64, intensity: f64) -> Self {
         Self {
+            // Typical knock-sensor ECU loop: 2° per event, 12° authority,
+            // 1°/s recovery (sawtooth: one light event per 2 s at the limit).
+            retard: [0.; 12],
+            retard_step: 2_f64.to_radians(),
+            retard_limit: 12_f64.to_radians(),
+            recovery: 1_f64.to_radians(),
+            events: 0,
             integral: [0.; 12],
             reference: [(f64::NAN, f64::NAN); 12],
             knocked: [false; 12],
@@ -150,46 +176,59 @@ impl Knock {
             intensity,
         }
     }
-    /// One cylinder, one substep. `burn` is the Wiebe burned fraction while a
-    /// burn is active; `temperature_k` the single-zone (mostly burned) gas.
+    /// One cylinder, one substep. `phase` is crank angle from its firing TDC;
+    /// `burn` the Wiebe burned fraction while a burn is active;
+    /// `temperature_k` the single-zone gas (all unburned charge before spark).
     pub fn step(
         &mut self,
         i: usize,
+        phase: f64,
         burn: Option<f64>,
         pressure_pa: f64,
         temperature_k: f64,
         dt: f64,
     ) {
         self.amplitude[i] *= self.decay;
+        self.retard[i] = (self.retard[i] - self.recovery * dt).max(0.);
         // Speed of sound falls as the burned gas expands: the ring drifts down.
         self.omega[i] =
             TAU * 1.84 * (super::thermo::gamma(temperature_k) * 287. * temperature_k).sqrt()
                 / (PI * self.bore_m);
         self.phase[i] = (self.phase[i] + self.omega[i] * dt) % TAU;
-        let Some(burned) = burn else {
+        // Livengood–Wu integrates from intake closing. Here from compression
+        // BDC; the BDC–IVC share is < 1e-3 (charge < 450 K, < 2 bar).
+        let compressing = (phase + PI).rem_euclid(2. * TAU) < PI;
+        if burn.is_none() && !compressing {
             self.integral[i] = 0.;
             self.reference[i] = (f64::NAN, f64::NAN);
             self.knocked[i] = false;
             return;
-        };
-        // ponytail: integral starts at spark, not IVC (pre-spark compression est. ~0.04
-        // at 3000 rpm); single-zone T at spark as end-gas reference.
+        }
+        // Unburned end gas: isentropic from the BDC charge (residuals and
+        // intake heating included), γ 1.32 of a gasoline–air mixture. Not the
+        // single-zone T: its air cv compresses at γ ≈ 1.39 (+55 K at spark).
+        // A spark after TDC (no BDC state this cycle) references the spark.
+        // No end-gas wall loss (slightly hot).
         if self.reference[i].0.is_nan() {
             self.reference[i] = (temperature_k, pressure_pa);
         }
+        let (t0, p0) = self.reference[i];
+        let end_gas = t0 * (pressure_pa / p0).max(1e-3).powf(0.32 / 1.32);
+        let burned = burn.unwrap_or(0.);
         if self.knocked[i] || burned >= 0.98 {
             return;
         }
-        // Unburned end gas: isentropic compression from the spark state, γ 1.32.
-        let (t0, p0) = self.reference[i];
-        let end_gas = t0 * (pressure_pa / p0).max(1e-3).powf(0.32 / 1.32);
-        let delay_s = 17.68e-3
+        let delay_s = DELAY_CALIBRATION
+            * 17.68e-3
             * (self.octane / 100.).powf(3.402)
             * (pressure_pa / 101325.).max(1e-3).powf(-1.7)
             * (3800. / end_gas).exp();
         self.integral[i] += dt / delay_s;
-        if self.integral[i] >= 1. {
+        // Autoignition before spark would be preignition: not modelled.
+        if self.integral[i] >= 1. && burn.is_some() {
             self.knocked[i] = true;
+            self.events += 1;
+            self.retard[i] = (self.retard[i] + self.retard_step).min(self.retard_limit);
             if self.omega[i] < self.omega_limit {
                 // Ring amplitude ∝ unburned fraction; 5 % of p at full intensity
                 // (≈ +11 dB over the mechanical layer at 3000 rpm / 0.7).
@@ -227,7 +266,42 @@ mod tests {
             }
         }
         let mut k = Knock::new(48000., 96000., 0.086, 1.);
-        k.step(0, Some(0.2), 4e6, 2500., 1. / 96000.);
+        k.step(0, 0.1, Some(0.2), 4e6, 2500., 1. / 96000.);
         assert!(k.pressure().is_finite());
+    }
+    #[test]
+    fn knock_control_retards_per_event_clamps_and_recovers() {
+        let dt = 1. / 96000.;
+        let mut k = Knock::new(48000., 96000., 0.086, 1.);
+        // One burn per "cycle" in a hot, 60 bar end gas: τ ≈ 0.2 ms, so each
+        // burn knocks once; then out of the compression window it resets.
+        let cycle = |k: &mut Knock| {
+            for _ in 0..200 {
+                k.step(0, 0.1, Some(0.2), 6e6, 1000., dt);
+            }
+            k.step(0, 3., None, 1e5, 1000., dt);
+        };
+        cycle(&mut k);
+        assert_eq!(k.events, 1);
+        let step = 2_f64.to_radians();
+        assert!((k.retard[0] - step).abs() < 1e-3 * step, "{}", k.retard[0]);
+        assert_eq!(k.retard[1], 0.);
+        for _ in 0..10 {
+            cycle(&mut k);
+        }
+        assert_eq!(k.events, 11);
+        assert!(k.retard[0] <= 12_f64.to_radians() && k.retard[0] > 11.9_f64.to_radians());
+        // Knock-free: 1°/s back towards the base spark, never past it.
+        let before = k.retard[0];
+        for _ in 0..96000 {
+            k.step(0, 3., None, 1e5, 400., dt);
+        }
+        let recovered = (before - k.retard[0]).to_degrees();
+        assert!((recovered - 1.).abs() < 1e-6, "{recovered}°");
+        for _ in 0..96000 * 12 {
+            k.step(0, 3., None, 1e5, 400., dt);
+        }
+        assert_eq!(k.retard[0], 0.);
+        assert_eq!(k.events, 11);
     }
 }
