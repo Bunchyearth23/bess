@@ -8,8 +8,14 @@ fn main() -> Result<(), String> {
             .ok_or("Output directory required")?,
     );
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Optional second argument `turbo`: same points on a 0.8 bar turbo build.
+    let mut scratch = Scratch::default();
+    if std::env::args().nth(2).as_deref() == Some("turbo") {
+        scratch.build.aspiration = bess::engine_build::Aspiration::Turbo;
+        scratch.build.boost_bar = 0.8;
+    }
     for (label, rpm, load) in [("idle", 850., 0.1), ("loaded", 3000., 0.7)] {
-        let mut voice = AutomationVoice::new(48000, &Scratch::default())?;
+        let mut voice = AutomationVoice::new(48000, &scratch)?;
         for _ in 0..48000 {
             voice.next(rpm, load);
         }
