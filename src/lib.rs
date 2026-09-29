@@ -7,6 +7,7 @@ pub mod beamng_level;
 pub mod bench;
 pub mod combustion;
 pub mod drive;
+pub mod dyno;
 pub mod engine_build;
 pub mod engine_meta;
 pub mod export;
