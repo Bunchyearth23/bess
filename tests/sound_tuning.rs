@@ -185,11 +185,8 @@ fn every_control_changes_a_real_running_engine_stem_in_its_active_conditions() {
     let reference = render(&base);
     for (name, field, value) in fields() {
         let mut tuned = base.clone();
-        // Intake length has no audible function until its resonance is enabled.
-        let active_reference = if name == "intake_length_m" {
-            tuned.sound.intake_resonance = 1.;
-            Some(render(&tuned))
-        } else if name == "exhaust_body_hz" || name == "exhaust_body_q" {
+        // Intake length sets the physical runners; no resonance EQ needed.
+        let active_reference = if name == "exhaust_body_hz" || name == "exhaust_body_q" {
             tuned.sound.exhaust_body_db = 8.;
             Some(render(&tuned))
         } else {

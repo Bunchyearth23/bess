@@ -9,6 +9,7 @@ use super::{
     crank::Crank,
     cycle::{CycleCylinder, CycleInput},
     induction::Induction,
+    intake_acoustic::IntakeAcoustic,
     manifolds::{AfterTreatment, Exchange, Flows, Manifolds},
     tone::Tone,
 };
@@ -85,7 +86,6 @@ pub struct Engine {
     rate: f64,
     substeps: usize,
     dt: f64,
-    intake_pole: f64,
     bank_gain: f32,
     angle: f64,
     rpm: f64,
@@ -93,8 +93,7 @@ pub struct Engine {
     failed: bool,
     radiation: super::radiation::Radiation,
     radiation_seed: u64,
-    intake_previous: f64,
-    intake_ac: f64,
+    intake_acoustic: IntakeAcoustic,
     intake_phase: f64,
     afterfire_armed: bool,
     afterfire_remaining_s: f64,
@@ -186,6 +185,8 @@ impl Engine {
         let controller = Controller::new(rpm, f64::from(scratch.redline_rpm), scratch.build.fuel)
             .map_err(|e| e.to_string())?;
         let acoustic = Acoustic::new(rate, &scratch.design, &scratch.build, &scratch.sound);
+        let intake_acoustic =
+            IntakeAcoustic::new(rate, n, &scratch.build, displacement, &scratch.sound);
         let tone = Tone::new(rate, &scratch.sound);
         let mechanics = Modes::new(
             rate as f32,
@@ -223,14 +224,12 @@ impl Engine {
             rpm,
             substeps,
             dt: 1. / (f64::from(rate) * substeps as f64),
-            intake_pole: (-TAU * 30. / f64::from(rate)).exp(),
             bank_gain,
             was_imposed: true,
             failed: false,
             radiation: super::radiation::Radiation::new(rate, seed),
             radiation_seed: seed,
-            intake_previous: 0.,
-            intake_ac: 0.,
+            intake_acoustic,
             intake_phase: 0.,
             afterfire_armed: false,
             afterfire_remaining_s: 0.,
@@ -288,6 +287,7 @@ impl Engine {
             .retune(sound.mechanical_pitch_hz, sound.mechanical_resonance);
         self.sound_fade = 0.;
         self.acoustic.retune(&sound);
+        self.intake_acoustic.retune(&sound);
         // Cycle inputs read new ignition/variation/duration settings; existing
         // burn, trapped charge and angular phase are not recreated or cleared.
         self.scratch.sound = sound;
@@ -312,6 +312,7 @@ impl Engine {
             .retune(sound.mechanical_pitch_hz, sound.mechanical_resonance);
         self.sound_fade = 0.;
         self.acoustic.retune(sound);
+        self.intake_acoustic.retune(sound);
         self.scratch.sound = *sound;
         true
     }
@@ -353,8 +354,6 @@ impl Engine {
             ..Default::default()
         };
         self.radiation = super::radiation::Radiation::new(self.rate as u32, self.radiation_seed);
-        self.intake_previous = 0.;
-        self.intake_ac = 0.;
         self.intake_phase = 0.;
         self.afterfire_armed = false;
         self.afterfire_remaining_s = 0.;
@@ -407,6 +406,7 @@ impl Engine {
         let n = self.cylinders.len();
         let mut flow = [0.; 12];
         let mut intake_flow = 0.;
+        let mut intake_flows = [0.; 12];
         let mut heat = 0.;
         let mut correction = 0.;
         let mut torque = 0.;
@@ -571,6 +571,7 @@ impl Engine {
                 flows.exhaust_species[bank].fuel_kg += output.exhaust_fuel_kg.max(0.);
                 *cylinder_flow += output.exhaust_mass_flow_kg_s / substeps as f64;
                 intake_flow += output.intake_mass_kg * self.rate;
+                intake_flows[i] += output.intake_mass_kg * self.rate;
                 torque += output.gas_torque_nm;
                 heat += output.heat_j;
                 injected += output.injected_fuel_kg;
@@ -721,14 +722,14 @@ impl Engine {
             exhaust.map(|r| r.pressure_pa),
             afterfire.map(|q| q * self.rate),
         );
-        self.intake_ac = intake_flow - self.intake_previous + self.intake_pole * self.intake_ac;
-        self.intake_previous = intake_flow;
         // A fixed acoustic calibration, independent of RPM/load/observed RMS.
         const PA_TO_SAMPLE: f32 = 1. / 3000.;
         let exhaust_audio = (bank_pressure[0] + bank_pressure[1] * self.bank_gain) * PA_TO_SAMPLE;
-        let (intake_audio, contact) =
-            self.radiation
-                .next(self.intake_ac as f32, intake_flow as f32, impact as f32);
+        let (intake_audio, contact) = self.radiation.next(
+            self.intake_acoustic.next(&intake_flows),
+            intake_flow as f32,
+            impact as f32,
+        );
         // Structure-borne combustion noise: summed cylinder dp/dt (Pa/s),
         // high-passed so only the fast pressure-rise content excites the block.
         // Fixed calibration; load and spark timing scale it physically.
