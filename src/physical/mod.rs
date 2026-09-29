@@ -10,6 +10,7 @@ pub mod engine;
 pub mod gas;
 pub mod induction;
 pub mod manifolds;
+mod mechanical;
 pub mod thermo;
 pub mod tone;
 

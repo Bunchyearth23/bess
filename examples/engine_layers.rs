@@ -1,4 +1,5 @@
 //! Isolated physical intake/mechanical auditions, same fixed gain before/after.
+//! Optional second argument: experimental knock intensity, adds a full-load clip.
 use bess::{automation_voice::AutomationVoice, output_limiter::OutputLimiter, scratch::Scratch};
 fn main() -> Result<(), String> {
     let _guard = bess::realtime::DenormalGuard::enter();
@@ -8,8 +9,14 @@ fn main() -> Result<(), String> {
             .ok_or("Output directory required")?,
     );
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    for (label, rpm, load) in [("idle", 850., 0.1), ("loaded", 3000., 0.7)] {
-        let mut voice = AutomationVoice::new(48000, &Scratch::default())?;
+    let mut scratch = Scratch::default();
+    let mut cases = vec![("idle", 850., 0.1), ("loaded", 3000., 0.7)];
+    if let Some(knock) = std::env::args().nth(2) {
+        scratch.experimental.knock = knock.parse().map_err(|_| "Knock: 0..1")?;
+        cases.push(("full", 4000., 1.));
+    }
+    for (label, rpm, load) in cases {
+        let mut voice = AutomationVoice::new(48000, &scratch)?;
         for _ in 0..48000 {
             voice.next(rpm, load);
         }

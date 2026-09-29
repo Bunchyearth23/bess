@@ -116,6 +116,8 @@ pub struct CycleOutput {
     pub wall_numerical_correction_j: f64,
     /// True only on a spark event that could not initiate combustion.
     pub misfired: bool,
+    /// Wiebe burned fraction while a burn is active, from spark to its end.
+    pub burn_fraction: Option<f64>,
     pub ledger: EnergyLedger,
 }
 
@@ -468,6 +470,9 @@ impl CycleCylinder {
             .min(self.fresh_air_mass / AFR);
         self.fuel_mass -= fuel_burned;
         self.fresh_air_mass = (self.fresh_air_mass - fuel_burned * AFR).max(0.);
+        let burn_fraction = self
+            .burn
+            .map(|burn| burn.curve.fraction(local1.min(burn.stop_angle)));
         if self.burn.is_some_and(|burn| local1 >= burn.stop_angle) {
             self.burn = None;
         }
@@ -541,6 +546,7 @@ impl CycleCylinder {
             coolant_heat_j: coolant_loss,
             wall_numerical_correction_j: wall_correction,
             misfired,
+            burn_fraction,
             ledger,
         };
         Ok(output)

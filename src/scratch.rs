@@ -54,6 +54,8 @@ pub struct ExperimentalSpec {
     pub direct_injection: bool,
     /// Lift-off pops and bangs, 0 = off. Never set by the engine builder.
     pub afterfire: f32,
+    /// End-gas knock intensity, 0 = off. Also lowers the effective octane.
+    pub knock: f32,
 }
 
 impl Default for ExperimentalSpec {
@@ -76,6 +78,7 @@ impl Default for ExperimentalSpec {
             idle_cov: 0.07,
             direct_injection: false,
             afterfire: 0.,
+            knock: 0.,
         }
     }
 }
@@ -97,6 +100,7 @@ impl ExperimentalSpec {
             ("cam overlap", self.cam, 0., 1.),
             ("idle combustion COV", self.idle_cov, 0.01, 0.2),
             ("afterfire", self.afterfire, 0., 1.),
+            ("knock", self.knock, 0., 1.),
         ] {
             if !value.is_finite() || value < lo || value > hi {
                 return Err(format!("Scratch {name} out of range"));

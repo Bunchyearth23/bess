@@ -473,6 +473,12 @@ impl App {
             &mut scratch.experimental.afterfire,
         );
         ui.small("Off by default: pop-and-bang style overrun, independent of the parts.");
+        percent_slider(
+            ui,
+            "Knock (end-gas detonation)",
+            &mut scratch.experimental.knock,
+        );
+        ui.small("Off by default: lowers effective octane; rings at high load or advanced spark.");
         if (scratch.design, scratch.build) != before
             && scratch.design.validate().is_ok()
             && scratch.build.validate().is_ok()

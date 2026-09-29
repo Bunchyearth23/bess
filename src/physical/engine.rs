@@ -1,6 +1,7 @@
 //! Coupled engine: physical cylinders, manifold states, shaft and acoustic ports.
 //! All evolving gas/shaft state is f64. Audio is an explicitly calibrated f32
 //! observation of mass-flow waves and mechanical impacts, never a torque curve.
+use super::mechanical::{Knock, Slap};
 use super::radiation::Modes;
 use super::{
     acoustic::Acoustic,
@@ -101,6 +102,10 @@ pub struct Engine {
     /// Summed cylinder pressure at the previous output sample; NaN before any.
     pressure_previous: f64,
     combustion_highpass: [StateVariableFilter; 2],
+    slap: Slap,
+    knock: Knock,
+    /// Last block/head excitations (contact, combustion, slap) for calibration.
+    excitation: [f32; 3],
     mechanics: Modes,
     tone: Tone,
     previous_mechanics: Option<Modes>,
@@ -202,6 +207,7 @@ impl Engine {
         };
         let aftertreatment = std::array::from_fn(|_| AfterTreatment::new(scratch.build.catalyst));
         let substeps = (96000. / f64::from(rate)).ceil().max(1.) as usize;
+        let (slap, knock) = mechanical_events(&scratch, &config, rate, substeps, seed);
         let bank_gain = 10_f32.powf(scratch.design.bank_gain_db / 20.);
         Ok(Self {
             scratch,
@@ -238,6 +244,9 @@ impl Engine {
             // Fourth-order Butterworth high-pass at 500 Hz.
             combustion_highpass: [0.5412, 1.3066]
                 .map(|q| StateVariableFilter::new(rate as f32, 500., q, SvfMode::Highpass)),
+            slap,
+            knock,
+            excitation: [0.; 3],
             mechanics,
             tone,
             previous_mechanics: None,
@@ -257,6 +266,11 @@ impl Engine {
     }
     pub fn failed(&self) -> bool {
         self.failed
+    }
+    /// Last mechanical excitations (valve/DI contact, combustion, piston slap)
+    /// before the modal bank; a calibration diagnostic.
+    pub fn mechanical_excitation(&self) -> [f32; 3] {
+        self.excitation
     }
 
     /// Adopt prepared sound controls without replacing the running engine.
@@ -362,6 +376,13 @@ impl Engine {
         self.combustion_highpass
             .iter_mut()
             .for_each(StateVariableFilter::reset);
+        (self.slap, self.knock) = mechanical_events(
+            &self.scratch,
+            &self.config,
+            self.rate as u32,
+            self.substeps,
+            self.radiation_seed,
+        );
     }
 
     pub fn next(&mut self, commands: Commands) -> Sample {
@@ -417,6 +438,8 @@ impl Engine {
         let mut afterfire = [0.; 2];
         let (mut idle_bypass, mut fresh_supply, mut fresh_tailpipe, mut injected) =
             (0., 0., 0., 0.);
+        // Opt-in: at zero the knock state is never touched (bit-identical).
+        let knock = self.scratch.experimental.knock > 0.;
         for _ in 0..substeps {
             self.rpm = commands.imposed_rpm.unwrap_or(self.crank.state().rpm);
             let mut controller = self
@@ -579,9 +602,19 @@ impl Engine {
                 peak = peak.max(output.pressure_pa);
                 pressure += output.pressure_pa;
                 misfires += u64::from(output.misfired);
+                let phase = angle - self.phases[i];
+                self.slap.step(i, phase, output.pressure_pa, self.rpm, dt);
+                if knock {
+                    self.knock.step(
+                        i,
+                        output.burn_fraction,
+                        output.pressure_pa,
+                        output.temperature_k,
+                        dt,
+                    );
+                }
                 // First two slider-crank acceleration terms, estimated moving mass.
                 if commands.imposed_rpm.is_none() {
-                    let phase = angle - self.phases[i];
                     let (sine, cosine) = phase.sin_cos();
                     let radius = self.config.stroke_m * 0.5;
                     let ratio = radius / self.config.rod_m;
@@ -733,6 +766,10 @@ impl Engine {
         // high-passed so only the fast pressure-rise content excites the block.
         // Fixed calibration; load and spark timing scale it physically.
         const PA_S_TO_SAMPLE: f64 = 2e-12;
+        // Knock rings the chamber gas only in this observation, never the solver.
+        if knock {
+            pressure += self.knock.pressure();
+        }
         let dp_dt = if self.pressure_previous.is_nan() {
             0.
         } else {
@@ -743,7 +780,11 @@ impl Engine {
             .combustion_highpass
             .iter_mut()
             .fold((dp_dt * PA_S_TO_SAMPLE) as f32, |x, f| f.next_sample(x));
-        let mut mechanical = self.mechanics.next(contact, combustion);
+        // Piston slap is structure-borne: block input, beside combustion.
+        let slap = self.slap.next();
+        self.excitation = [contact, combustion, slap];
+        let block = combustion + slap;
+        let mut mechanical = self.mechanics.next(contact, block);
         let normalized_rpm = ((self.rpm as f32 - self.scratch.idle_rpm)
             / (self.scratch.redline_rpm - self.scratch.idle_rpm))
             .clamp(0., 1.);
@@ -763,7 +804,7 @@ impl Engine {
             shaped_exhaust = old.0 + (shaped_exhaust - old.0) * self.sound_fade;
             shaped_intake = old.1 + (shaped_intake - old.1) * self.sound_fade;
             if let Some(previous) = &mut self.previous_mechanics {
-                let old = previous.next(contact, combustion);
+                let old = previous.next(contact, block);
                 mechanical = old + (mechanical - old) * self.sound_fade;
             }
             self.sound_fade = (self.sound_fade + 1. / (self.rate as f32 * 0.03)).min(1.);
@@ -810,6 +851,33 @@ fn add_exchange(exchange: &mut Exchange, mass: f64, enthalpy: f64) {
     } else {
         exchange.mass_out_kg -= mass;
     }
+}
+fn mechanical_events(
+    scratch: &Scratch,
+    config: &CylinderConfig,
+    rate: u32,
+    substeps: usize,
+    seed: u64,
+) -> (Slap, Knock) {
+    let rate = f64::from(rate);
+    let step_rate = rate * substeps as f64;
+    (
+        Slap::new(
+            rate,
+            step_rate,
+            config.bore_m,
+            config.stroke_m,
+            config.rod_m,
+            scratch.build.block,
+            seed,
+        ),
+        Knock::new(
+            rate,
+            step_rate,
+            config.bore_m,
+            f64::from(scratch.experimental.knock),
+        ),
+    )
 }
 fn crossed(from: f64, to: f64, event: f64) -> bool {
     ((from - event) / (2. * TAU)).floor() < ((to - event) / (2. * TAU)).floor()
@@ -935,5 +1003,102 @@ mod retune_tests {
         }
         assert!(!engine.failed());
         assert!(engine.previous_tone.is_none());
+    }
+}
+
+#[cfg(test)]
+mod mechanical_tests {
+    use super::*;
+
+    fn run(scratch: &Scratch, rpm: f64, throttle: f64, mut each: impl FnMut(&Engine, Sample)) {
+        let mut engine = Engine::new(scratch, 96_000).unwrap();
+        let command = Commands {
+            imposed_rpm: Some(rpm),
+            throttle,
+            ..Default::default()
+        };
+        for i in 0..96_000 * 2 {
+            let s = engine.next(command);
+            assert!(!engine.failed() && s.mechanical.is_finite());
+            if i >= 96_000 {
+                each(&engine, s);
+            }
+        }
+    }
+    /// Modal-bank output energy of valve contacts and of piston slap alone.
+    fn layer_energy(scratch: &Scratch, rpm: f64, throttle: f64) -> (f64, f64) {
+        let engine = Engine::new(scratch, 96_000).unwrap();
+        let (mut contact, mut slap) = (engine.mechanics.clone(), engine.mechanics.clone());
+        let (mut a, mut b) = (0., 0.);
+        run(scratch, rpm, throttle, |e, _| {
+            let [c, _, s] = e.mechanical_excitation();
+            a += f64::from(contact.next(c, 0.)).powi(2);
+            b += f64::from(slap.next(0., s)).powi(2);
+        });
+        (a, b)
+    }
+    fn db(ratio: f64) -> f64 {
+        10. * ratio.log10()
+    }
+
+    #[test]
+    fn slap_sits_below_valve_contacts_and_drops_at_idle() {
+        let scratch = Scratch::default();
+        let (contact, slap) = layer_energy(&scratch, 3000., 0.7);
+        let (idle_contact, idle_slap) = layer_energy(&scratch, 850., 0.1);
+        let (loaded, idle) = (db(slap / contact), db(idle_slap / idle_contact));
+        println!("slap vs contacts: {loaded:.1} dB at 3000/0.7, {idle:.1} dB at idle");
+        assert!((-10.0..=-4.).contains(&loaded), "{loaded} dB");
+        assert!(idle < loaded - 3., "{idle} dB");
+    }
+    #[test]
+    fn slap_energy_rises_with_load_at_fixed_rpm() {
+        let scratch = Scratch::default();
+        let slap = |throttle| layer_energy(&scratch, 3000., throttle).1;
+        let (closed, part, loaded) = (slap(0.), slap(0.3), slap(1.));
+        println!("slap energy {closed:e} {part:e} {loaded:e}");
+        assert!(part > closed * 1.2 && loaded > part * 1.2);
+    }
+    /// Fraction of mechanical energy in 5–9 kHz (two-pole-pair SVF band).
+    fn knock_band(knock: f32, throttle: f64, advance: f32) -> (f64, Vec<Sample>) {
+        let mut scratch = Scratch::default();
+        scratch.experimental.knock = knock;
+        scratch.sound.ignition_retard_deg = -advance;
+        let mut filters = [
+            StateVariableFilter::new(96000., 5000., 0.707, SvfMode::Highpass),
+            StateVariableFilter::new(96000., 5000., 0.707, SvfMode::Highpass),
+            StateVariableFilter::new(96000., 9000., 0.707, SvfMode::Lowpass),
+            StateVariableFilter::new(96000., 9000., 0.707, SvfMode::Lowpass),
+        ];
+        let (mut band, mut total, mut samples) = (0., 0., Vec::new());
+        run(&scratch, 4000., throttle, |_, s| {
+            let x = filters
+                .iter_mut()
+                .fold(s.mechanical, |x, f| f.next_sample(x));
+            band += f64::from(x).powi(2);
+            total += f64::from(s.mechanical).powi(2);
+            samples.push(s);
+        });
+        (band / total, samples)
+    }
+    #[test]
+    fn knock_rings_5_to_9_khz_only_in_the_observation_and_off_is_inert() {
+        let (off, quiet) = knock_band(0., 1., 15.);
+        let (on, knocking) = knock_band(1., 1., 15.);
+        println!("5–9 kHz share: off {off:.3}, knock {on:.3}");
+        // Measured: 0.012 → 0.222.
+        assert!(on > off * 5. && on > 0.1, "{off} → {on}");
+        // Gas, crank and exhaust never see the ring; only mechanics differ.
+        for (a, b) in quiet.iter().zip(&knocking) {
+            assert_eq!(a.exhaust.to_bits(), b.exhaust.to_bits());
+            assert_eq!(a.torque_nm.to_bits(), b.torque_nm.to_bits());
+            assert_eq!(a.heat_j.to_bits(), b.heat_j.to_bits());
+        }
+        // Where the end gas does not autoignite, knock on is bit-identical.
+        let (_, idle_off) = knock_band(0., 0.05, 0.);
+        let (_, idle_on) = knock_band(1., 0.05, 0.);
+        for (a, b) in idle_off.iter().zip(&idle_on) {
+            assert_eq!(a.mechanical.to_bits(), b.mechanical.to_bits());
+        }
     }
 }
