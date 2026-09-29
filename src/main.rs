@@ -860,6 +860,20 @@ impl App {
             &mut self.params.volume,
             0.0..=1.0,
         );
+        if let Some(audio) = &self.audio {
+            let latency = f32::from_bits(audio.meter.latency_ms.load(Ordering::Relaxed));
+            ui.small(format!(
+                "Output latency {} (device {})",
+                audio::latency_text(latency, audio.bluetooth),
+                audio.device_name
+            ));
+            if audio.bluetooth {
+                ui.colored_label(
+                    Color32::YELLOW,
+                    "Bluetooth adds ~200–300 ms; use a wired output to judge timing.",
+                );
+            }
+        }
     }
     fn driving_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Driving — test bench");
@@ -2574,8 +2588,15 @@ fn main() -> eframe::Result {
                 "PASS: observed stream/producer/physical checks"
             };
             let report = format!(
-                "{}\nEngine: {engine_label}\nScenario: {scenario}\nRequested duration: {seconds} s\nObserved duration: {:.3} s\nStatus: {status}\nPhysical engine failure: {physical_failed}\nProducer failure: {producer_failed}\nSynthesis rate: {} Hz\nSynthesis block: {:.3} ms\nCommand updates: {command_updates} (at most 10 Hz)\nCallbacks: {n}\nMaximum callback CPU time: {:.3} ms\nCallback p99 budget percent (bucket upper bound, 101 = overflow): {p99}\nBudget overruns: {}\nAudio underruns: {underruns}\nMissing frames: {}\nProduced blocks: {}\nMaximum synthesis block time: {:.3} ms\nSilent test: synthesis calculated, output volume set to zero.\n",
+                "{}\nOutput device: {} (Bluetooth: {})\nMeasured output latency: {:.1} ms (shown: {})\nEngine: {engine_label}\nScenario: {scenario}\nRequested duration: {seconds} s\nObserved duration: {:.3} s\nStatus: {status}\nPhysical engine failure: {physical_failed}\nProducer failure: {producer_failed}\nSynthesis rate: {} Hz\nSynthesis block: {:.3} ms\nCommand updates: {command_updates} (at most 10 Hz)\nCallbacks: {n}\nMaximum callback CPU time: {:.3} ms\nCallback p99 budget percent (bucket upper bound, 101 = overflow): {p99}\nBudget overruns: {}\nAudio underruns: {underruns}\nMissing frames: {}\nProduced blocks: {}\nMaximum synthesis block time: {:.3} ms\nSilent test: synthesis calculated, output volume set to zero.\n",
                 a.description,
+                a.device_name,
+                a.bluetooth,
+                f32::from_bits(a.meter.latency_ms.load(Ordering::Relaxed)),
+                audio::latency_text(
+                    f32::from_bits(a.meter.latency_ms.load(Ordering::Relaxed)),
+                    a.bluetooth
+                ),
                 start.elapsed().as_secs_f64(),
                 a.synth_rate,
                 a.block_ms,

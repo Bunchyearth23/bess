@@ -166,6 +166,11 @@ impl AudioReader {
         }
     }
 
+    /// Frames waiting in the producer ring: BESS's own output queue delay.
+    pub fn queued_frames(&self) -> usize {
+        self.consumer.slots()
+    }
+
     pub fn next_sample(&mut self) -> f32 {
         match self.consumer.pop() {
             Ok(sample) => {

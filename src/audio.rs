@@ -50,6 +50,89 @@ fn preferred_buffer(rate: u32, supported: &cpal::SupportedBufferSize) -> u32 {
     }
 }
 
+/// Output-limiter anticipation present in every render path (output_limiter.rs).
+const LIMITER_LOOKAHEAD_MS: f32 = 3.;
+/// Group delay of scratch's 95-tap 2:1 anti-alias FIR, in synthesis frames.
+const DECIMATOR_DELAY_FRAMES: f32 = 47.;
+/// A Bluetooth sink reporting less than this is hiding its codec/transport delay.
+const BLUETOOTH_MIN_PLAUSIBLE_MS: f32 = 150.;
+
+/// Slow one-pole follower for the per-callback latency estimate.
+fn smooth_latency(previous: f32, sample: f32) -> f32 {
+    if previous <= 0. {
+        sample
+    } else {
+        previous + (sample - previous) * 0.05
+    }
+}
+
+/// Case-insensitive name heuristic for Bluetooth sinks.
+/// ponytail: keyword list, not a bus query; add names as users report them.
+pub fn looks_bluetooth(name: &str) -> bool {
+    let name = name.to_lowercase();
+    [
+        "bluez",
+        "bluetooth",
+        "a2dp",
+        "airpods",
+        "headset",
+        "hands-free",
+    ]
+    .iter()
+    .any(|key| name.contains(key))
+}
+
+/// Read-only GUI text for the smoothed output latency.
+pub fn latency_text(ms: f32, bluetooth: bool) -> String {
+    if bluetooth && ms < BLUETOOTH_MIN_PLAUSIBLE_MS {
+        "≥ ~200 ms (Bluetooth codec, not measurable)".into()
+    } else if ms > 0. {
+        format!("≈ {ms:.0} ms")
+    } else {
+        "not measured yet".into()
+    }
+}
+
+/// ALSA's `default` device hides which PipeWire sink it plays to; ask
+/// PipeWire once while opening (never in the callback).
+/// ponytail: PipeWire (`wpctl`) only; plain PulseAudio/JACK fall back to the cpal name.
+fn pipewire_default_sink() -> Option<(String, bool)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let output = std::process::Command::new("wpctl")
+        .args(["inspect", "@DEFAULT_AUDIO_SINK@"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let property = |key: &str| {
+        text.lines().find_map(|line| {
+            let (k, v) = line.trim_start_matches([' ', '*']).split_once(" = ")?;
+            (k == key).then(|| v.trim_matches('"').to_owned())
+        })
+    };
+    let name = property("node.description").or_else(|| property("node.name"))?;
+    let bluetooth = property("device.api").is_some_and(|api| api == "bluez5")
+        || property("node.name").is_some_and(|node| looks_bluetooth(&node));
+    Some((name, bluetooth))
+}
+
+fn output_identity(device: &cpal::Device) -> (String, bool) {
+    let description = device.description().ok();
+    let cpal_name = description
+        .as_ref()
+        .map_or_else(|| "unknown device".to_owned(), |d| d.name().to_owned());
+    let cpal_bluetooth = description
+        .as_ref()
+        .is_some_and(|d| d.interface_type() == cpal::InterfaceType::Bluetooth)
+        || looks_bluetooth(&cpal_name);
+    match pipewire_default_sink() {
+        Some((sink, bluetooth)) => (sink, bluetooth || cpal_bluetooth),
+        None => (cpal_name, cpal_bluetooth),
+    }
+}
+
 pub struct Meter {
     pub max_ns: AtomicU64,
     pub overruns: AtomicU32,
@@ -70,6 +153,9 @@ pub struct Meter {
     /// the index one past the newest sample.
     pub scope: Box<[AtomicU32; crate::spectrum::WINDOW]>,
     pub scope_end: AtomicUsize,
+    /// Smoothed output latency (f32 ms bits): device playback delay reported
+    /// by cpal + BESS producer ring + DSP lookahead.
+    pub latency_ms: AtomicU32,
 }
 impl Default for Meter {
     fn default() -> Self {
@@ -90,6 +176,7 @@ impl Default for Meter {
             callback_budget_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
             scope: Box::new(std::array::from_fn(|_| AtomicU32::new(0))),
             scope_end: AtomicUsize::new(0),
+            latency_ms: AtomicU32::new(0),
         }
     }
 }
@@ -132,6 +219,9 @@ pub struct Audio {
     pub tx: CommandSender<Command>,
     pub meter: Arc<Meter>,
     pub description: String,
+    /// Output device (the PipeWire default sink when cpal only sees `default`).
+    pub device_name: String,
+    pub bluetooth: bool,
     pub rate: u32,
     /// Rate used to prepare replacement scratch voices (twice device rate).
     pub synth_rate: u32,
@@ -186,6 +276,7 @@ impl Audio {
             .map(|configs| configs.collect())
             .unwrap_or_default();
         let supported = preferred_output(default, &ranges);
+        let (device_name, bluetooth) = output_identity(&device);
         let rate = supported.sample_rate();
         let format = match supported.sample_format() {
             cpal::SampleFormat::I16 => "16-bit signed",
@@ -280,16 +371,37 @@ impl Audio {
         let mut reader: Option<AudioReader> = None;
         let callback_meter = meter.clone();
         let mut scope_index = 0usize;
+        let mut latency_ms = 0f32;
+        let dsp_ms = LIMITER_LOOKAHEAD_MS
+            + if synth_rate != rate {
+                DECIMATOR_DELAY_FRAMES * 1000. / synth_rate as f32
+            } else {
+                0.
+            };
         macro_rules! stream {
             ($ty:ty, $convert:expr) => {{
                 device.build_output_stream(
                     config,
-                    move |data: &mut [$ty], _: &cpal::OutputCallbackInfo| {
+                    move |data: &mut [$ty], info: &cpal::OutputCallbackInfo| {
                         let _denormals = DenormalGuard::enter();
                         let started = std::time::Instant::now();
                         if reader.is_none() {
                             reader = setup_rx.pop().ok();
                         }
+                        // The newest queued sample reaches the DAC after the
+                        // whole ring drains plus the device's reported delay.
+                        let timestamp = info.timestamp();
+                        let device_s = timestamp
+                            .playback
+                            .duration_since(timestamp.callback)
+                            .as_secs_f32();
+                        let queued_s = reader.as_ref().map_or(0, AudioReader::queued_frames) as f32
+                            / rate as f32;
+                        latency_ms =
+                            smooth_latency(latency_ms, (device_s + queued_s) * 1000. + dsp_ms);
+                        callback_meter
+                            .latency_ms
+                            .store(latency_ms.to_bits(), Ordering::Relaxed);
                         if reader.as_ref().is_some_and(AudioReader::failed) {
                             callback_meter.failed.store(true, Ordering::Relaxed);
                         }
@@ -348,6 +460,8 @@ impl Audio {
             tx,
             meter,
             description,
+            device_name,
+            bluetooth,
             rate,
             synth_rate,
             pipe_stats,
@@ -386,6 +500,41 @@ mod tests {
         meter.record_callback(200, 2000);
         assert_eq!(meter.callback_p99_budget_percent(), 10);
         assert_eq!(meter.blocks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bluetooth_heuristic_matches_common_sink_names_case_insensitively() {
+        for name in [
+            "bluez_output.AC_80_0A_6E_55_71.1",
+            "Bluetooth Speaker",
+            "AirPods Pro",
+            "WH-1000XM4 A2DP",
+            "Sony Headset",
+        ] {
+            assert!(looks_bluetooth(name), "{name}");
+        }
+        for name in ["Built-in Audio Analog Stereo", "default", "HDMI 1", ""] {
+            assert!(!looks_bluetooth(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn latency_smoothing_and_text() {
+        assert_eq!(smooth_latency(0., 60.), 60.);
+        let mut ms = 60.;
+        for _ in 0..200 {
+            ms = smooth_latency(ms, 80.);
+        }
+        assert!((ms - 80.).abs() < 0.01);
+        assert_eq!(smooth_latency(60., 80.), 61.);
+        assert_eq!(latency_text(52.4, false), "≈ 52 ms");
+        assert_eq!(latency_text(0., false), "not measured yet");
+        // PipeWire hid the codec delay: never show the false small number.
+        assert_eq!(
+            latency_text(52.4, true),
+            "≥ ~200 ms (Bluetooth codec, not measurable)"
+        );
+        assert_eq!(latency_text(243., true), "≈ 243 ms");
     }
 
     #[test]
