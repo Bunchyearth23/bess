@@ -10,7 +10,7 @@
 pub use super::cylinder::Reservoir;
 use super::{
     config::CylinderConfig,
-    gas::{DischargeCurve, HarmonicCam, Valve},
+    gas::{DischargeCurve, HarmonicCam, Valve, floor_fast, rem_euclid_near},
     thermo::{self, EnergyInput, EnergyLedger, GasState, Mixture, SliderCrank, ThermoError, Wiebe},
     wave_junction::WavePort,
 };
@@ -56,6 +56,43 @@ pub struct CycleInput {
     pub variation: f64,
     /// Wiebe duration multiplier, 0.5..=1.5. Changes burn timing, not fuel energy.
     pub burn_duration_scale: f64,
+}
+
+impl CycleInput {
+    /// Checks of the fields an engine substep shares across its cylinders
+    /// (crank, timing, fuel and burn commands). `step` runs them itself;
+    /// `step_shared_checked` leaves them to a caller that ran them once.
+    pub fn shared_valid(&self) -> bool {
+        self.angle_rad.is_finite()
+            && self.angle_rad.abs() <= 1e12
+            && (0.0..=30000.0).contains(&self.rpm)
+            && (1e-9..=1. / 16000.).contains(&self.dt_s)
+            && (0.0..=3.0).contains(&self.fuel_multiplier)
+            && (0.0..=1.0).contains(&self.variation)
+            && (0.5..=1.5).contains(&self.burn_duration_scale)
+            && self.intake_phase_rad.is_finite()
+    }
+
+    /// Per-cylinder checks: reservoirs, compositions, budgets, spark shift.
+    fn cylinder_valid(&self) -> bool {
+        self.spark_shift_rad.is_finite()
+            && (0.0..=10.0).contains(&self.intake_mass_limit_kg)
+            && (0.0..=10.0).contains(&self.exhaust_mass_limit_kg)
+            && [
+                self.intake_fresh_air_fraction,
+                self.intake_fuel_fraction,
+                self.exhaust_fresh_air_fraction,
+                self.exhaust_fuel_fraction,
+            ]
+            .iter()
+            .all(|f| (0.0..=1.).contains(f))
+            && self.intake_fresh_air_fraction + self.intake_fuel_fraction <= 1. + 1e-12
+            && self.exhaust_fresh_air_fraction + self.exhaust_fuel_fraction <= 1. + 1e-12
+            && [self.intake, self.exhaust].iter().all(|r| {
+                (100.0..=1e7).contains(&r.pressure_pa)
+                    && (200.0..=3500.0).contains(&r.temperature_k)
+            })
+    }
 }
 
 impl Default for CycleInput {
@@ -280,9 +317,11 @@ impl CycleCylinder {
         cam.lift_m(local_angle)
     }
 
+    /// `(temperature, pressure)` is `gas.temperature_pressure()`.
     fn port_flow(
         &self,
         gas: GasState,
+        (temperature, pressure): (f64, f64),
         reservoir: Reservoir,
         reservoir_mixture: impl Fn() -> Mixture,
         lift: f64,
@@ -298,7 +337,6 @@ impl CycleCylinder {
         if lift == 0. || valve.count == 0 {
             return 0.;
         }
-        let (pressure, temperature) = (gas.pressure_pa(), gas.temperature_k());
         let upstream = if reservoir.pressure_pa > pressure {
             reservoir_mixture().properties(reservoir.temperature_k)
         } else {
@@ -318,33 +356,19 @@ impl CycleCylinder {
     /// Advance one externally timed step, at most 1/16 kHz and 0.1 radian.
     /// For the 96 kHz engine use dt=1/96000; halted crankshaft is supported.
     pub fn step(&mut self, input: CycleInput) -> Result<CycleOutput, ThermoError> {
+        if !input.shared_valid() {
+            self.exhaust_port = None;
+            return Err(ThermoError::InvalidInput);
+        }
+        self.step_shared_checked(input)
+    }
+
+    /// `step` for an input whose `shared_valid()` the caller has checked, e.g.
+    /// once per engine substep for fields common to all cylinders. The
+    /// per-cylinder fields are still validated here.
+    pub fn step_shared_checked(&mut self, input: CycleInput) -> Result<CycleOutput, ThermoError> {
         let exhaust_port = self.exhaust_port.take();
-        if !input.angle_rad.is_finite()
-            || input.angle_rad.abs() > 1e12
-            || !(0.0..=30000.0).contains(&input.rpm)
-            || !(1e-9..=1. / 16000.).contains(&input.dt_s)
-            || !(0.0..=3.0).contains(&input.fuel_multiplier)
-            || !(0.0..=1.0).contains(&input.variation)
-            || !(0.5..=1.5).contains(&input.burn_duration_scale)
-            || !input.spark_shift_rad.is_finite()
-            || !input.intake_phase_rad.is_finite()
-            || !(0.0..=10.0).contains(&input.intake_mass_limit_kg)
-            || !(0.0..=10.0).contains(&input.exhaust_mass_limit_kg)
-            || [
-                input.intake_fresh_air_fraction,
-                input.intake_fuel_fraction,
-                input.exhaust_fresh_air_fraction,
-                input.exhaust_fuel_fraction,
-            ]
-            .iter()
-            .any(|f| !(0.0..=1.).contains(f))
-            || input.intake_fresh_air_fraction + input.intake_fuel_fraction > 1. + 1e-12
-            || input.exhaust_fresh_air_fraction + input.exhaust_fuel_fraction > 1. + 1e-12
-            || [input.intake, input.exhaust].iter().any(|r| {
-                !(100.0..=1e7).contains(&r.pressure_pa)
-                    || !(200.0..=3500.0).contains(&r.temperature_k)
-            })
-        {
+        if !input.cylinder_valid() {
             return Err(ThermoError::InvalidInput);
         }
         let previous = if self.gas.is_some() {
@@ -381,13 +405,22 @@ impl CycleCylinder {
         }
         let mut gas = self.gas.expect("initialized above");
         let mass0 = gas.mass_kg();
-        let temperature0 = gas.temperature_k();
+        let (temperature0, pressure0) = gas.temperature_pressure();
+        let state0 = (temperature0, pressure0);
         let intake_lift = self.valve_lift(local0, true, input.intake_phase_rad);
         let exhaust_lift = self.valve_lift(local0, false, 0.);
         let intake_requested =
-            self.port_flow(gas, input.intake, intake_mixture, intake_lift, true) * input.dt_s;
+            self.port_flow(gas, state0, input.intake, intake_mixture, intake_lift, true)
+                * input.dt_s;
         let exhaust_requested = match exhaust_port {
-            None => self.port_flow(gas, input.exhaust, exhaust_mixture, exhaust_lift, false),
+            None => self.port_flow(
+                gas,
+                state0,
+                input.exhaust,
+                exhaust_mixture,
+                exhaust_lift,
+                false,
+            ),
             // A seated valve cannot see the wave; skip the joint solve.
             Some(_) if exhaust_lift == 0. => 0.,
             Some(port) => {
@@ -395,8 +428,10 @@ impl CycleCylinder {
                     pressure_pa,
                     ..input.exhaust
                 };
-                port.solve(|p| self.port_flow(gas, at(p), exhaust_mixture, exhaust_lift, false))
-                    .0
+                port.solve(|p| {
+                    self.port_flow(gas, state0, at(p), exhaust_mixture, exhaust_lift, false)
+                })
+                .0
             }
         } * input.dt_s;
         let intake_in = intake_requested.max(0.).min(input.intake_mass_limit_kg);
@@ -443,9 +478,9 @@ impl CycleCylinder {
         let outflow_h = gas.mixture().enthalpy(temperature0);
         let injected_enthalpy = injected_fuel * Mixture::FUEL.enthalpy(input.intake.temperature_k);
 
-        let spark_reference = SPARK_REFERENCE + input.spark_shift_rad.rem_euclid(CYCLE);
-        let before_event = ((local0 - spark_reference) / CYCLE).floor();
-        let after_event = ((local1 - spark_reference) / CYCLE).floor();
+        let spark_reference = SPARK_REFERENCE + rem_euclid_near(input.spark_shift_rad, CYCLE);
+        let before_event = floor_fast((local0 - spark_reference) / CYCLE);
+        let after_event = floor_fast((local1 - spark_reference) / CYCLE);
         let mut misfired = false;
         if after_event > before_event {
             self.burn = None;
@@ -532,7 +567,7 @@ impl CycleCylinder {
         if self.coefficient_clock == 0 {
             self.heat_coefficient = hohenberg_w_m2_k(
                 gas.volume_m3(),
-                gas.pressure_pa(),
+                pressure0,
                 temperature0,
                 2. * self.config.stroke_m * input.rpm / 60.,
             );
@@ -576,10 +611,11 @@ impl CycleCylinder {
         self.gas = Some(gas);
         self.previous_angle = input.angle_rad;
         let exhaust_mass = exhaust_out - exhaust_in;
+        let (temperature_k, pressure_pa) = gas.temperature_pressure();
         let output = CycleOutput {
-            pressure_pa: gas.pressure_pa(),
-            temperature_k: gas.temperature_k(),
-            gas_torque_nm: (gas.pressure_pa() - 101325.) * volume_derivative,
+            pressure_pa,
+            temperature_k,
+            gas_torque_nm: (pressure_pa - 101325.) * volume_derivative,
             intake_mass_kg: intake_in - intake_out,
             intake_enthalpy_j: intake_in * intake_h - intake_out * outflow_h,
             intake_fresh_air_kg: intake_fresh,

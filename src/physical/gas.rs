@@ -129,8 +129,16 @@ impl Orifice {
         };
         let g = properties.gamma;
         let ratio = downstream / upstream;
-        let critical = (2.0 / (g + 1.0)).powf(g / (g - 1.0));
-        let factor = if ratio <= critical {
+        // For the valid 1.01 <= gamma <= 2 the critical ratio lies in
+        // 0.444..0.607: decide clear cases without its powf (same branch).
+        let choked = if ratio > 0.61 {
+            false
+        } else if ratio < 0.44 {
+            true
+        } else {
+            ratio <= (2.0 / (g + 1.0)).powf(g / (g - 1.0))
+        };
+        let factor = if choked {
             g.sqrt() * (2.0 / (g + 1.0)).powf((g + 1.0) / (2.0 * (g - 1.0)))
         } else {
             // expm1 avoids cancellation as downstream pressure approaches upstream.
@@ -215,6 +223,32 @@ pub fn transfer(a: &mut GasVolume, b: &mut GasVolume, orifice: Orifice, dt_s: f6
     }
 }
 
+/// `x.rem_euclid(period)` for period > 0, without the fmod call when
+/// -period < x < 2 period: there `x % period` is exactly x or x - period
+/// (Sterbenz), the value fmod returns. Bit-identical for every input.
+pub(crate) fn rem_euclid_near(x: f64, period: f64) -> f64 {
+    if (0.0..period).contains(&x) {
+        x
+    } else if (period..2.0 * period).contains(&x) {
+        x - period
+    } else if -period < x && x < 0.0 {
+        x + period
+    } else {
+        x.rem_euclid(period)
+    }
+}
+
+/// `x.floor()` by integer truncation, exact for |x| < 2^52 (no libm call on
+/// baseline x86-64). Signed zeros and non-finite values go to `floor`.
+pub(crate) fn floor_fast(x: f64) -> f64 {
+    if x.abs() < 4e15 && x != 0.0 {
+        let t = x as i64 as f64;
+        if t > x { t - 1.0 } else { t }
+    } else {
+        x.floor()
+    }
+}
+
 /// All angles are crank radians; a four-stroke cam repeats every 4π radians.
 #[derive(Clone, Copy, Debug)]
 pub struct HarmonicCam {
@@ -237,10 +271,29 @@ impl HarmonicCam {
         {
             return 0.0;
         }
-        let delta = (crank_angle_rad.rem_euclid(2.0 * TAU) - self.center_rad.rem_euclid(2.0 * TAU)
-            + TAU)
-            .rem_euclid(2.0 * TAU)
-            - TAU;
+        // Cheap conservative reject of the closed part of the cycle, before
+        // three fmod calls: this unwrapped estimate is within a few ulp of
+        // |angle| of the exact wrap below, far inside `margin`, and the window
+        // keeps clear of the ±2π wrap, so it only returns where that would.
+        let margin = 1e-9 * (1.0 + crank_angle_rad.abs() + self.center_rad.abs());
+        let half = self.duration_rad * 0.5;
+        if half < TAU - 2.0 * margin {
+            let offset = crank_angle_rad - self.center_rad;
+            let mut estimate = offset - (offset * (0.5 / TAU)) as i64 as f64 * (2.0 * TAU);
+            if estimate > TAU {
+                estimate -= 2.0 * TAU;
+            } else if estimate < -TAU {
+                estimate += 2.0 * TAU;
+            }
+            if estimate.abs() >= half + margin {
+                return 0.0;
+            }
+        }
+        let delta = rem_euclid_near(
+            crank_angle_rad.rem_euclid(2.0 * TAU) - rem_euclid_near(self.center_rad, 2.0 * TAU)
+                + TAU,
+            2.0 * TAU,
+        ) - TAU;
         if delta.abs() >= self.duration_rad * 0.5 {
             return 0.0;
         }
@@ -438,6 +491,70 @@ mod tests {
         close(cam.lift_m(0.1 + TAU), 0.0);
         close(cam.lift_m(1.0), cam.lift_m(-0.8));
         assert!(cam.lift_m(2.05) == 0.0);
+    }
+
+    #[test]
+    fn fast_rejects_match_the_exact_arithmetic() {
+        // Pre-X-014 arithmetic, kept as the bit-exact reference.
+        let wrap = |cam: HarmonicCam, angle: f64| {
+            let delta = (angle.rem_euclid(2.0 * TAU) - cam.center_rad.rem_euclid(2.0 * TAU) + TAU)
+                .rem_euclid(2.0 * TAU)
+                - TAU;
+            if delta.abs() >= cam.duration_rad * 0.5 {
+                return 0.0;
+            }
+            let harmonic = 0.5 + 0.5 * (TAU * delta / cam.duration_rad).cos();
+            (cam.peak_lift_m * harmonic.powf(cam.shape_exponent) - cam.lash_m).max(0.0)
+        };
+        for (center, duration) in [(-1.9, 4.4), (4.3, 4.4), (-40.0, 0.3), (1.0, 12.4)] {
+            let cam = HarmonicCam {
+                center_rad: center,
+                duration_rad: duration,
+                peak_lift_m: 0.01,
+                shape_exponent: 1.5,
+                lash_m: 0.0002,
+            };
+            for base in [0.0, 1e3, -1e3, 1e6, 3e8] {
+                for i in 0..20_000 {
+                    let edge = center + 0.5 * duration + (i % 7) as f64 * 1e-12;
+                    for angle in [base + i as f64 * 7e-3, base + edge, base - edge] {
+                        assert_eq!(cam.lift_m(angle).to_bits(), wrap(cam, angle).to_bits());
+                    }
+                }
+            }
+        }
+        let mut values = vec![
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            -f64::INFINITY,
+            1e300,
+            -1e300,
+        ];
+        for k in -40..=40 {
+            let x = k as f64 * 0.5 * TAU;
+            values.extend([x, x.next_up(), x.next_down(), x + 1e-3, x - 1e-3]);
+        }
+        values.extend((0..100_000).map(|i| (i as f64 * 0.37).sin() * 10f64.powi(i % 17 - 4)));
+        for x in values {
+            let period = 2.0 * TAU;
+            assert_eq!(
+                rem_euclid_near(x, period).to_bits(),
+                x.rem_euclid(period).to_bits(),
+                "{x}"
+            );
+            assert_eq!(floor_fast(x).to_bits(), x.floor().to_bits(), "{x}");
+            assert_eq!(
+                floor_fast(x / period).to_bits(),
+                (x / period).floor().to_bits(),
+                "{x}"
+            );
+        }
+        for g in (0..=990).map(|i| 1.01 + i as f64 * 1e-3) {
+            let critical = (2.0 / (g + 1.0)).powf(g / (g - 1.0));
+            assert!((0.44..=0.61).contains(&critical), "{g}: {critical}");
+        }
     }
 
     #[test]
