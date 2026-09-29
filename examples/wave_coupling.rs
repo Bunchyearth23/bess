@@ -1,8 +1,12 @@
-//! X-017 evidence: passive wave/valve junction (`experimental.wave_coupling`).
-//!   cargo run --release --example wave_coupling -- <out_dir> [idle|dyno|cpu|all]
-//! idle: raw exhaust spectra at 850 rpm / 0.05, seconds 2–8, off vs on.
-//! dyno: WOT torque vs primary length, coupling on (and off as reference).
-//! cpu:  engine cost per second of audio, off vs on.
+//! X-017/X-028 evidence: passive wave/valve junction (`experimental.wave_coupling`).
+//!   cargo run --release --example wave_coupling -- <out_dir> [idle|dyno|cpu|rate|survey|bands|all]
+//! idle:   raw exhaust spectra at 850 rpm / 0.05, seconds 2–8, off vs on.
+//! dyno:   WOT torque vs primary length, coupling on (and off as reference).
+//! cpu:    engine cost per second of audio, off vs on.
+//! survey: on/off dyno ratio and WOT exhaust level, I4 (cast, equal-length
+//!         x0.5/x1/x2, mild cam), V8, V12, turbo I4.
+//! bands:  octave-band WOT exhaust energy, on minus off.
+//! levels: absolute WOT exhaust level against rpm, off and on.
 use bess::{
     dyno,
     engine_build::Headers,
@@ -286,6 +290,276 @@ fn rate(out: &mut String) {
     }
 }
 
+/// X-028 survey: coupled/uncoupled dyno ratio and WOT exhaust level for the
+/// default I4 (cast), equal-length I4 at x0.5/x1/x2, V8, V12 and turbo I4.
+fn survey(out: &mut String) {
+    let configs: Vec<(&str, Scratch)> = {
+        let mut v = Vec::new();
+        v.push(("I4 cast", Scratch::default()));
+        for scale in [0.5_f32, 1., 2.] {
+            let mut s = Scratch::default();
+            s.build.headers = Headers::EqualLength;
+            s.sound.primary_length_scale = scale;
+            v.push((
+                ["I4 EL x0.5", "I4 EL x1", "I4 EL x2"][(scale.log2() + 1.) as usize],
+                s,
+            ));
+        }
+        // Small overlap (cam 0, no VVT): the wave effect without the default
+        // cam's fixed-rpm reversion dips.
+        for (name, scale) in [("I4 EL x1 mild", 1_f32), ("I4 EL x2 mild", 2.)] {
+            let mut s = Scratch::default();
+            s.build.headers = Headers::EqualLength;
+            s.build.cam = 0.;
+            s.build.vvt = false;
+            s.sound.primary_length_scale = scale;
+            v.push((name, s));
+        }
+        v.push(("V8", preset("V8 cross-plane", false)));
+        v.push(("V12", preset("V12 60°", false)));
+        let mut turbo = Scratch::default();
+        turbo.build.aspiration = bess::engine_build::Aspiration::Turbo;
+        turbo.build.boost_bar = 0.8;
+        v.push(("Turbo I4", turbo));
+        v
+    };
+    let jobs: Vec<_> = configs
+        .iter()
+        .flat_map(|(n, s)| [false, true].map(move |c| (*n, s.clone(), c)))
+        .collect();
+    let curves: Vec<_> = std::thread::scope(|sc| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|(_, scratch, coupled)| {
+                let mut scratch = scratch.clone();
+                scratch.experimental.wave_coupling = *coupled;
+                sc.spawn(move || {
+                    let _d = DenormalGuard::enter();
+                    dyno::sweep(&scratch, 31).unwrap()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    writeln!(out, "config,rpm,torque_off,torque_on,ratio,map_off,map_on").unwrap();
+    for (k, (name, _)) in configs.iter().enumerate() {
+        let (off, on) = (&curves[2 * k], &curves[2 * k + 1]);
+        let ratio: Vec<f64> = on
+            .torque_nm
+            .iter()
+            .zip(&off.torque_nm)
+            .map(|(a, b)| a / b - 1.)
+            .collect();
+        // Above 1500 rpm: the idle end is dominated by low absolute torque.
+        let (lo, hi) = ratio
+            .iter()
+            .zip(&off.rpm)
+            .filter(|(_, n)| **n >= 1500.)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), (r, _)| {
+                (a.min(*r), b.max(*r))
+            });
+        let line = format!(
+            "{name}: ratio min {:+.1} % max {:+.1} %, peak off {:.1} Nm @ {:.0}, on {:.1} Nm @ {:.0}",
+            100. * lo,
+            100. * hi,
+            off.peak_torque.0,
+            off.peak_torque.1,
+            on.peak_torque.0,
+            on.peak_torque.1
+        );
+        println!("{line}");
+        writeln!(out, "# {line}").unwrap();
+        for (i, r) in ratio.iter().enumerate() {
+            writeln!(
+                out,
+                "{name},{:.0},{:.3},{:.3},{r:.4},{:.1},{:.1}",
+                off.rpm[i], off.torque_nm[i], on.torque_nm[i], off.map_kpa[i], on.map_kpa[i]
+            )
+            .unwrap();
+        }
+    }
+    // WOT exhaust level, 48 kHz, imposed rpm; turbo gets longer to spool.
+    let rate = 48_000_u32;
+    let level_jobs: Vec<_> = configs
+        .iter()
+        .flat_map(|(n, s)| {
+            let redline = f64::from(s.redline_rpm);
+            [2500., 4500., 0.95 * redline].map(move |rpm| (*n, s.clone(), rpm))
+        })
+        .collect();
+    let rows: Vec<String> = std::thread::scope(|sc| {
+        let handles: Vec<_> = level_jobs
+            .iter()
+            .map(|(name, scratch, rpm)| {
+                sc.spawn(move || {
+                    let _d = DenormalGuard::enter();
+                    let settle =
+                        if scratch.build.aspiration == bess::engine_build::Aspiration::Natural {
+                            0.5
+                        } else {
+                            2.5
+                        };
+                    let energy = |coupled| {
+                        let mut scratch = scratch.clone();
+                        scratch.experimental.wave_coupling = coupled;
+                        let mut engine = Engine::new(&scratch, rate).unwrap();
+                        let (mut e, mut t) = (0., 0.);
+                        for frame in 0..((settle + 0.5) * f64::from(rate)) as usize {
+                            let s = engine.next(Commands {
+                                imposed_rpm: Some(*rpm),
+                                throttle: 1.,
+                                ..Default::default()
+                            });
+                            assert!(!engine.failed());
+                            if frame as f64 >= settle * f64::from(rate) {
+                                e += f64::from(s.exhaust).powi(2);
+                                t += s.torque_nm - engine.friction_nm();
+                            }
+                        }
+                        (e, t)
+                    };
+                    let ((e0, t0), (e1, t1)) = (energy(false), energy(true));
+                    format!(
+                        "{name},{rpm:.0},{:+.2},{:+.2}",
+                        10. * (e1 / e0).log10(),
+                        100. * (t1 / t0 - 1.)
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    writeln!(
+        out,
+        "# level: config,rpm,coupled_minus_off_db,torque_change_pct"
+    )
+    .unwrap();
+    for row in rows {
+        println!("level {row}");
+        writeln!(out, "# level {row}").unwrap();
+    }
+}
+
+/// Octave-band exhaust energy, coupled minus uncoupled (dB), WOT 48 kHz.
+fn bands(out: &mut String) {
+    let cases = [
+        ("V12 60°", 2_f32, 7000.),
+        ("V12 60°", 1., 6650.),
+        ("Inline-4", 2., 4500.),
+    ];
+    let rows: Vec<String> = std::thread::scope(|sc| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|&(name, scale, rpm)| {
+                sc.spawn(move || {
+                    let _d = DenormalGuard::enter();
+                    let spectrum = |coupled| {
+                        let mut scratch = preset(name, coupled);
+                        scratch.build.headers = Headers::EqualLength;
+                        scratch.sound.primary_length_scale = scale;
+                        let mut engine = Engine::new(&scratch, 48000).unwrap();
+                        let mut x = Vec::new();
+                        for frame in 0..48000 {
+                            let s = engine.next(Commands {
+                                imposed_rpm: Some(rpm),
+                                throttle: 1.,
+                                ..Default::default()
+                            });
+                            if frame >= 16384 {
+                                x.push(Complex::new(f64::from(s.exhaust), 0.));
+                            }
+                        }
+                        x.truncate(16384 * 2 - 1);
+                        x.resize(32768, Complex::new(0., 0.));
+                        FftPlanner::new().plan_fft_forward(32768).process(&mut x);
+                        let hz = 48000. / 32768.;
+                        (0..8)
+                            .map(|o| {
+                                let (lo, hi) = (62.5 * 2_f64.powi(o), 125. * 2_f64.powi(o));
+                                x[1..16384]
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(k, _)| (lo..hi).contains(&((k + 1) as f64 * hz)))
+                                    .map(|(_, c)| c.norm_sqr())
+                                    .sum::<f64>()
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let (off, on) = (spectrum(false), spectrum(true));
+                    let total = |v: &[f64]| v.iter().sum::<f64>();
+                    let cells: Vec<String> = off
+                        .iter()
+                        .zip(&on)
+                        .map(|(a, b)| format!("{:+.1}", 10. * (b / a).log10()))
+                        .collect();
+                    format!(
+                        "{name} x{scale} {rpm}: total {:+.1} dB; octaves from 62.5 Hz {}; on-share {:?}",
+                        10. * (total(&on) / total(&off)).log10(),
+                        cells.join(" "),
+                        on.iter().map(|b| (100. * b / total(&on)).round()).collect::<Vec<_>>()
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for row in rows {
+        println!("{row}");
+        writeln!(out, "{row}").unwrap();
+    }
+}
+
+/// Absolute WOT exhaust level (dBFS) against rpm, off and on, 48 kHz.
+fn levels(out: &mut String) {
+    let configs: Vec<(&str, f32, bool)> = vec![
+        ("cast", 1., false),
+        ("EL x1", 1., true),
+        ("EL x2", 2., true),
+    ];
+    let jobs: Vec<_> = configs
+        .iter()
+        .flat_map(|&c| (0..11).map(move |k| (c, 2000. + 500. * f64::from(k))))
+        .collect();
+    let rows: Vec<String> = std::thread::scope(|sc| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|&((name, scale, equal), rpm)| {
+                sc.spawn(move || {
+                    let _d = DenormalGuard::enter();
+                    let level = |coupled| {
+                        let mut scratch = Scratch::default();
+                        if equal {
+                            scratch.build.headers = Headers::EqualLength;
+                        }
+                        scratch.sound.primary_length_scale = scale;
+                        scratch.experimental.wave_coupling = coupled;
+                        let mut engine = Engine::new(&scratch, 48000).unwrap();
+                        let mut e = 0.;
+                        for frame in 0..48000 {
+                            let s = engine.next(Commands {
+                                imposed_rpm: Some(rpm),
+                                throttle: 1.,
+                                ..Default::default()
+                            });
+                            if frame >= 24000 {
+                                e += f64::from(s.exhaust).powi(2) / 24000.;
+                            }
+                        }
+                        10. * e.log10()
+                    };
+                    format!("{name},{rpm},{:.2},{:.2}", level(false), level(true))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    writeln!(out, "config,rpm,off_dbfs,on_dbfs").unwrap();
+    for row in rows {
+        println!("{row}");
+        writeln!(out, "{row}").unwrap();
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().unwrap_or_else(|| "out".into()));
@@ -296,6 +570,9 @@ fn main() {
         ("dyno", dyno_curves),
         ("cpu", cpu),
         ("rate", rate),
+        ("survey", survey),
+        ("bands", bands),
+        ("levels", levels),
     ] {
         if mode == "all" || mode == name {
             let mut out = String::new();

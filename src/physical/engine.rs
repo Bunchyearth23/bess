@@ -462,6 +462,16 @@ impl Engine {
         let coupled = self.scratch.experimental.wave_coupling;
         if coupled {
             let exhaust = [0, 1].map(|b| self.manifolds.exhaust_bank(b));
+            // Pipe γ and R of each collector's own gas (X-026 composition).
+            self.acoustic.set_gas([0, 1].map(|b| {
+                let c = self.manifolds.exhaust_composition(b);
+                let mixture =
+                    super::thermo::Mixture::from_fractions(c.fresh_air_fraction, c.fuel_fraction);
+                (
+                    mixture.gamma(exhaust[b].temperature_k),
+                    mixture.gas_constant(),
+                )
+            }));
             self.acoustic.begin(
                 exhaust.map(|r| r.temperature_k),
                 exhaust.map(|r| r.pressure_pa),
