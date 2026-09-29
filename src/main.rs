@@ -1,17 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod audio;
+#[cfg(test)]
+mod control_count;
 mod spectrum;
+mod ui_kit;
 use bess::{
     bank::Bank,
     beamng, beamng_level,
     bench::{AuditionMix, BeamNgCamera},
     drive::{Controls, Mode},
-    engine_build::EngineBuild,
+    engine_build::{EngineBuild, EngineTuning},
     hybrid::Settings,
     project::{self, Parameters, Project},
     render,
     room::Room,
-    scratch::{EngineDesign, Layout, Scratch, ScratchModel},
+    scratch::{EngineDesign, Layout, Scratch, ScratchModel, SoundTuning},
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -141,6 +144,10 @@ const DYNO_POINTS: usize = 25;
 #[derive(Default)]
 struct Dyno {
     curve: Option<bess::dyno::Curve>,
+    /// The curve before the latest change, drawn dashed as a reference.
+    previous: Option<bess::dyno::Curve>,
+    /// A curve kept as the reference until cleared.
+    pinned: Option<bess::dyno::Curve>,
     error: Option<String>,
     /// Torque-relevant scratch settings of the latest request.
     key: Option<Scratch>,
@@ -211,6 +218,10 @@ impl Dyno {
                 {
                     *clutch = sized(curve.peak_torque.0);
                 }
+                // A re-sweep that changed nothing keeps the older reference.
+                if self.curve.as_ref() != Some(&curve) {
+                    self.previous = self.curve.take();
+                }
                 self.curve = Some(curve);
                 self.error = None;
             }
@@ -220,12 +231,15 @@ impl Dyno {
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let mut style = (*cc.egui_ctx.style()).clone();
+        Self::with_ctx(&cc.egui_ctx, initial)
+    }
+    fn with_ctx(ctx: &egui::Context, initial: Option<PathBuf>) -> Self {
+        ctx.set_visuals(egui::Visuals::dark());
+        let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(12., 10.);
         style.visuals.panel_fill = Color32::from_rgb(17, 23, 30);
         style.visuals.selection.bg_fill = Color32::from_rgb(0, 115, 110);
-        cc.egui_ctx.set_style(style);
+        ctx.set_style(style);
         let mut app = Self {
             capture: None,
             capture_level: false,
@@ -531,6 +545,7 @@ impl App {
         };
         self.dyno.poll(scratch, &mut self.driving.peak_torque_nm);
         let perf = scratch.build.performance(scratch.design.cylinders);
+        let mut pin = false;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.strong(format!(
                 "{:.2} L {} · {:.1} × {:.1} mm",
@@ -545,7 +560,8 @@ impl App {
                 ui.label(format!(
                     "{torque:.0} Nm @ {torque_rpm:.0} · {power:.0} kW ({:.0} hp) @ {power_rpm:.0} rpm",
                     power * 1.341
-                ));
+                ))
+                .on_hover_text("Wide-open throttle, speed held: cylinder gas torque minus friction. Its peak also sizes the clutch.");
             } else {
                 ui.label(format!(
                     "≈ {:.0} Nm · {:.0} kW ({:.0} hp) · idle {:.0} / redline {:.0} rpm",
@@ -555,6 +571,7 @@ impl App {
                     perf.idle_rpm,
                     perf.redline_rpm
                 ));
+                ui.small("Builder estimate until the dyno sweep of the physical engine is ready.");
             }
             if self.dyno.busy() {
                 ui.horizontal(|ui| {
@@ -569,31 +586,54 @@ impl App {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
             if let Some(curve) = &self.dyno.curve {
-                dyno_plot(ui, curve, self.dyno.busy());
-                ui.small("Wide-open throttle, speed held: cylinder gas torque minus friction. Its peak also sizes the clutch.");
-            } else {
-                ui.small("Builder estimate until the dyno sweep of the physical engine is ready.");
+                let reference = self.dyno.pinned.as_ref().or(self.dyno.previous.as_ref());
+                dyno_plot(ui, curve, reference, self.dyno.busy());
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(reference) = reference {
+                        ui.label(format!(
+                            "Dashed: {} · Δ {:+.0} Nm · {:+.1} kW",
+                            if self.dyno.pinned.is_some() {
+                                "pinned"
+                            } else {
+                                "before the last change"
+                            },
+                            curve.peak_torque.0 - reference.peak_torque.0,
+                            curve.peak_power.0 - reference.peak_power.0
+                        ));
+                    }
+                    let label = if self.dyno.pinned.is_some() {
+                        "Clear reference"
+                    } else {
+                        "Pin as reference"
+                    };
+                    pin = ui
+                        .small_button(label)
+                        .on_hover_text("Keep this curve dashed while you tune, instead of the previous one.")
+                        .clicked();
+                });
             }
         });
+        if pin {
+            self.dyno.pinned = match self.dyno.pinned {
+                Some(_) => None,
+                None => self.dyno.curve.clone(),
+            };
+        }
         let before = (scratch.design, scratch.build);
         section(ui, "Block", |ui| {
             engine_design(ui, &mut scratch.design, &mut self.firing_text);
             engine_block(ui, &mut scratch.build);
         });
         let multibank = scratch.design.banks[..scratch.design.cylinders as usize].contains(&1);
-        engine_parts(ui, &mut scratch.build, multibank);
-        percent_slider(
+        let cylinders = scratch.design.cylinders;
+        engine_parts(
             ui,
-            "Afterfire (lift-off pops)",
-            &mut scratch.experimental.afterfire,
+            &mut scratch.build,
+            &mut scratch.tuning,
+            &mut scratch.sound,
+            cylinders,
+            multibank,
         );
-        ui.small("Off by default: pop-and-bang style overrun, independent of the parts.");
-        percent_slider(
-            ui,
-            "Knock (end-gas detonation)",
-            &mut scratch.experimental.knock,
-        );
-        ui.small("Off by default: lowers effective octane; rings at high load or advanced spark.");
         if (scratch.design, scratch.build) != before
             && scratch.design.validate().is_ok()
             && scratch.build.validate().is_ok()
@@ -612,8 +652,22 @@ impl App {
                 self.settings.fuel_cut,
             ) = mix;
         }
-        section(ui, "Physical engine", |ui| {
-            ui.small("Cylinder pressure, valve flow and crank inertia generate the sound. Part changes update the physical model.");
+        section(ui, "Combustion and engine physics", |ui| {
+            combustion_controls(ui, &mut scratch.sound);
+            percent_slider(
+                ui,
+                "Afterfire (lift-off pops)",
+                &mut scratch.experimental.afterfire,
+            )
+            .on_hover_text("Off by default: pop-and-bang style overrun, independent of the parts.");
+            percent_slider(
+                ui,
+                "Knock (end-gas detonation)",
+                &mut scratch.experimental.knock,
+            )
+            .on_hover_text(
+                "Off by default: lowers effective octane; rings at high load or advanced spark.",
+            );
             slider(
                 ui,
                 "Idle target (rpm)",
@@ -635,39 +689,20 @@ impl App {
                 0.05..=2.0,
             );
             percent_slider(ui, "Deceleration fuel cut", &mut self.settings.fuel_cut);
-            slider(ui, "Exhaust level", &mut self.params.exhaust, 0.0..=1.0);
-            slider(ui, "Intake level", &mut self.params.intake, 0.0..=1.0);
-            slider(
-                ui,
-                "Mechanical level",
-                &mut self.params.mechanical,
-                0.0..=1.0,
-            );
-            slider(
-                ui,
-                "Engine layer gain",
-                &mut self.settings.engine_gain,
-                0.0..=2.0,
-            );
-            slider(ui, "Idle gain", &mut self.settings.idle_gain, 0.0..=2.0);
             ui.checkbox(
                 &mut self.settings.accessory_ac,
                 "A/C compressor load · 16 Nm",
-            );
+            )
+            .on_hover_text("Accessory loads act on the physical crank in driving mode. Direct RPM tests hold shaft speed.");
             ui.checkbox(
                 &mut self.settings.accessory_steering,
                 "Power steering load · 22 Nm",
             );
-            ui.small("Accessory loads act on the physical crank in driving mode. Direct RPM tests hold shaft speed.");
-            ui.small(
-                "Gas temperatures and valve events follow the engine parts and running conditions.",
-            );
         });
-        sound_tuning_controls(
-            ui,
-            &mut scratch.sound,
-            scratch.build.muffler != bess::engine_build::Muffler::None,
-        );
+        section(ui, "Layer mix", |ui| {
+            layer_mix_controls(ui, &mut self.params, &mut self.settings);
+        });
+        sound_tuning_controls(ui, &mut scratch.sound);
         if let Err(e) = scratch.validate() {
             ui.colored_label(Color32::LIGHT_RED, e);
         }
@@ -732,19 +767,10 @@ impl App {
             }
         }
         if self.scratch.is_some() {
+            camera_row(ui, &mut self.camera, true);
             ui.horizontal_wrapped(|ui| {
-                ui.label("Listening position:");
-                for (camera, label) in [
-                    (BeamNgCamera::Orbit, "Outside"),
-                    (BeamNgCamera::Tailpipe, "Tailpipe"),
-                    (BeamNgCamera::Hood, "Engine bay"),
-                    (BeamNgCamera::Cockpit, "Cabin"),
-                ] {
-                    ui.selectable_value(&mut self.camera, camera, label);
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Room:");
+                ui.label("Room:")
+                    .on_hover_text("Room is for listening only; WAV and BeamNG exports stay dry.");
                 for room in Room::ALL {
                     ui.selectable_value(&mut self.room, room, room.label());
                 }
@@ -753,11 +779,10 @@ impl App {
                     egui::Slider::new(&mut self.room_mix, 0.0..=1.0).text("wet"),
                 );
             });
-            ui.small("Room is for listening only; WAV and BeamNG exports stay dry.");
-            ui.small("Scratch engine: there is no Automation source A, only the designed sound.");
         } else {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.settings.enhanced, false, "A · Source Automation");
+                ui.selectable_value(&mut self.settings.enhanced, false, "A · Source Automation")
+                    .on_hover_text("Plays the imported WAV files with prepared transitions. Not a game recording.");
                 let ready = self
                     .automation_model
                     .as_ref()
@@ -767,7 +792,8 @@ impl App {
                         &mut self.settings.enhanced,
                         true,
                         "B · BESS physical engine",
-                    );
+                    )
+                    .on_hover_text("The same physical engine as scratch engines, configured from the Automation vehicle data.");
                 });
             });
         }
@@ -779,28 +805,11 @@ impl App {
                     "Match levels to compare tone",
                 ),
             );
-            ui.small(
-            "A plays the imported WAV files with prepared transitions. It is not a game recording.",
-        );
-            ui.small("B uses the same physical engine as scratch engines, configured from the Automation vehicle data.");
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("BeamNG camera:");
-                    let cams = [
-                        (BeamNgCamera::Cockpit, "🛋 Cockpit / Interior"),
-                        (BeamNgCamera::Hood, "🚗 Hood"),
-                        (BeamNgCamera::Tailpipe, "💨 Tailpipe"),
-                        (BeamNgCamera::Orbit, "🌐 Orbit / Exterior"),
-                    ];
-                    for (cam, label) in cams {
-                        let is_active = self.audition_mix == AuditionMix::BeamNgTwoEmitter
-                            && self.camera == cam;
-                        if ui.selectable_label(is_active, label).clicked() {
-                            self.audition_mix = AuditionMix::BeamNgTwoEmitter;
-                            self.camera = cam;
-                        }
-                    }
-                });
+                let beamng = self.audition_mix == AuditionMix::BeamNgTwoEmitter;
+                if camera_row(ui, &mut self.camera, beamng) {
+                    self.audition_mix = AuditionMix::BeamNgTwoEmitter;
+                }
                 ui.horizontal(|ui| {
                     ui.label("Listening mix:");
                     ui.selectable_value(
@@ -863,37 +872,6 @@ impl App {
     }
     fn driving_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Driving — test bench");
-        ui.small("Control listening tests and WAV renders.");
-        if ui
-            .add_enabled(
-                self.audio.is_some() && self.level_worker.is_none(),
-                egui::Button::new(if self.playing {
-                    "Pause listening"
-                } else {
-                    "Listen"
-                }),
-            )
-            .clicked()
-        {
-            self.playing = !self.playing;
-        }
-        if let Some(audio) = &self.audio {
-            let rpm = self.readout.rpm;
-            let load = f32::from_bits(audio.meter.load.load(Ordering::Relaxed));
-            ui.label(format!("{rpm:.0} rpm · engine load {:.0} %", load * 100.));
-            if self.driving.mode == Mode::Simulated {
-                let speed = f32::from_bits(audio.meter.speed.load(Ordering::Relaxed));
-                let gear = audio.meter.gear.load(Ordering::Relaxed);
-                ui.label(format!(
-                    "{speed:.1} km/h · gear {}",
-                    if gear == 0 {
-                        "N".to_owned()
-                    } else {
-                        gear.to_string()
-                    }
-                ));
-            }
-        }
         ui.separator();
         self.drive_controls(ui);
         if self.driving.mode == Mode::Direct {
@@ -904,8 +882,13 @@ impl App {
                 .or(self.scratch.as_ref().map(|s| (s.idle_rpm, s.redline_rpm)));
             if let Some((min, max)) = range {
                 self.params.rpm = self.params.rpm.clamp(min, max);
-                slider(ui, "Requested RPM", &mut self.params.rpm, min..=max);
-                ui.small(format!("Range: {min:.0}–{max:.0} rpm"));
+                slider_help(
+                    ui,
+                    "Requested RPM",
+                    &mut self.params.rpm,
+                    min..=max,
+                    &format!("Range: {min:.0}–{max:.0} rpm"),
+                );
             } else {
                 ui.small("Import a vehicle to adjust RPM.");
             }
@@ -1121,8 +1104,14 @@ fn wheel_adjust(
     }
 }
 /// Full-load torque (left axis) and power (right axis) from idle to redline,
-/// with peak marks and a hover readout. `dim` while a newer sweep runs.
-fn dyno_plot(ui: &mut egui::Ui, curve: &bess::dyno::Curve, dim: bool) {
+/// with peak marks and a hover readout. `reference` is drawn dashed under it
+/// (the previous or pinned curve). `dim` while a newer sweep runs.
+fn dyno_plot(
+    ui: &mut egui::Ui,
+    curve: &bess::dyno::Curve,
+    reference: Option<&bess::dyno::Curve>,
+    dim: bool,
+) {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -1135,7 +1124,22 @@ fn dyno_plot(ui: &mut egui::Ui, curve: &bess::dyno::Curve, dim: bool) {
     // Axis tops are whole multiples of four round quarter steps.
     let top =
         |peak: f64, quarter: f64| (peak * 1.15 / (4. * quarter)).ceil().max(1.) * 4. * quarter;
-    let (torque_top, power_top) = (top(curve.peak_torque.0, 25.), top(curve.peak_power.0, 10.));
+    let (torque_top, power_top) = (
+        top(
+            curve
+                .peak_torque
+                .0
+                .max(reference.map_or(0., |r| r.peak_torque.0)),
+            25.,
+        ),
+        top(
+            curve
+                .peak_power
+                .0
+                .max(reference.map_or(0., |r| r.peak_power.0)),
+            10.,
+        ),
+    );
     let x = |rpm: f64| plot.left() + ((rpm - low) / (high - low)) as f32 * plot.width();
     let y =
         |value: f64, top: f64| plot.bottom() - (value / top).clamp(0., 1.) as f32 * plot.height();
@@ -1206,6 +1210,25 @@ fn dyno_plot(ui: &mut egui::Ui, curve: &bess::dyno::Curve, dim: bool) {
     let torque_color = Color32::from_rgb(75, 222, 195).gamma_multiply(fade);
     let power_color = Color32::from_rgb(255, 170, 70).gamma_multiply(fade);
     let ((torque, torque_rpm), (power, power_rpm)) = (curve.peak_torque, curve.peak_power);
+    if let Some(reference) = reference {
+        for (values, top, color) in [
+            (&reference.torque_nm, torque_top, torque_color),
+            (&reference.power_kw, power_top, power_color),
+        ] {
+            let points: Vec<_> = reference
+                .rpm
+                .iter()
+                .zip(values.iter())
+                .map(|(&r, &v)| egui::pos2(x(r), y(v, top)))
+                .collect();
+            painter.extend(egui::Shape::dashed_line(
+                &points,
+                egui::Stroke::new(1.4_f32, color.gamma_multiply(0.55)),
+                5.,
+                4.,
+            ));
+        }
+    }
     // Torque peaks are labelled below their mark, power peaks above.
     for (values, top, color, (peak, peak_rpm), label, vertical) in [
         (
@@ -1366,13 +1389,14 @@ fn choice<T: PartialEq + Copy>(
     label: &str,
     value: &mut T,
     options: &[(T, &str)],
-) {
+) -> egui::Response {
     ui.horizontal_wrapped(|ui| {
         ui.label(label);
         for (option, name) in options {
             ui.selectable_value(value, *option, *name);
         }
-    });
+    })
+    .response
 }
 fn engine_block(ui: &mut egui::Ui, b: &mut EngineBuild) {
     use bess::engine_build::BlockMaterial;
@@ -1401,15 +1425,28 @@ fn engine_block(ui: &mut egui::Ui, b: &mut EngineBuild) {
             (BlockMaterial::CastIron, "Cast iron"),
             (BlockMaterial::Aluminium, "Aluminium"),
         ],
+    )
+    .on_hover_text(
+        "Block material only shades mechanical noise: iron is heavier and better damped.",
     );
-    ui.small("Block material only shades mechanical noise: iron is heavier and better damped.");
 }
-/// Automation-style part sections below the block.
-fn engine_parts(ui: &mut egui::Ui, b: &mut EngineBuild, multibank: bool) {
+/// Automation-style part sections below the block. Each part section holds
+/// its choices first, then the overrides of what those parts derive (W-007.3)
+/// and, for the exhaust, the geometry that only shapes the sound (X-021).
+fn engine_parts(
+    ui: &mut egui::Ui,
+    b: &mut EngineBuild,
+    tuning: &mut EngineTuning,
+    sound: &mut SoundTuning,
+    cylinders: u32,
+    multibank: bool,
+) {
     use bess::engine_build::{
         Aspiration, BlowOff, Catalyst, Crankshaft, Crossover, Fuel, Head, Headers, Muffler,
         Throttle,
     };
+    use ui_kit::{Derived, override_slider as over, range, reset_button};
+    let d = Derived::of(b, cylinders);
     section(ui, "Head and valvetrain", |ui| {
         choice(
             ui,
@@ -1424,9 +1461,92 @@ fn engine_parts(ui: &mut egui::Ui, b: &mut EngineBuild, multibank: bool) {
         let mut valves = b.valves as u32;
         ui.add(egui::Slider::new(&mut valves, 2..=5).text("Valves per cylinder"));
         b.valves = valves as u8;
-        percent_slider(ui, "Cam profile (mild → race)", &mut b.cam);
-        ui.small("More overlap: stronger top end, lumpier and less stable idle.");
+        percent_slider(ui, "Cam profile (mild → race)", &mut b.cam)
+            .on_hover_text("More overlap: stronger top end, lumpier and less stable idle.");
         ui.checkbox(&mut b.vvt, "Variable valve timing");
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Cam timing and lift");
+            reset_button(
+                ui,
+                "Reset cams",
+                &mut tuning.cam,
+                "Back to the values the cam profile derives",
+            );
+        });
+        let c = &mut tuning.cam;
+        over(
+            ui,
+            "Duration at 0.050″",
+            &mut c.duration_deg,
+            d.duration_deg,
+            range::DURATION_DEG,
+            "°",
+            "Longer: peak torque moves up the rev range, idle gets lumpier.",
+        );
+        over(
+            ui,
+            "Lift",
+            &mut c.lift_mm,
+            d.lift_mm,
+            range::LIFT_MM,
+            " mm",
+            "Flow capacity at high revs. Both cams share one profile for now.",
+        );
+        over(
+            ui,
+            "Lobe separation",
+            &mut c.lsa_deg,
+            d.lsa_deg,
+            range::LSA_DEG,
+            "°",
+            "Angle between the intake and exhaust lobe centres. Tighter: more overlap.",
+        );
+        over(
+            ui,
+            "Intake cam advance",
+            &mut c.intake_advance_deg,
+            d.advance_deg,
+            range::ADVANCE_DEG,
+            "°",
+            "Moves the intake centreline earlier: torque slides down the rev range.",
+        );
+        ui.label(format!(
+            "Valve overlap ≈ {:.0}° at 0.050″",
+            ui_kit::overlap_deg(
+                c.duration_deg.unwrap_or(d.duration_deg),
+                c.lsa_deg.unwrap_or(d.lsa_deg),
+                c.intake_advance_deg.unwrap_or(d.advance_deg),
+            )
+        ))
+        .on_hover_text("Duration minus the centre spacing. Negative: the valves never overlap.");
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Valve sizes (fraction of bore)");
+            reset_button(
+                ui,
+                "Reset valves",
+                &mut tuning.valves,
+                "Back to the sizes the head derives",
+            );
+        });
+        let v = &mut tuning.valves;
+        over(
+            ui,
+            "Intake valve / bore",
+            &mut v.intake_to_bore,
+            d.intake_to_bore,
+            range::INTAKE_TO_BORE,
+            "",
+            "Head diameter of the intake valves; follows the bore.",
+        );
+        over(
+            ui,
+            "Exhaust valve / bore",
+            &mut v.exhaust_to_bore,
+            d.exhaust_to_bore,
+            range::EXHAUST_TO_BORE,
+            "",
+            "Head diameter of the exhaust valves; follows the bore. Whether they fit is not checked.",
+        );
     });
     section(ui, "Bottom end", |ui| {
         choice(
@@ -1440,6 +1560,15 @@ fn engine_parts(ui: &mut egui::Ui, b: &mut EngineBuild, multibank: bool) {
             ],
         );
         slider(ui, "Compression ratio", &mut b.compression, 7.0..=14.0);
+        over(
+            ui,
+            "Rod / stroke",
+            &mut tuning.bottom.rod_to_stroke,
+            d.rod_to_stroke,
+            range::ROD_TO_STROKE,
+            "",
+            "Longer rods: less side load and a slower piston at top dead centre.",
+        );
     });
     section(ui, "Aspiration", |ui| {
         choice(
@@ -1464,6 +1593,15 @@ fn engine_parts(ui: &mut egui::Ui, b: &mut EngineBuild, multibank: bool) {
                     (BlowOff::None, "None (flutter)"),
                 ],
             );
+            over(
+                ui,
+                "Turbo size",
+                &mut tuning.turbo.size,
+                d.turbo_size,
+                range::TURBO_SIZE,
+                " ×",
+                "Small: spools early and runs out of breath. Large: lag, then more top end. Scales the compressor and the rotor inertia.",
+            );
         }
     });
     section(ui, "Fuel and intake", |ui| {
@@ -1485,6 +1623,33 @@ fn engine_parts(ui: &mut egui::Ui, b: &mut EngineBuild, multibank: bool) {
                 (Throttle::Single, "Single body"),
                 (Throttle::Individual, "Individual throttle bodies"),
             ],
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Intake overrides");
+            reset_button(
+                ui,
+                "Reset intake",
+                &mut tuning.intake,
+                "Back to the sizes the throttle type derives",
+            );
+        });
+        over(
+            ui,
+            "Throttle diameter",
+            &mut tuning.intake.throttle_mm,
+            d.throttle_mm,
+            range::THROTTLE_MM,
+            " mm",
+            "Equivalent single throttle: restricts the top end when small.",
+        );
+        over(
+            ui,
+            "Plenum / displacement",
+            &mut tuning.intake.plenum_ratio,
+            d.plenum_ratio,
+            range::PLENUM_RATIO,
+            " ×",
+            "Plenum volume as a multiple of the engine's displacement.",
         );
     });
     section(ui, "Exhaust", |ui| {
@@ -1532,6 +1697,7 @@ fn engine_parts(ui: &mut egui::Ui, b: &mut EngineBuild, multibank: bool) {
                 (Muffler::ReverseFlow, "Reverse-flow"),
             ],
         );
+        exhaust_geometry_controls(ui, sound, b.muffler != Muffler::None);
     });
 }
 fn firing_text(design: &EngineDesign) -> String {
@@ -1582,7 +1748,13 @@ fn engine_design(ui: &mut egui::Ui, design: &mut EngineDesign, text: &mut String
     slider(ui, "Bank angle (°)", &mut design.bank_angle, 0.0..=180.0);
     ui.horizontal(|ui| {
         ui.label("Firing order");
-        if ui.text_edit_singleline(text).changed() {
+        if ui
+            .text_edit_singleline(text)
+            .on_hover_text(
+                "Spark wiring is separate from cam timing. Missing or mistimed sparks can misfire.",
+            )
+            .changed()
+        {
             let numbers: Vec<u8> = text
                 .split(|c: char| !c.is_ascii_digit())
                 .filter_map(|n| n.parse().ok())
@@ -1606,9 +1778,7 @@ fn engine_design(ui: &mut egui::Ui, design: &mut EngineDesign, text: &mut String
             ),
         );
     }
-    ui.small("Spark wiring is separate from cam timing. Missing or mistimed sparks can misfire.");
     section(ui, "Crankpins and banks", |ui| {
-        ui.small("Pin angle on the crank (0–360°). Bank-2 pistons reach top dead centre one bank angle later.");
         egui::Grid::new("cylinders").num_columns(4).show(ui, |ui| {
             for i in 0..design.cylinders as usize {
                 ui.label(format!("Cylinder {}", i + 1));
@@ -1657,16 +1827,16 @@ fn engine_design(ui: &mut egui::Ui, design: &mut EngineDesign, text: &mut String
         })
         .collect();
     ui.small(format!(
-        "Fires at: {}",
+        "Fires at: {} · intervals {}°",
         events
             .iter()
             .map(|(a, c)| format!("{}@{a:.0}°", c + 1))
             .collect::<Vec<_>>()
-            .join("  ")
+            .join("  "),
+        gaps.join(" / ")
     ));
-    ui.small(format!("Intervals: {}°", gaps.join(" / ")));
 }
-fn percent_slider(ui: &mut egui::Ui, label: &str, value: &mut f32) {
+fn percent_slider(ui: &mut egui::Ui, label: &str, value: &mut f32) -> egui::Response {
     let mut percent = *value * 100.;
     let mut response = ui.add(
         egui::Slider::new(&mut percent, 0.0..=100.0)
@@ -1675,12 +1845,88 @@ fn percent_slider(ui: &mut egui::Ui, label: &str, value: &mut f32) {
     );
     wheel_adjust(ui, &mut response, &mut percent, 0., 100.);
     *value = percent / 100.;
+    response
 }
+const WHEEL_HELP: &str = "Mouse wheel: fixed steps (1, 0.1 or 0.01) · Shift + wheel: 10× finer";
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    slider_help(ui, label, v, range, "");
+}
+/// A slider whose unit, written in the label as "Bass (dB)", shows as a suffix.
+/// `help` (what it does) leads its tooltip, followed by the wheel hint.
+fn slider_help(
+    ui: &mut egui::Ui,
+    label: &str,
+    v: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    help: &str,
+) {
     let (min, max) = (*range.start(), *range.end());
-    let mut response = ui.add(egui::Slider::new(v, range).text(label));
+    let (text, suffix) = ui_kit::split_unit(label);
+    let mut response = ui.add(egui::Slider::new(v, range).text(text).suffix(suffix));
     wheel_adjust(ui, &mut response, v, min, max);
-    response.on_hover_text("Mouse wheel: fixed steps (1, 0.1 or 0.01) · Shift + wheel: 10× finer");
+    response.on_hover_text(if help.is_empty() {
+        WHEEL_HELP.to_owned()
+    } else {
+        format!("{help}\n{WHEEL_HELP}")
+    });
+}
+/// A slider for a geometry control that shapes the sound but not the torque.
+fn sound_only_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    v: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    help: &str,
+) {
+    ui.horizontal_wrapped(|ui| {
+        slider_help(ui, label, v, range, help);
+        ui_kit::sound_only_tag(ui);
+    });
+}
+/// One listening-position selector for every source. `active` is false while
+/// the choice is not the one in force (imported vehicles, live mix); true when
+/// a click returned `true` means the caller should make it so.
+fn camera_row(ui: &mut egui::Ui, camera: &mut BeamNgCamera, active: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Listening position:");
+        for (option, label) in [
+            (BeamNgCamera::Cockpit, "Cabin"),
+            (BeamNgCamera::Hood, "Engine bay"),
+            (BeamNgCamera::Tailpipe, "Tailpipe"),
+            (BeamNgCamera::Orbit, "Outside"),
+        ] {
+            if ui
+                .selectable_label(active && *camera == option, label)
+                .on_hover_text(option.description())
+                .clicked()
+            {
+                *camera = option;
+                clicked = true;
+            }
+        }
+    });
+    clicked
+}
+/// Exhaust, intake and mechanical layer levels and the two layer gains.
+fn layer_mix_controls(ui: &mut egui::Ui, params: &mut Parameters, settings: &mut Settings) {
+    slider(ui, "Exhaust level", &mut params.exhaust, 0.0..=1.0);
+    slider(ui, "Intake level", &mut params.intake, 0.0..=1.0);
+    slider(ui, "Mechanical level", &mut params.mechanical, 0.0..=1.0);
+    slider_help(
+        ui,
+        "Engine layer gain",
+        &mut settings.engine_gain,
+        0.0..=2.0,
+        "Level of the engine layer against the exhaust in the mix.",
+    );
+    slider_help(
+        ui,
+        "Idle gain",
+        &mut settings.idle_gain,
+        0.0..=2.0,
+        "Level of the idle sound. Also sets the idle level of the BeamNG export.",
+    );
 }
 fn adjacent_level_points(
     report: &beamng_level::Report,
@@ -2071,7 +2317,7 @@ impl eframe::App for App {
             .min_width(380.)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Sound settings");
+                    ui.heading("Engine and sound");
                     ui.separator();
                     ui.heading("01 / Source vehicle");
                     if ui
@@ -2127,22 +2373,20 @@ impl eframe::App for App {
                             ));
                         }
                     }
-                    ui.separator();
-                    ui.heading("02 / Physical engine sound");
-                    if self.scratch.is_some() {
-                        ui.small("Use the engine parts and sound controls above.");
-                    } else if let Some(model) = &self.automation_model {
+                    if self.scratch.is_none() && let Some(model) = &self.automation_model {
+                        ui.separator();
+                        ui.heading("02 / Physical engine sound");
                         match model {
                             Ok(model) => {
                                 ui.small("Automation engine data configures our physical engine. Original recordings remain available as A.");
                                 ui.label("Model assumptions:");
                                 for assumption in &model.assumptions { ui.small(assumption); }
-                                slider(ui, "Exhaust level", &mut self.params.exhaust, 0.0..=1.0);
-                                slider(ui, "Intake level", &mut self.params.intake, 0.0..=1.0);
-                                slider(ui, "Mechanical level", &mut self.params.mechanical, 0.0..=1.0);
-                                slider(ui, "Engine layer gain", &mut self.settings.engine_gain, 0.0..=2.0);
-                                slider(ui, "Idle gain", &mut self.settings.idle_gain, 0.0..=2.0);
-                                sound_tuning_controls(ui, &mut self.settings.physical_sound, model.scratch.build.muffler != bess::engine_build::Muffler::None);
+                                layer_mix_controls(ui, &mut self.params, &mut self.settings);
+                                section(ui, "Combustion and exhaust geometry", |ui| {
+                                    combustion_controls(ui, &mut self.settings.physical_sound);
+                                    exhaust_geometry_controls(ui, &mut self.settings.physical_sound, model.scratch.build.muffler != bess::engine_build::Muffler::None);
+                                });
+                                sound_tuning_controls(ui, &mut self.settings.physical_sound);
                             }
                             Err(error) => { ui.colored_label(Color32::YELLOW, format!("Source A is available. Physical resynthesis unavailable: {error}")); }
                         }
@@ -2200,13 +2444,10 @@ impl eframe::App for App {
                 ui.add(egui::ProgressBar::new(((peak_db+60.)/60.).clamp(0.,1.)).text(format!("Peak {peak_db:.0} dBFS")));
                 spectrum_plot(ui,&self.readout.spectrum);
             }
+            // Scratch engines export WAV only: the BeamNG block needs an imported vehicle.
+            if self.scratch.is_none() {
             ui.separator();ui.heading("Export BeamNG");
-            if self.scratch.is_some() {
-                ui.colored_label(Color32::YELLOW, "Scratch engines export WAV only for now. BeamNG export needs an imported Automation vehicle.");
-            }
-            ui.small("Adds a BESS configuration to the original Automation vehicle. Keep the original mod enabled.");
-            ui.small("BeamNG receives the same physical engine used for B listening.");
-            ui.small("The original vehicle game afterfire, turbo and startup sounds are preserved.");
+            ui.small("Adds a BESS configuration to the original Automation vehicle (keep the original mod enabled). It receives the same physical engine as B listening; the vehicle's own afterfire, turbo and startup sounds are preserved.");
             ui.horizontal(|ui| {
                 ui.label("Sound profile name");
                 ui.text_edit_singleline(&mut self.profile_name);
@@ -2214,13 +2455,7 @@ impl eframe::App for App {
             ui.small("Named profiles appear as separate BESS configurations for the same vehicle.");
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong("BeamNG volume estimate");
-                ui.small("Compare the WAV levels BESS will export with the original Automation samples. Listening volume does not change these files.");
-                slider(
-                    ui,
-                    "Idle gain",
-                    &mut self.settings.idle_gain,
-                    0.0..=2.0,
-                );
+                ui.small("Compare the WAV levels BESS will export with the original Automation samples. Listening volume does not change these files. Idle gain is set with the layer mix.");
                 if ui
                     .add_enabled(
                         self.bank.is_some()
@@ -2271,6 +2506,7 @@ impl eframe::App for App {
                 let (tx,rx)=mpsc::channel();self.worker=Some(rx);self.status="Creating and verifying BeamNG configuration…".into();
                 std::thread::spawn(move||{let folder=dir.join(format!("BESS-BeamNG-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()));
                     let _=tx.send(bess::variant::package_named(&folder,p,h,bank,&profile));});
+            }
             }
             ui.separator();ui.heading("Listening exports");
             slider(ui,"WAV duration (seconds)",&mut self.seconds,1.0..=60.0);
@@ -2785,26 +3021,101 @@ mod wheel_tests {
     }
 }
 
-fn sound_tuning_controls(
-    ui: &mut egui::Ui,
-    sound: &mut bess::scratch::SoundTuning,
-    has_muffler: bool,
-) {
+/// Cylinder-pressure controls: they change torque as well as sound.
+fn combustion_controls(ui: &mut egui::Ui, sound: &mut SoundTuning) {
+    slider_help(
+        ui,
+        "Cycle variation (×)",
+        &mut sound.cycle_variation,
+        0.0..=2.0,
+        "Cycle-to-cycle irregularity of the combustion.",
+    );
+    slider_help(
+        ui,
+        "Combustion duration (×)",
+        &mut sound.combustion_duration,
+        0.5..=1.5,
+        "Changes cylinder pressure and torque.",
+    );
+    slider_help(
+        ui,
+        "Ignition retard (degrees)",
+        &mut sound.ignition_retard_deg,
+        -20.0..=20.0,
+        "Changes cylinder pressure and torque; negative retard advances ignition.",
+    );
+    let neutral = SoundTuning::default();
+    let set = (
+        sound.cycle_variation,
+        sound.combustion_duration,
+        sound.ignition_retard_deg,
+    ) != (
+        neutral.cycle_variation,
+        neutral.combustion_duration,
+        neutral.ignition_retard_deg,
+    );
+    if ui
+        .add_enabled(set, egui::Button::new("Reset combustion").small())
+        .clicked()
+    {
+        sound.cycle_variation = neutral.cycle_variation;
+        sound.combustion_duration = neutral.combustion_duration;
+        sound.ignition_retard_deg = neutral.ignition_retard_deg;
+    }
+}
+
+/// Exhaust lengths and muffler: sound only, because pressure waves do not
+/// feed back on the valves in this model (X-021).
+fn exhaust_geometry_controls(ui: &mut egui::Ui, sound: &mut SoundTuning, has_muffler: bool) {
+    sound_only_slider(
+        ui,
+        "Header length (× part)",
+        &mut sound.primary_length_scale,
+        0.5..=2.0,
+        "Scales the primary length of the fitted headers. Shifts the exhaust resonances.",
+    );
+    sound_only_slider(
+        ui,
+        "Tailpipe length (m)",
+        &mut sound.tail_length_m,
+        0.2..=5.0,
+        "Shifts the exhaust resonances.",
+    );
+    ui.add_enabled_ui(has_muffler, |ui| {
+        sound_only_slider(
+            ui,
+            "Muffler volume (× part)",
+            &mut sound.muffler_volume_scale,
+            0.25..=3.0,
+            "Needs a fitted muffler.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            percent_slider(ui, "Muffler absorption", &mut sound.muffler_absorption)
+                .on_hover_text("Needs a fitted muffler.");
+            ui_kit::sound_only_tag(ui);
+        });
+    });
+}
+
+fn sound_tuning_controls(ui: &mut egui::Ui, sound: &mut SoundTuning) {
     section(ui, "Sound shaping", |ui| {
-        ui.small("Saved with this engine. Part changes keep these adjustments.");
-        ui.small("Shapes exhaust and intake. Mechanical sound has its own controls below.");
+        ui.small("Saved with this engine. Part changes keep these adjustments.")
+            .on_hover_text(
+                "Shapes exhaust and intake. Mechanical sound has its own controls below.",
+            );
         slider(ui, "Bass (dB)", &mut sound.bass_db, -12.0..=12.0);
         slider(ui, "Presence (dB)", &mut sound.presence_db, -12.0..=12.0);
         slider(ui, "Treble (dB)", &mut sound.treble_db, -12.0..=12.0);
-        slider(
+        slider_help(
             ui,
             "Brightness cutoff (Hz)",
             &mut sound.brightness_hz,
             500.0..=20_000.0,
+            "20,000 Hz leaves the top end open.",
         );
-        ui.small("20,000 Hz leaves the top end open.");
-        percent_slider(ui, "Saturation", &mut sound.drive);
-        percent_slider(ui, "Flow texture", &mut sound.flow_texture);
+        percent_slider(ui, "Saturation", &mut sound.drive).on_hover_text("Rounds the peaks.");
+        percent_slider(ui, "Flow texture", &mut sound.flow_texture)
+            .on_hover_text("Texture that follows the engine signal.");
         slider(
             ui,
             "Brightness at high RPM (dB)",
@@ -2817,7 +3128,6 @@ fn sound_tuning_controls(
             &mut sound.load_brightness_db,
             -12.0..=12.0,
         );
-        ui.small("Saturation rounds the peaks; texture follows the engine signal.");
     });
     section(ui, "Intake and mechanical character", |ui| {
         slider(
@@ -2827,14 +3137,14 @@ fn sound_tuning_controls(
             0.0..=3.0,
         );
         ui.add_enabled_ui(sound.intake_resonance > 0., |ui| {
-            slider(
+            sound_only_slider(
                 ui,
                 "Intake resonator length (m)",
                 &mut sound.intake_length_m,
                 0.15..=1.5,
+                "Longer resonators deepen the intake note. Needs resonance above zero.",
             );
         });
-        ui.small("Longer resonators deepen the intake note. Resonance must be above zero.");
         slider(
             ui,
             "Mechanical pitch (Hz)",
@@ -2848,40 +3158,22 @@ fn sound_tuning_controls(
             0.5..=8.0,
         );
     });
-    section(ui, "Combustion character", |ui| {
-        slider(
-            ui,
-            "Cycle variation (×)",
-            &mut sound.cycle_variation,
-            0.0..=2.0,
-        );
-        slider(
-            ui,
-            "Combustion duration (×)",
-            &mut sound.combustion_duration,
-            0.5..=1.5,
-        );
-        slider(
-            ui,
-            "Ignition retard (degrees)",
-            &mut sound.ignition_retard_deg,
-            -20.0..=20.0,
-        );
-        ui.small("Variation changes cycle irregularity. Duration and ignition change cylinder pressure and torque; negative retard advances ignition.");
-    });
     section(ui, "Exhaust tone", |ui| {
-        ui.small("Only the exhaust outlet. Intake and mechanical sound keep their own character.");
+        ui.small("Only the exhaust outlet.").on_hover_text(
+            "Intake and mechanical sound keep their own character. The controls above shape exhaust and intake together.",
+        );
         slider(
             ui,
             "Exhaust bass (dB)",
             &mut sound.exhaust_bass_db,
             -12.0..=12.0,
         );
-        slider(
+        slider_help(
             ui,
             "Exhaust body (dB)",
             &mut sound.exhaust_body_db,
             -12.0..=12.0,
+            "Positive adds a resonant note; negative reduces drone.",
         );
         ui.add_enabled_ui(sound.exhaust_body_db != 0., |ui| {
             slider(
@@ -2890,62 +3182,54 @@ fn sound_tuning_controls(
                 &mut sound.exhaust_body_hz,
                 40.0..=2000.0,
             );
-            slider(ui, "Body focus (Q)", &mut sound.exhaust_body_q, 0.5..=8.0);
+            slider_help(
+                ui,
+                "Body focus (Q)",
+                &mut sound.exhaust_body_q,
+                0.5..=8.0,
+                "Higher Q targets a narrower band.",
+            );
         });
-        ui.small("Positive body adds a resonant note; negative body reduces drone. Higher Q targets a narrower band.");
         slider(
             ui,
             "Exhaust rasp (dB)",
             &mut sound.exhaust_rasp_db,
             -12.0..=12.0,
         );
-        slider(
+        slider_help(
             ui,
             "Exhaust low cut (Hz)",
             &mut sound.exhaust_low_cut_hz,
             20.0..=300.0,
+            "20 Hz bypasses the filter. Removes rumble.",
         );
-        slider(
+        slider_help(
             ui,
             "Exhaust high cut (Hz)",
             &mut sound.exhaust_high_cut_hz,
             500.0..=20000.0,
+            "20,000 Hz bypasses the filter. Softens the edge.",
         );
-        ui.small("20 Hz / 20,000 Hz bypass these filters. Low cut removes rumble; high cut softens the edge.");
         percent_slider(ui, "Exhaust saturation", &mut sound.exhaust_drive);
         if ui.button("Reset exhaust tone").clicked() {
             sound.reset_exhaust_tone();
         }
     });
-    section(ui, "Exhaust tuning", |ui| {
-        slider(
-            ui,
-            "Header length (× part)",
-            &mut sound.primary_length_scale,
-            0.5..=2.0,
-        );
-        slider(
-            ui,
-            "Tailpipe length (m)",
-            &mut sound.tail_length_m,
-            0.2..=5.0,
-        );
-        ui.add_enabled_ui(has_muffler, |ui| {
-            slider(
-                ui,
-                "Muffler volume (× part)",
-                &mut sound.muffler_volume_scale,
-                0.25..=3.0,
-            );
-            percent_slider(ui, "Muffler absorption", &mut sound.muffler_absorption);
-        });
-        ui.small("Muffler controls require a fitted muffler. Length changes shift the exhaust resonances.");
-    });
     if ui
         .button("Reset sound shaping")
-        .on_hover_text("Reset all sound adjustments; keep engine parts and layer levels.")
+        .on_hover_text("Reset the sound adjustments above; keep engine parts, combustion, exhaust geometry and layer levels.")
         .clicked()
     {
-        *sound = Default::default();
+        let kept = *sound;
+        *sound = SoundTuning {
+            cycle_variation: kept.cycle_variation,
+            combustion_duration: kept.combustion_duration,
+            ignition_retard_deg: kept.ignition_retard_deg,
+            primary_length_scale: kept.primary_length_scale,
+            tail_length_m: kept.tail_length_m,
+            muffler_volume_scale: kept.muffler_volume_scale,
+            muffler_absorption: kept.muffler_absorption,
+            ..Default::default()
+        };
     }
 }
