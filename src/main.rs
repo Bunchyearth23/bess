@@ -539,40 +539,10 @@ impl App {
             let _ = tx.send(ScratchModel::build(&scratch, rate));
         });
     }
-    fn scratch_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(scratch) = &mut self.scratch else {
-            return;
-        };
-        self.dyno.poll(scratch, &mut self.driving.peak_torque_nm);
-        let perf = scratch.build.performance(scratch.design.cylinders);
+    /// Dyno curve under the spectrum, always visible while tuning.
+    fn dyno_view(&mut self, ui: &mut egui::Ui) {
         let mut pin = false;
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.strong(format!(
-                "{:.2} L {} · {:.1} × {:.1} mm",
-                perf.displacement_l,
-                layout_name(&scratch.design),
-                scratch.build.bore_mm,
-                scratch.build.stroke_mm
-            ));
-            if let Some(curve) = &self.dyno.curve {
-                let ((torque, torque_rpm), (power, power_rpm)) =
-                    (curve.peak_torque, curve.peak_power);
-                ui.label(format!(
-                    "{torque:.0} Nm @ {torque_rpm:.0} · {power:.0} kW ({:.0} hp) @ {power_rpm:.0} rpm",
-                    power * 1.341
-                ))
-                .on_hover_text("Wide-open throttle, speed held: cylinder gas torque minus friction. Its peak also sizes the clutch.");
-            } else {
-                ui.label(format!(
-                    "≈ {:.0} Nm · {:.0} kW ({:.0} hp) · idle {:.0} / redline {:.0} rpm",
-                    perf.peak_torque_nm,
-                    perf.peak_power_kw,
-                    perf.peak_power_kw * 1.341,
-                    perf.idle_rpm,
-                    perf.redline_rpm
-                ));
-                ui.small("Builder estimate until the dyno sweep of the physical engine is ready.");
-            }
             if self.dyno.busy() {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -608,7 +578,9 @@ impl App {
                     };
                     pin = ui
                         .small_button(label)
-                        .on_hover_text("Keep this curve dashed while you tune, instead of the previous one.")
+                        .on_hover_text(
+                            "Keep this curve dashed while you tune, instead of the previous one.",
+                        )
                         .clicked();
                 });
             }
@@ -619,6 +591,41 @@ impl App {
                 None => self.dyno.curve.clone(),
             };
         }
+    }
+    fn scratch_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(scratch) = &mut self.scratch else {
+            return;
+        };
+        self.dyno.poll(scratch, &mut self.driving.peak_torque_nm);
+        let perf = scratch.build.performance(scratch.design.cylinders);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong(format!(
+                "{:.2} L {} · {:.1} × {:.1} mm",
+                perf.displacement_l,
+                layout_name(&scratch.design),
+                scratch.build.bore_mm,
+                scratch.build.stroke_mm
+            ));
+            if let Some(curve) = &self.dyno.curve {
+                let ((torque, torque_rpm), (power, power_rpm)) =
+                    (curve.peak_torque, curve.peak_power);
+                ui.label(format!(
+                    "{torque:.0} Nm @ {torque_rpm:.0} · {power:.0} kW ({:.0} hp) @ {power_rpm:.0} rpm",
+                    power * 1.341
+                ))
+                .on_hover_text("Wide-open throttle, speed held: cylinder gas torque minus friction. Its peak also sizes the clutch.");
+            } else {
+                ui.label(format!(
+                    "≈ {:.0} Nm · {:.0} kW ({:.0} hp) · idle {:.0} / redline {:.0} rpm",
+                    perf.peak_torque_nm,
+                    perf.peak_power_kw,
+                    perf.peak_power_kw * 1.341,
+                    perf.idle_rpm,
+                    perf.redline_rpm
+                ));
+                ui.small("Builder estimate until the dyno sweep of the physical engine is ready.");
+            }
+        });
         let before = (scratch.design, scratch.build);
         section(ui, "Block", |ui| {
             engine_design(ui, &mut scratch.design, &mut self.firing_text);
@@ -2457,6 +2464,9 @@ impl eframe::App for App {
                 let peak_db=self.readout.peak_db;
                 ui.add(egui::ProgressBar::new(((peak_db+60.)/60.).clamp(0.,1.)).text(format!("Peak {peak_db:.0} dBFS")));
                 spectrum_plot(ui,&self.readout.spectrum);
+            }
+            if self.scratch.is_some() {
+                self.dyno_view(ui);
             }
             // Scratch engines export WAV only: the BeamNG block needs an imported vehicle.
             if self.scratch.is_none() {
