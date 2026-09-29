@@ -19,6 +19,10 @@ impl std::error::Error for CrankError {}
 /// Estimated Chen-Flynn FMEP coefficients, not a measured friction map.
 /// FMEP = a + b * peak cylinder pressure + c * mean piston speed + d * speed².
 /// Total four-stroke friction torque is FMEP * total displacement / (4π).
+/// Sized to the middle of the published scatter band for modern 4-valve SI
+/// engines (≈0.8 bar at 2000 rpm, ≈2.0 bar at 6000 rpm for an 86 mm stroke;
+/// Sandoval & Heywood SAE 2003-01-0725, FEV friction scatter band). The former
+/// 400 Pa/(m/s)² speed² term gave 3.0 bar at 20 m/s, double those references.
 #[derive(Debug, Clone, Copy)]
 pub struct FrictionModel {
     pub a_pa: f64,
@@ -31,8 +35,8 @@ impl Default for FrictionModel {
         Self {
             a_pa: 30_000.,
             b: 0.005,
-            c_pa_per_m_s: 5000.,
-            d_pa_per_m2_s2: 400.,
+            c_pa_per_m_s: 6000.,
+            d_pa_per_m2_s2: 200.,
         }
     }
 }

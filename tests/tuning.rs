@@ -47,7 +47,9 @@ fn resolve_without_overrides_is_the_part_formulas_bit_for_bit() {
                                 * (v / 0.002).powf(2.0 / 3.0)
                                 * if individual { 1.35 } else { 1.0 },
                             v * if individual { 0.35 } else { 1.25 },
-                            v * 0.005,
+                            // X-024 re-matched the compressor (0.005 choked at half the
+                            // engine air demand); the other formulas stay pinned.
+                            v * 0.008,
                             if aspiration == Aspiration::TwinTurbo {
                                 1.2e-5
                             } else {
