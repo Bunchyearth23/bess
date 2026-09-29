@@ -237,6 +237,24 @@ impl HarmonicCam {
         {
             return 0.0;
         }
+        // Cheap conservative reject of the closed part of the cycle, before
+        // three fmod calls: this unwrapped estimate is within a few ulp of
+        // |angle| of the exact wrap below, far inside `margin`, and the window
+        // keeps clear of the ±2π wrap, so it only returns where that would.
+        let margin = 1e-9 * (1.0 + crank_angle_rad.abs() + self.center_rad.abs());
+        let half = self.duration_rad * 0.5;
+        if half < TAU - 2.0 * margin {
+            let offset = crank_angle_rad - self.center_rad;
+            let mut estimate = offset - (offset * (0.5 / TAU)) as i64 as f64 * (2.0 * TAU);
+            if estimate > TAU {
+                estimate -= 2.0 * TAU;
+            } else if estimate < -TAU {
+                estimate += 2.0 * TAU;
+            }
+            if estimate.abs() >= half + margin {
+                return 0.0;
+            }
+        }
         let delta = (crank_angle_rad.rem_euclid(2.0 * TAU) - self.center_rad.rem_euclid(2.0 * TAU)
             + TAU)
             .rem_euclid(2.0 * TAU)
@@ -438,6 +456,38 @@ mod tests {
         close(cam.lift_m(0.1 + TAU), 0.0);
         close(cam.lift_m(1.0), cam.lift_m(-0.8));
         assert!(cam.lift_m(2.05) == 0.0);
+    }
+
+    #[test]
+    fn fast_rejects_match_the_exact_arithmetic() {
+        // Pre-X-014 arithmetic, kept as the bit-exact reference.
+        let wrap = |cam: HarmonicCam, angle: f64| {
+            let delta = (angle.rem_euclid(2.0 * TAU) - cam.center_rad.rem_euclid(2.0 * TAU) + TAU)
+                .rem_euclid(2.0 * TAU)
+                - TAU;
+            if delta.abs() >= cam.duration_rad * 0.5 {
+                return 0.0;
+            }
+            let harmonic = 0.5 + 0.5 * (TAU * delta / cam.duration_rad).cos();
+            (cam.peak_lift_m * harmonic.powf(cam.shape_exponent) - cam.lash_m).max(0.0)
+        };
+        for (center, duration) in [(-1.9, 4.4), (4.3, 4.4), (-40.0, 0.3), (1.0, 12.4)] {
+            let cam = HarmonicCam {
+                center_rad: center,
+                duration_rad: duration,
+                peak_lift_m: 0.01,
+                shape_exponent: 1.5,
+                lash_m: 0.0002,
+            };
+            for base in [0.0, 1e3, -1e3, 1e6, 3e8] {
+                for i in 0..20_000 {
+                    let edge = center + 0.5 * duration + (i % 7) as f64 * 1e-12;
+                    for angle in [base + i as f64 * 7e-3, base + edge, base - edge] {
+                        assert_eq!(cam.lift_m(angle).to_bits(), wrap(cam, angle).to_bits());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
