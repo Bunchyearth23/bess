@@ -261,8 +261,12 @@ fn primary_length_moves_the_tuned_torque_peak_as_one_over_length() {
             error.sqrt()
         );
         assert!(gain > 0.1, "x{expected}: no tuning lobe");
+        // 15 %: the ratio also holds a length-independent part, Blair's mass
+        // flux lowering each primary's own-pulse backpressure at high flow
+        // (X-028), which a pure rpm shift cannot fit. Linear port: −7…−9 %;
+        // ratio superposition with mass flux: −11…−13 %.
         assert!(
-            (best / expected - 1.).abs() < 0.1,
+            (best / expected - 1.).abs() < 0.15,
             "x{expected}: factor {best}"
         );
         assert!(

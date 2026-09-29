@@ -12,7 +12,7 @@ use super::{
     config::CylinderConfig,
     gas::{DischargeCurve, HarmonicCam, Valve},
     thermo::{self, EnergyInput, EnergyLedger, GasState, Mixture, SliderCrank, ThermoError, Wiebe},
-    wave_junction::WavePort,
+    wave_junction::{WavePort, orifice_slope},
 };
 use std::f64::consts::{PI, TAU};
 
@@ -156,6 +156,8 @@ pub struct CycleCylinder {
     heat_coefficient: f64,
     coefficient_clock: u32,
     exhaust_port: Option<WavePort>,
+    /// Previous joint-solve inflow (kg/s), the next solve's starting point.
+    port_inflow: f64,
 }
 
 impl CycleCylinder {
@@ -224,6 +226,7 @@ impl CycleCylinder {
             heat_coefficient: 100.,
             coefficient_clock: 0,
             exhaust_port: None,
+            port_inflow: 0.,
         })
     }
 
@@ -259,6 +262,7 @@ impl CycleCylinder {
         self.wall_temperature = self.config.wall_temperature_k;
         self.heat_coefficient = 100.;
         self.coefficient_clock = 0;
+        self.port_inflow = 0.;
     }
 
     fn uniform(&mut self) -> f64 {
@@ -389,14 +393,39 @@ impl CycleCylinder {
         let exhaust_requested = match exhaust_port {
             None => self.port_flow(gas, input.exhaust, exhaust_mixture, exhaust_lift, false),
             // A seated valve cannot see the wave; skip the joint solve.
-            Some(_) if exhaust_lift == 0. => 0.,
+            Some(_) if exhaust_lift == 0. => {
+                self.port_inflow = 0.;
+                0.
+            }
             Some(port) => {
-                let at = |pressure_pa| Reservoir {
-                    pressure_pa,
-                    ..input.exhaust
+                let port = WavePort {
+                    guess_inflow_kg_s: self.port_inflow,
+                    ..port
                 };
-                port.solve(|p| self.port_flow(gas, at(p), exhaust_mixture, exhaust_lift, false))
-                    .0
+                // `port_flow` with its per-step invariants hoisted out of the
+                // solve: the same orifice, states and donor properties.
+                let orifice = self
+                    .exhaust_valve
+                    .orifice(exhaust_lift, self.discharge_curve);
+                let (cylinder_pa, cylinder_k) = (gas.pressure_pa(), gas.temperature_k());
+                let reservoir_k = input.exhaust.temperature_k;
+                let backflow = exhaust_mixture().properties(reservoir_k);
+                let outflow = gas.mixture().properties(cylinder_k);
+                let inflow = port
+                    .solve(cylinder_pa, |p| {
+                        let upstream = if p > cylinder_pa { backflow } else { outflow };
+                        let flow = orifice.mass_flow_from_states(
+                            p,
+                            reservoir_k,
+                            cylinder_pa,
+                            cylinder_k,
+                            upstream,
+                        );
+                        (flow, orifice_slope(flow, p, cylinder_pa, upstream.gamma))
+                    })
+                    .0;
+                self.port_inflow = inflow;
+                inflow
             }
         } * input.dt_s;
         let intake_in = intake_requested.max(0.).min(input.intake_mass_limit_kg);

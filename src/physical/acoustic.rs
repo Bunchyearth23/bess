@@ -1,5 +1,8 @@
 //! Cylinder mass-flow boundaries and separate primaries joined to two exhausts.
 //! Linear acoustic perturbations ride on the 0D mean state. This is not 1D CFD.
+//! Coupled (`begin`/`port`/`finish`, X-017/X-028): the valve port superposes
+//! waves as pressure-amplitude ratios (`wave_junction`) and the pipes use the
+//! collector gas's own γ and R.
 use crate::{
     acoustics::{ExhaustLayout, ExhaustNetwork, Geometry},
     engine_build::{Catalyst, Crossover, EngineBuild, Headers, Muffler},
@@ -46,6 +49,11 @@ pub struct Acoustic {
     arrivals: [f64; 12],
     returns: [f64; 12],
     tail_incoming: [f32; 2],
+    coupled: bool,
+    bank_mean_pa: [f64; 2],
+    /// (γ, R) of each bank's gas, coupled path only; the legacy path keeps
+    /// its air constants 1.33 / 287.
+    gas: [(f64, f64); 2],
 }
 
 impl Acoustic {
@@ -157,6 +165,9 @@ impl Acoustic {
             arrivals: [0.; 12],
             returns: [0.; 12],
             tail_incoming: [0.; 2],
+            coupled: false,
+            bank_mean_pa: [f64::NAN; 2],
+            gas: [(1.33, 287.); 2],
         }
     }
 
@@ -207,6 +218,11 @@ impl Acoustic {
         self.finish(flow_kg_s, reaction_w)
     }
 
+    /// Coupled path: (γ, R) of each bank's collector gas for the next `begin`.
+    pub fn set_gas(&mut self, gas: [(f64, f64); 2]) {
+        self.gas = gas;
+    }
+
     /// Read every wave arriving this sample, before the valve flows are known.
     /// `mean_flow` None convects on the previous sample's flow (the coupled
     /// path, where this sample's flow is solved against these arrivals).
@@ -217,6 +233,21 @@ impl Acoustic {
         mean_flow: Option<&[f64; 12]>,
     ) {
         self.tick += 1;
+        self.coupled = mean_flow.is_none();
+        let gas = if self.coupled {
+            // Reference pressure of the port's amplitude ratio: the 0D bank
+            // pressure below the 12 Hz flow high-pass corner.
+            for (mean, p) in self.bank_mean_pa.iter_mut().zip(pressures_pa) {
+                *mean = if mean.is_nan() {
+                    p
+                } else {
+                    self.pole * *mean + (1. - self.pole) * p
+                };
+            }
+            self.gas
+        } else {
+            [(1.33, 287.); 2]
+        };
         for primary in &mut self.primaries {
             primary.length_m += self.length_slew * (primary.target_length_m - primary.length_m);
         }
@@ -234,13 +265,14 @@ impl Acoustic {
                 );
             }
             for primary in &mut self.primaries {
-                let speed = (1.33 * 287. * self.temperatures[primary.bank]).sqrt();
+                let (gamma, r) = gas[primary.bank];
+                let speed = (gamma * r * self.temperatures[primary.bank]).sqrt();
                 primary.loss = 0.001_f64.powf((primary.length_m / speed) / 0.12);
             }
         }
-        self.speeds = self.temperatures.map(|t| (1.33 * 287. * t).sqrt());
+        self.speeds = std::array::from_fn(|b| (gas[b].0 * gas[b].1 * self.temperatures[b]).sqrt());
         self.densities = std::array::from_fn::<_, 2, _>(|b| {
-            pressures_pa[b].max(10000.) / (287. * self.temperatures[b])
+            pressures_pa[b].max(10000.) / (gas[b].1 * self.temperatures[b])
         });
         // Read every port before scattering. Reading the tail's previous
         // sample here and advancing it again at launch adds a spurious delay.
@@ -278,9 +310,10 @@ impl Acoustic {
         let p = &self.primaries[cylinder];
         let z = self.speeds[p.bank] / p.area_m2;
         WavePort {
-            pressure_at_zero_flow_pa: mean_pa
-                + 2. * self.returns[cylinder]
-                + z * (self.pole * p.ac_flow - p.previous_flow),
+            mean_pa,
+            wave_pa: 2. * self.returns[cylinder] + z * (self.pole * p.ac_flow - p.previous_flow),
+            reference_pa: self.bank_mean_pa[p.bank],
+            gamma: self.gas[p.bank].0,
             impedance: z,
             guess_inflow_kg_s: -p.previous_flow,
         }
@@ -301,7 +334,12 @@ impl Acoustic {
             weighted[b] = tail_y[b] * f64::from(tail_incoming[b]);
             // Volume source from chemical heat release: Qdot*(gamma-1)/(rho*c²).
             // Junction admittances convert this volume velocity to pressure.
-            weighted[b] += reaction_w[b] * 0.33 / (rho * c * c) * 0.5;
+            let gamma_less_one = if self.coupled {
+                self.gas[b].0 - 1.
+            } else {
+                0.33
+            };
+            weighted[b] += reaction_w[b] * gamma_less_one / (rho * c * c) * 0.5;
         }
         for (i, p) in self.primaries.iter().enumerate() {
             let b = p.bank;
@@ -329,6 +367,15 @@ impl Acoustic {
                 lines[b].write((junction[b] - cross_arrivals[b]) as f32);
             }
         }
+        // Coupled: launch w⁺ = σ − w⁻ with σ from the same port relation the
+        // valve was solved against, at this sample's mean outflow.
+        let launch: [f64; 12] = std::array::from_fn(|i| {
+            if self.coupled && i < self.primaries.len() {
+                self.port(i, 0.).wave_sum(-flow_kg_s[i]) - returns[i]
+            } else {
+                0.
+            }
+        });
         for (i, p) in self.primaries.iter_mut().enumerate() {
             let c = speeds[p.bank];
             // Remove the slowly varying mean already represented by 0D mass.
@@ -338,8 +385,12 @@ impl Acoustic {
             // Prescribed volume flow Q = (p+ - p-)/Z: p+ = Z*Q + p-.
             // At zero perturbation flow this is a rigid, lossless termination;
             // multiplying the return by an arbitrary gain removes low modes.
-            p.forward
-                .write((excitation + returns[i]).clamp(-200000., 200000.) as f32);
+            let outgoing = if self.coupled {
+                launch[i]
+            } else {
+                excitation + returns[i]
+            };
+            p.forward.write(outgoing.clamp(-200000., 200000.) as f32);
             p.backward
                 .write((junction[p.bank] - arrivals[i]).clamp(-200000., 200000.) as f32);
         }
@@ -353,7 +404,7 @@ impl Acoustic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scratch::PRESETS;
+    use crate::{physical::wave_junction::orifice_slope, scratch::PRESETS};
 
     #[test]
     fn retune_preserves_running_state_and_slews_primary_lengths() {
@@ -605,17 +656,21 @@ mod tests {
                 108e3
             };
             let inflow = |p: f64| orifice.mass_flow_from_states(p, 673., cylinder, 900., gas);
+            let sloped = |p: f64| {
+                let f = inflow(p);
+                (f, orifice_slope(f, p, cylinder, 1.33))
+            };
             for (i, f) in flow.iter_mut().enumerate().take(8) {
                 let port = network.port(i, mean);
                 *f = if implicit {
-                    -port.solve(inflow).0
+                    -port.solve(cylinder, sloped).0
                 } else {
                     let flow = -inflow(mean + delayed[i]);
                     delayed[i] = network.valve_pressure(i);
                     flow
                 };
                 if sample == n / 8 {
-                    let p = port.pressure_at_zero_flow_pa + port.impedance * *f;
+                    let p = port.port_pressure(-*f);
                     slope = slope.max(port.impedance * (inflow(p + 1.) - inflow(p - 1.)) / 2.);
                 }
             }
