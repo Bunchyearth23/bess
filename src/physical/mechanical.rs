@@ -170,9 +170,10 @@ impl Knock {
             decay: (-1. / (step_rate * 0.0015)).exp(),
             // Modes past 0.4 fs of the output are not rendered (no aliasing).
             omega_limit: TAU * 0.4 * rate,
-            // No fuel octane in the build: RON 95, lowered so the user can
-            // provoke knock at high load / advanced spark.
-            octane: 95. - 25. * intensity,
+            // No fuel octane in the build: RON 95 down to RON 85 at full
+            // intensity (Q-002), so knock control stays in authority over
+            // most of the range and saturates only near the top.
+            octane: 95. - 10. * intensity,
             intensity,
         }
     }

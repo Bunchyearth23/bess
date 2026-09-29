@@ -666,7 +666,7 @@ impl App {
                 &mut scratch.experimental.knock,
             )
             .on_hover_text(
-                "Off by default: lowers effective octane; rings at high load or advanced spark.",
+                "Off by default: fuel from RON 95 (0 %) to RON 85 (100 %); rings at high load or advanced spark, and the ECU retards the knocking cylinder.",
             );
             slider(
                 ui,

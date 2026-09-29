@@ -235,9 +235,9 @@ Integrated continuation (2026-09-28): physical scratch is active, with conservat
 | X-002 | open | P1 | Audio stability depends on device and buffer size | Extended real-device test |
 | X-003 | open | P2 | The modeled linear crossfade of adjacent R7 Cerberus BeamNG WAVs dips about 2.50 dB on load near 5,200 rpm; BeamNG's actual blend law is unverified | Slow in-game sweep around 5,200 rpm; adjust blending if distracting |
 | Q-001 | answered | P1 | `bunchyearth23_thunderhawk_zero` ZIP received and inspected | See `reports/vehicle-check.txt`; JBeam commas are sometimes omitted |
-| Q-002 | open | P3 | Knock slider maps ON = 95 − 25·knock; above ≈0.1 it saturates the 12° control authority. Keep, remap (e.g. RON 95→85) or calibrate `DELAY_CALIBRATION` from a measured map? | User decision |
-| Q-003 | open | P3 | The "Export BeamNG" block is now hidden in scratch mode (it was always disabled there). Keep hidden? | User decision; default applied: hidden |
-| Q-004 | open | P3 | "Reset sound shaping" now keeps the moved combustion/exhaust-geometry fields ("Reset combustion" is separate). Should it reset them too? | User decision; default applied: keeps them |
+| Q-002 | answered | P3 | Knock slider range | 2026-09-29 user: reduce the range. Now RON 95 (0) → RON 85 (1). Alone it does not make knock sporadic: even RON 95 saturates the 12° authority at 3000 rpm WOT because of the end-gas temperature bias (X-026); re-check after X-026 |
+| Q-003 | answered | P3 | "Export BeamNG" block in scratch mode | 2026-09-29 user: keep it hidden until scratch BeamNG export exists |
+| Q-004 | answered | P3 | Scope of "Reset sound shaping" | 2026-09-29 user: keep resets per section; combustion/geometry have their own reset |
 | X-007 | mitigated | P2 | Parameter smoothing and A/B fade tested in the hybrid chain | Extended listening still needed |
 | X-004 | open | P1 | Thunderhawk stops at 4,989 rpm; 0.5 corpus limits vary from 3,557 to 7,487. JBeam damage threshold is not a rev limiter | Respect each bank's range; extend only with source evidence |
 | X-005 | open | P1 | Declared cylinders/layout recovered from twelve `.car` files, but firing order, bank phasing, headers and active parts remain unknown; header acoustics are aggregated | Reliable engine data and in-game test; see 0.8.2 report |
