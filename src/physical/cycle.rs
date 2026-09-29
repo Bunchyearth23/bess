@@ -10,7 +10,7 @@
 pub use super::cylinder::Reservoir;
 use super::{
     config::CylinderConfig,
-    gas::{DischargeCurve, HarmonicCam, Valve},
+    gas::{DischargeCurve, HarmonicCam, Valve, floor_fast, rem_euclid_near},
     thermo::{self, EnergyInput, EnergyLedger, GasState, Mixture, SliderCrank, ThermoError, Wiebe},
     wave_junction::WavePort,
 };
@@ -455,9 +455,9 @@ impl CycleCylinder {
         let outflow_h = gas.mixture().enthalpy(temperature0);
         let injected_enthalpy = injected_fuel * Mixture::FUEL.enthalpy(input.intake.temperature_k);
 
-        let spark_reference = SPARK_REFERENCE + input.spark_shift_rad.rem_euclid(CYCLE);
-        let before_event = ((local0 - spark_reference) / CYCLE).floor();
-        let after_event = ((local1 - spark_reference) / CYCLE).floor();
+        let spark_reference = SPARK_REFERENCE + rem_euclid_near(input.spark_shift_rad, CYCLE);
+        let before_event = floor_fast((local0 - spark_reference) / CYCLE);
+        let after_event = floor_fast((local1 - spark_reference) / CYCLE);
         let mut misfired = false;
         if after_event > before_event {
             self.burn = None;

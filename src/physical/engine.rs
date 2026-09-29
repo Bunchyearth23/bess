@@ -961,7 +961,8 @@ fn mechanical_events(
     )
 }
 fn crossed(from: f64, to: f64, event: f64) -> bool {
-    ((from - event) / (2. * TAU)).floor() < ((to - event) / (2. * TAU)).floor()
+    use super::gas::floor_fast;
+    floor_fast((from - event) / (2. * TAU)) < floor_fast((to - event) / (2. * TAU))
 }
 
 #[cfg(test)]

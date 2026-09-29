@@ -223,6 +223,32 @@ pub fn transfer(a: &mut GasVolume, b: &mut GasVolume, orifice: Orifice, dt_s: f6
     }
 }
 
+/// `x.rem_euclid(period)` for period > 0, without the fmod call when
+/// -period < x < 2 period: there `x % period` is exactly x or x - period
+/// (Sterbenz), the value fmod returns. Bit-identical for every input.
+pub(crate) fn rem_euclid_near(x: f64, period: f64) -> f64 {
+    if (0.0..period).contains(&x) {
+        x
+    } else if (period..2.0 * period).contains(&x) {
+        x - period
+    } else if -period < x && x < 0.0 {
+        x + period
+    } else {
+        x.rem_euclid(period)
+    }
+}
+
+/// `x.floor()` by integer truncation, exact for |x| < 2^52 (no libm call on
+/// baseline x86-64). Signed zeros and non-finite values go to `floor`.
+pub(crate) fn floor_fast(x: f64) -> f64 {
+    if x.abs() < 4e15 && x != 0.0 {
+        let t = x as i64 as f64;
+        if t > x { t - 1.0 } else { t }
+    } else {
+        x.floor()
+    }
+}
+
 /// All angles are crank radians; a four-stroke cam repeats every 4π radians.
 #[derive(Clone, Copy, Debug)]
 pub struct HarmonicCam {
@@ -263,10 +289,11 @@ impl HarmonicCam {
                 return 0.0;
             }
         }
-        let delta = (crank_angle_rad.rem_euclid(2.0 * TAU) - self.center_rad.rem_euclid(2.0 * TAU)
-            + TAU)
-            .rem_euclid(2.0 * TAU)
-            - TAU;
+        let delta = rem_euclid_near(
+            crank_angle_rad.rem_euclid(2.0 * TAU) - rem_euclid_near(self.center_rad, 2.0 * TAU)
+                + TAU,
+            2.0 * TAU,
+        ) - TAU;
         if delta.abs() >= self.duration_rad * 0.5 {
             return 0.0;
         }
@@ -495,6 +522,34 @@ mod tests {
                     }
                 }
             }
+        }
+        let mut values = vec![
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            -f64::INFINITY,
+            1e300,
+            -1e300,
+        ];
+        for k in -40..=40 {
+            let x = k as f64 * 0.5 * TAU;
+            values.extend([x, x.next_up(), x.next_down(), x + 1e-3, x - 1e-3]);
+        }
+        values.extend((0..100_000).map(|i| (i as f64 * 0.37).sin() * 10f64.powi(i % 17 - 4)));
+        for x in values {
+            let period = 2.0 * TAU;
+            assert_eq!(
+                rem_euclid_near(x, period).to_bits(),
+                x.rem_euclid(period).to_bits(),
+                "{x}"
+            );
+            assert_eq!(floor_fast(x).to_bits(), x.floor().to_bits(), "{x}");
+            assert_eq!(
+                floor_fast(x / period).to_bits(),
+                (x / period).floor().to_bits(),
+                "{x}"
+            );
         }
         for g in (0..=990).map(|i| 1.01 + i as f64 * 1e-3) {
             let critical = (2.0 / (g + 1.0)).powf(g / (g - 1.0));
