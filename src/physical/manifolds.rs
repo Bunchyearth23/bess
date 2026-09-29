@@ -309,9 +309,10 @@ fn state(volume: f64, p: f64, t: f64, mixture: Mixture) -> Result<GasState, Ther
     GasState::at_pressure(volume, p, t, mixture)
 }
 fn reservoir(gas: GasState) -> Reservoir {
+    let (temperature_k, pressure_pa) = gas.temperature_pressure();
     Reservoir {
-        pressure_pa: gas.pressure_pa(),
-        temperature_k: gas.temperature_k(),
+        pressure_pa,
+        temperature_k,
     }
 }
 /// Mass removable at old-state enthalpy before the 200 K floor, with a factor

@@ -313,7 +313,17 @@ impl GasState {
     }
 
     pub fn pressure_pa(self) -> f64 {
-        self.mass_kg * self.mixture.gas_constant() * self.temperature_k() / self.volume_m3
+        self.pressure_at(self.temperature_k())
+    }
+
+    /// `(temperature_k(), pressure_pa())` sharing one energy inversion.
+    pub fn temperature_pressure(self) -> (f64, f64) {
+        let temperature = self.temperature_k();
+        (temperature, self.pressure_at(temperature))
+    }
+
+    fn pressure_at(self, temperature_k: f64) -> f64 {
+        self.mass_kg * self.mixture.gas_constant() * temperature_k / self.volume_m3
     }
 
     /// Conservative first-law step using trapezoidal p dV and old-state outflow
@@ -345,8 +355,7 @@ impl GasState {
         if !(MIN_MASS_KG..=10.0).contains(&new_mass) {
             return Err(ThermoError::InvalidInput);
         }
-        let old_temperature = self.temperature_k();
-        let old_pressure = self.pressure_pa();
+        let (old_temperature, old_pressure) = self.temperature_pressure();
         let delta_volume = new_volume_m3 - self.volume_m3;
         let enthalpy_out = mass_out * self.mixture.enthalpy(old_temperature);
         let mixture = input.mixture.unwrap_or(self.mixture);

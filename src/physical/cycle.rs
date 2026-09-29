@@ -280,9 +280,11 @@ impl CycleCylinder {
         cam.lift_m(local_angle)
     }
 
+    /// `(temperature, pressure)` is `gas.temperature_pressure()`.
     fn port_flow(
         &self,
         gas: GasState,
+        (temperature, pressure): (f64, f64),
         reservoir: Reservoir,
         reservoir_mixture: impl Fn() -> Mixture,
         lift: f64,
@@ -298,7 +300,6 @@ impl CycleCylinder {
         if lift == 0. || valve.count == 0 {
             return 0.;
         }
-        let (pressure, temperature) = (gas.pressure_pa(), gas.temperature_k());
         let upstream = if reservoir.pressure_pa > pressure {
             reservoir_mixture().properties(reservoir.temperature_k)
         } else {
@@ -381,13 +382,22 @@ impl CycleCylinder {
         }
         let mut gas = self.gas.expect("initialized above");
         let mass0 = gas.mass_kg();
-        let temperature0 = gas.temperature_k();
+        let (temperature0, pressure0) = gas.temperature_pressure();
+        let state0 = (temperature0, pressure0);
         let intake_lift = self.valve_lift(local0, true, input.intake_phase_rad);
         let exhaust_lift = self.valve_lift(local0, false, 0.);
         let intake_requested =
-            self.port_flow(gas, input.intake, intake_mixture, intake_lift, true) * input.dt_s;
+            self.port_flow(gas, state0, input.intake, intake_mixture, intake_lift, true)
+                * input.dt_s;
         let exhaust_requested = match exhaust_port {
-            None => self.port_flow(gas, input.exhaust, exhaust_mixture, exhaust_lift, false),
+            None => self.port_flow(
+                gas,
+                state0,
+                input.exhaust,
+                exhaust_mixture,
+                exhaust_lift,
+                false,
+            ),
             // A seated valve cannot see the wave; skip the joint solve.
             Some(_) if exhaust_lift == 0. => 0.,
             Some(port) => {
@@ -395,8 +405,10 @@ impl CycleCylinder {
                     pressure_pa,
                     ..input.exhaust
                 };
-                port.solve(|p| self.port_flow(gas, at(p), exhaust_mixture, exhaust_lift, false))
-                    .0
+                port.solve(|p| {
+                    self.port_flow(gas, state0, at(p), exhaust_mixture, exhaust_lift, false)
+                })
+                .0
             }
         } * input.dt_s;
         let intake_in = intake_requested.max(0.).min(input.intake_mass_limit_kg);
@@ -532,7 +544,7 @@ impl CycleCylinder {
         if self.coefficient_clock == 0 {
             self.heat_coefficient = hohenberg_w_m2_k(
                 gas.volume_m3(),
-                gas.pressure_pa(),
+                pressure0,
                 temperature0,
                 2. * self.config.stroke_m * input.rpm / 60.,
             );
@@ -576,10 +588,11 @@ impl CycleCylinder {
         self.gas = Some(gas);
         self.previous_angle = input.angle_rad;
         let exhaust_mass = exhaust_out - exhaust_in;
+        let (temperature_k, pressure_pa) = gas.temperature_pressure();
         let output = CycleOutput {
-            pressure_pa: gas.pressure_pa(),
-            temperature_k: gas.temperature_k(),
-            gas_torque_nm: (gas.pressure_pa() - 101325.) * volume_derivative,
+            pressure_pa,
+            temperature_k,
+            gas_torque_nm: (pressure_pa - 101325.) * volume_derivative,
             intake_mass_kg: intake_in - intake_out,
             intake_enthalpy_j: intake_in * intake_h - intake_out * outflow_h,
             intake_fresh_air_kg: intake_fresh,
