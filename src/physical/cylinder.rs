@@ -8,8 +8,8 @@
 
 use super::{
     config::CylinderConfig,
-    gas::{DischargeCurve, GasProperties, HarmonicCam, Valve},
-    thermo::{self, EnergyInput, EnergyLedger, GasState, SliderCrank, Wiebe},
+    gas::{DischargeCurve, HarmonicCam, Valve},
+    thermo::{self, EnergyInput, EnergyLedger, GasState, Mixture, SliderCrank, Wiebe},
 };
 use crate::engine_build::EngineBuild;
 use std::f64::consts::{PI, TAU};
@@ -130,10 +130,15 @@ impl CylinderPrototype {
         // Start at compression BDC with an intake-equilibrated charge. The first
         // cycle is a startup transient, so compare converged cycles separately.
         let angle = -PI;
-        let mass = options.intake.pressure_pa * geometry.volume(angle)
-            / (thermo::GAS_CONSTANT * options.intake.temperature_k);
-        let gas = GasState::new(mass, options.intake.temperature_k, geometry.volume(angle))
-            .map_err(|e| format!("Invalid initial charge: {e:?}"))?;
+        // This prototype burns heat into air only (see module note).
+        let gas = GasState::at_pressure(
+            geometry.volume(angle),
+            options.intake.pressure_pa,
+            options.intake.temperature_k,
+            Mixture::AIR,
+        )
+        .map_err(|e| format!("Invalid initial charge: {e:?}"))?;
+        let mass = gas.mass_kg();
         let ca50 = 8_f64.to_radians();
         Ok(Self {
             config,
@@ -189,10 +194,7 @@ impl CylinderPrototype {
             reservoir.temperature_k,
             self.gas.pressure_pa(),
             self.gas.temperature_k(),
-            GasProperties {
-                gas_constant_j_kg_k: thermo::GAS_CONSTANT,
-                gamma: thermo::gamma(upstream_t),
-            },
+            Mixture::AIR.properties(upstream_t),
         )
     }
 
@@ -211,10 +213,10 @@ impl CylinderPrototype {
         let mass_in = (intake.max(0.0) + exhaust_in.max(0.0)) * dt_s;
         let mass_out = ((-intake).max(0.0) + (-exhaust_in).max(0.0)) * dt_s;
         let enthalpy_in =
-            intake.max(0.0) * dt_s * thermo::specific_enthalpy(self.options.intake.temperature_k)
+            intake.max(0.0) * dt_s * Mixture::AIR.enthalpy(self.options.intake.temperature_k)
                 + exhaust_in.max(0.0)
                     * dt_s
-                    * thermo::specific_enthalpy(self.options.exhaust.temperature_k);
+                    * Mixture::AIR.enthalpy(self.options.exhaust.temperature_k);
         if self.angle >= self.burn.start_rad() + BURN_DURATION {
             self.burn_ca50 += CYCLE;
             self.burn = Self::burn(self.burn_ca50);
@@ -242,6 +244,7 @@ impl CylinderPrototype {
             mass_in_kg: mass_in,
             enthalpy_in_j: enthalpy_in,
             mass_out_kg: mass_out,
+            mixture: None,
         };
         let ledger = self.gas.step(self.geometry.volume(next_angle), input)?;
         // If the donor cap activates, apportion actual outflow to both ports.

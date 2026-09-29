@@ -1,15 +1,17 @@
 //! Externally driven four-stroke cylinder. No oscillator or synthetic pulses:
 //! sound excitation is the actual exhaust-port gas flux. Composition is an
-//! air/fuel/product tracer model with identical thermodynamic properties, not
-//! chemical kinetics. Reservoir composition is supplied by the coupled network;
+//! air/fuel/product tracer model, not chemical kinetics; each constituent has
+//! its own heat capacity and gas constant (`thermo::Mixture`), so the charge,
+//! the burned gas and every port flux carry their own properties and enthalpy.
+//! Reservoir composition is supplied by the coupled network;
 //! recirculation cannot replenish oxygen or add fuel merely by crossing a port.
 //! Fuel and fresh air leave in the well-mixed donor fraction.
 
 pub use super::cylinder::Reservoir;
 use super::{
     config::CylinderConfig,
-    gas::{DischargeCurve, GasProperties, HarmonicCam, Valve},
-    thermo::{self, EnergyInput, EnergyLedger, GasState, SliderCrank, ThermoError, Wiebe},
+    gas::{DischargeCurve, HarmonicCam, Valve},
+    thermo::{self, EnergyInput, EnergyLedger, GasState, Mixture, SliderCrank, ThermoError, Wiebe},
     wave_junction::WavePort,
 };
 use std::f64::consts::{PI, TAU};
@@ -278,7 +280,14 @@ impl CycleCylinder {
         cam.lift_m(local_angle)
     }
 
-    fn port_flow(&self, gas: GasState, reservoir: Reservoir, lift: f64, intake: bool) -> f64 {
+    fn port_flow(
+        &self,
+        gas: GasState,
+        reservoir: Reservoir,
+        reservoir_mixture: impl Fn() -> Mixture,
+        lift: f64,
+        intake: bool,
+    ) -> f64 {
         let valve = if intake {
             self.intake_valve
         } else {
@@ -289,22 +298,20 @@ impl CycleCylinder {
         if lift == 0. || valve.count == 0 {
             return 0.;
         }
-        let temperature = if reservoir.pressure_pa > gas.pressure_pa() {
-            reservoir.temperature_k
+        let (pressure, temperature) = (gas.pressure_pa(), gas.temperature_k());
+        let upstream = if reservoir.pressure_pa > pressure {
+            reservoir_mixture().properties(reservoir.temperature_k)
         } else {
-            gas.temperature_k()
+            gas.mixture().properties(temperature)
         };
         valve
             .orifice(lift, self.discharge_curve)
             .mass_flow_from_states(
                 reservoir.pressure_pa,
                 reservoir.temperature_k,
-                gas.pressure_pa(),
-                gas.temperature_k(),
-                GasProperties {
-                    gas_constant_j_kg_k: thermo::GAS_CONSTANT,
-                    gamma: thermo::gamma(temperature),
-                },
+                pressure,
+                temperature,
+                upstream,
             )
     }
 
@@ -351,11 +358,24 @@ impl CycleCylinder {
         }
         let local0 = previous - self.phase_rad;
         let local1 = input.angle_rad - self.phase_rad;
+        // Built only where a port flows (most substeps have both valves shut).
+        let intake_mixture =
+            || Mixture::from_fractions(input.intake_fresh_air_fraction, input.intake_fuel_fraction);
+        let exhaust_mixture = || {
+            Mixture::from_fractions(
+                input.exhaust_fresh_air_fraction,
+                input.exhaust_fuel_fraction,
+            )
+        };
         if self.gas.is_none() {
-            let volume = self.geometry.volume(local0);
-            let mass = input.intake.pressure_pa * volume
-                / (thermo::GAS_CONSTANT * input.intake.temperature_k);
-            self.gas = Some(GasState::new(mass, input.intake.temperature_k, volume)?);
+            let gas = GasState::at_pressure(
+                self.geometry.volume(local0),
+                input.intake.pressure_pa,
+                input.intake.temperature_k,
+                intake_mixture(),
+            )?;
+            let mass = gas.mass_kg();
+            self.gas = Some(gas);
             self.fresh_air_mass = mass * input.intake_fresh_air_fraction;
             self.fuel_mass = mass * input.intake_fuel_fraction;
         }
@@ -364,9 +384,10 @@ impl CycleCylinder {
         let temperature0 = gas.temperature_k();
         let intake_lift = self.valve_lift(local0, true, input.intake_phase_rad);
         let exhaust_lift = self.valve_lift(local0, false, 0.);
-        let intake_requested = self.port_flow(gas, input.intake, intake_lift, true) * input.dt_s;
+        let intake_requested =
+            self.port_flow(gas, input.intake, intake_mixture, intake_lift, true) * input.dt_s;
         let exhaust_requested = match exhaust_port {
-            None => self.port_flow(gas, input.exhaust, exhaust_lift, false),
+            None => self.port_flow(gas, input.exhaust, exhaust_mixture, exhaust_lift, false),
             // A seated valve cannot see the wave; skip the joint solve.
             Some(_) if exhaust_lift == 0. => 0.,
             Some(port) => {
@@ -374,7 +395,7 @@ impl CycleCylinder {
                     pressure_pa,
                     ..input.exhaust
                 };
-                port.solve(|p| self.port_flow(gas, at(p), exhaust_lift, false))
+                port.solve(|p| self.port_flow(gas, at(p), exhaust_mixture, exhaust_lift, false))
                     .0
             }
         } * input.dt_s;
@@ -400,8 +421,8 @@ impl CycleCylinder {
         let exhaust_fuel = exhaust_out * fuel_fraction - exhaust_in * input.exhaust_fuel_fraction;
         self.fuel_mass = (self.fuel_mass + intake_fuel - exhaust_fuel).max(0.);
         self.fresh_air_mass = (self.fresh_air_mass + intake_fresh - exhaust_fresh).max(0.);
-        // Fuel is real added mass; it uses the same gas thermal properties and
-        // enters at intake temperature. No liquid film/evaporation model yet.
+        // Fuel is real added mass: gasoline vapour entering at intake
+        // temperature. No liquid film/evaporation model yet.
         // Meter only unconsumed air; previously injected fuel carried by a
         // reverse-flow pocket is not dosed again on reaspiration.
         let injected_fuel = intake_in
@@ -409,8 +430,18 @@ impl CycleCylinder {
                 - input.intake_fuel_fraction)
                 .max(0.);
         self.fuel_mass += injected_fuel;
-        let injected_enthalpy =
-            injected_fuel * thermo::specific_enthalpy(input.intake.temperature_k);
+        let intake_h = if intake_in > 0. {
+            intake_mixture().enthalpy(input.intake.temperature_k)
+        } else {
+            0.
+        };
+        let exhaust_h = if exhaust_in > 0. {
+            exhaust_mixture().enthalpy(input.exhaust.temperature_k)
+        } else {
+            0.
+        };
+        let outflow_h = gas.mixture().enthalpy(temperature0);
+        let injected_enthalpy = injected_fuel * Mixture::FUEL.enthalpy(input.intake.temperature_k);
 
         let spark_reference = SPARK_REFERENCE + input.spark_shift_rad.rem_euclid(CYCLE);
         let before_event = ((local0 - spark_reference) / CYCLE).floor();
@@ -515,16 +546,21 @@ impl CycleCylinder {
             input.dt_s,
         );
         let (volume, volume_derivative) = self.geometry.volume_and_derivative(local1);
+        let mass_in = intake_in + exhaust_in + injected_fuel;
+        // Outflow leaves the fractions unchanged; inflow and burning move them.
+        let mixture = (mass_in > 0. || fuel_burned > 0.).then(|| {
+            let inverse = 1. / (mass0 + mass_in - out);
+            Mixture::from_fractions(self.fresh_air_mass * inverse, self.fuel_mass * inverse)
+        });
         let ledger = gas.step(
             volume,
             EnergyInput {
                 heat_j: fuel_burned * LHV,
                 wall_heat_j: wall_heat,
-                mass_in_kg: intake_in + exhaust_in + injected_fuel,
-                enthalpy_in_j: (intake_in + injected_fuel)
-                    * thermo::specific_enthalpy(input.intake.temperature_k)
-                    + exhaust_in * thermo::specific_enthalpy(input.exhaust.temperature_k),
+                mass_in_kg: mass_in,
+                enthalpy_in_j: intake_in * intake_h + injected_enthalpy + exhaust_in * exhaust_h,
                 mass_out_kg: out,
+                mixture,
             },
         )?;
         // Lumped metal heat capacity and coolant conductance are explicit
@@ -545,13 +581,11 @@ impl CycleCylinder {
             temperature_k: gas.temperature_k(),
             gas_torque_nm: (gas.pressure_pa() - 101325.) * volume_derivative,
             intake_mass_kg: intake_in - intake_out,
-            intake_enthalpy_j: intake_in * thermo::specific_enthalpy(input.intake.temperature_k)
-                - intake_out * thermo::specific_enthalpy(temperature0),
+            intake_enthalpy_j: intake_in * intake_h - intake_out * outflow_h,
             intake_fresh_air_kg: intake_fresh,
             intake_fuel_kg: intake_fuel,
             exhaust_mass_kg: exhaust_mass,
-            exhaust_enthalpy_j: exhaust_out * thermo::specific_enthalpy(temperature0)
-                - exhaust_in * thermo::specific_enthalpy(input.exhaust.temperature_k),
+            exhaust_enthalpy_j: exhaust_out * outflow_h - exhaust_in * exhaust_h,
             exhaust_fresh_air_kg: exhaust_fresh,
             exhaust_fuel_kg: exhaust_fuel,
             exhaust_mass_flow_kg_s: exhaust_mass / input.dt_s,

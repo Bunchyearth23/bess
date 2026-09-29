@@ -7,11 +7,14 @@
 //! what gives a 0D model inertial ram and Helmholtz tuning (Engelman 1953;
 //! Heywood, *Internal Combustion Engine Fundamentals*, §7.6); the column's
 //! kinetic energy is not a separate ledger term, as for the compressor duct.
-//! Exhaust has up to two separate collectors.
+//! Exhaust has up to two separate collectors. Every volume's gas properties
+//! follow its tracked air/fuel/product composition (`thermo::Mixture`); each
+//! port carries the donor's enthalpy, and compositions are refreshed after
+//! the step at constant energy (fixed volumes: no p dV work to reconcile).
 use super::{
     cylinder::Reservoir,
-    gas::{GasProperties, Orifice},
-    thermo::{self, EnergyInput, EnergyLedger, GasState, ThermoError},
+    gas::Orifice,
+    thermo::{EnergyInput, EnergyLedger, GasState, MIN_TEMPERATURE_K, Mixture, ThermoError},
 };
 use crate::engine_build::{Catalyst, EngineBuild, Muffler, ResolvedTuning};
 use std::f64::consts::PI;
@@ -118,16 +121,12 @@ impl AfterTreatment {
         };
         let rate = gas_ignition / 0.006 + catalyst_ignition / 0.03;
         let burn = fuel.min(oxygen / 3.5) * (1.0 - (-dt * rate).exp());
-        let burn = burn
-            .min(0.02 * gas_mass_kg * thermo::specific_internal_energy(gas_temperature_k) / 43e6);
-        let heating_room = gas_mass_kg
-            * (thermo::specific_internal_energy(3500.0)
-                - thermo::specific_internal_energy(gas_temperature_k))
-            .max(0.0);
-        let cooling_room = gas_mass_kg
-            * (thermo::specific_internal_energy(gas_temperature_k)
-                - thermo::specific_internal_energy(200.0))
-            .max(0.0);
+        // Guard budgets only (collector gas is mostly products); the gas
+        // step itself uses the collector's tracked composition.
+        let u = |t| Mixture::PRODUCTS.internal_energy(t);
+        let burn = burn.min(0.02 * gas_mass_kg * u(gas_temperature_k) / 43e6);
+        let heating_room = gas_mass_kg * (u(3500.0) - u(gas_temperature_k)).max(0.0);
+        let cooling_room = gas_mass_kg * (u(gas_temperature_k) - u(200.0)).max(0.0);
         let burn = burn.min(heating_room * 0.5 / (0.8 * 43e6));
         let chemical_heat = burn * 43e6;
         let washout = (tailpipe_out_kg / gas_mass_kg).clamp(0.0, 1.0);
@@ -207,11 +206,17 @@ pub struct Composition {
     pub fresh_air_fraction: f64,
     pub fuel_fraction: f64,
 }
+impl Composition {
+    pub fn mixture(self) -> Mixture {
+        Mixture::from_fractions(self.fresh_air_fraction, self.fuel_fraction)
+    }
+}
 impl Species {
     pub fn composition(self, mass: f64) -> Composition {
+        let inverse = 1.0 / mass;
         Composition {
-            fresh_air_fraction: (self.fresh_air_kg / mass).clamp(0.0, 1.0),
-            fuel_fraction: (self.fuel_kg / mass).clamp(0.0, 1.0),
+            fresh_air_fraction: (self.fresh_air_kg * inverse).clamp(0.0, 1.0),
+            fuel_fraction: (self.fuel_kg * inverse).clamp(0.0, 1.0),
         }
     }
     pub(super) fn transport(
@@ -300,8 +305,8 @@ pub struct Manifolds {
     supply_composition: Composition,
 }
 
-fn state(volume: f64, p: f64, t: f64) -> Result<GasState, ThermoError> {
-    GasState::new(p * volume / (thermo::GAS_CONSTANT * t), t, volume)
+fn state(volume: f64, p: f64, t: f64, mixture: Mixture) -> Result<GasState, ThermoError> {
+    GasState::at_pressure(volume, p, t, mixture)
 }
 fn reservoir(gas: GasState) -> Reservoir {
     Reservoir {
@@ -312,18 +317,24 @@ fn reservoir(gas: GasState) -> Reservoir {
 /// Mass removable at old-state enthalpy before the 200 K floor, with a factor
 /// two margin. This budget is shared across every connection to the donor.
 fn removable(gas: GasState) -> f64 {
-    let floor_u = thermo::specific_internal_energy(thermo::MIN_TEMPERATURE_K);
-    let h = thermo::specific_enthalpy(gas.temperature_k());
+    let floor_u = gas.mixture().internal_energy(MIN_TEMPERATURE_K);
+    let h = gas.mixture().enthalpy(gas.temperature_k());
     ((gas.internal_energy_j() - gas.mass_kg() * floor_u) / (h - floor_u))
         .max(0.0)
         .min(gas.mass_kg() * 0.9)
         * 0.5
 }
-fn rate(from: Reservoir, to: Reservoir, area: f64, cd: f64) -> f64 {
-    let t = if from.pressure_pa >= to.pressure_pa {
-        from.temperature_k
+/// Orifice flow `from` → `to`; the upstream side supplies the gas properties.
+fn rate(
+    (from, from_mixture): (Reservoir, Mixture),
+    (to, to_mixture): (Reservoir, Mixture),
+    area: f64,
+    cd: f64,
+) -> f64 {
+    let upstream = if from.pressure_pa >= to.pressure_pa {
+        from_mixture.properties(from.temperature_k)
     } else {
-        to.temperature_k
+        to_mixture.properties(to.temperature_k)
     };
     Orifice {
         area_m2: area,
@@ -334,10 +345,7 @@ fn rate(from: Reservoir, to: Reservoir, area: f64, cd: f64) -> f64 {
         from.temperature_k,
         to.pressure_pa,
         to.temperature_k,
-        GasProperties {
-            gas_constant_j_kg_k: thermo::GAS_CONSTANT,
-            gamma: thermo::gamma(t),
-        },
+        upstream,
     )
 }
 
@@ -408,12 +416,19 @@ impl Manifolds {
             tuning.runner_area_m2 * tuning.runner_length_m * 0.5,
             ATMOSPHERE.pressure_pa,
             310.0,
+            Mixture::AIR,
         )
         .map_err(|e| format!("{e:?}"))?;
-        let intake =
-            state(intake_volume, ATMOSPHERE.pressure_pa, 310.0).map_err(|e| format!("{e:?}"))?;
-        let exhaust =
-            state(collector_volume, ATMOSPHERE.pressure_pa, 650.0).map_err(|e| format!("{e:?}"))?;
+        let intake = state(intake_volume, ATMOSPHERE.pressure_pa, 310.0, Mixture::AIR)
+            .map_err(|e| format!("{e:?}"))?;
+        // Collector and tailpipe start full of products (no tracer species).
+        let exhaust = state(
+            collector_volume,
+            ATMOSPHERE.pressure_pa,
+            650.0,
+            Mixture::PRODUCTS,
+        )
+        .map_err(|e| format!("{e:?}"))?;
         let exhaust_area_m2 = PI * (f64::from(build.exhaust_mm) * 0.001).powi(2) / 4.0;
         // Two metres of pipe plus the estimated muffler cavity. Resident exhaust
         // products isolate the collector from instantaneous fresh-air reentry.
@@ -427,6 +442,7 @@ impl Manifolds {
             exhaust_area_m2 * 2.0 + muffler_volume,
             ATMOSPHERE.pressure_pa,
             650.0,
+            Mixture::PRODUCTS,
         )
         .map_err(|e| format!("{e:?}"))?;
         let cat_loss = match build.catalyst {
@@ -498,6 +514,20 @@ impl Manifolds {
     pub fn intake(&self) -> Reservoir {
         reservoir(self.intake)
     }
+    /// Gas properties follow the transported species (same mass and energy).
+    fn refresh_mixtures(&mut self) {
+        let mix = |gas: &mut GasState, species: Species| {
+            gas.set_mixture(species.composition(gas.mass_kg()).mixture());
+        };
+        mix(&mut self.intake, self.intake_species);
+        for i in 0..self.runner_count {
+            mix(&mut self.runners[i], self.runner_species[i]);
+        }
+        for i in 0..2 {
+            mix(&mut self.exhaust[i], self.exhaust_species[i]);
+            mix(&mut self.tailpipe[i], self.tailpipe_species[i]);
+        }
+    }
     pub fn intake_composition(&self) -> Composition {
         self.intake_species.composition(self.intake.mass_kg())
     }
@@ -568,6 +598,8 @@ impl Manifolds {
         }
         s.fuel_kg = (s.fuel_kg - fuel_kg).max(0.0);
         s.fresh_air_kg = (s.fresh_air_kg - fresh).max(0.0);
+        let mixture = self.exhaust_composition(bank).mixture();
+        self.exhaust[bank].set_mixture(mixture);
         Ok(())
     }
     pub fn set_supply_composition(&mut self, composition: Composition) -> Result<(), ThermoError> {
@@ -742,7 +774,8 @@ impl Manifolds {
         // semi-implicitly. Inertia lets flow overshoot pressure equilibrium:
         // that is the ram effect, so only mass/thermal budgets limit it.
         let plenum = self.intake();
-        let plenum_h = thermo::specific_enthalpy(plenum.temperature_k);
+        let plenum_mixture = self.intake.mixture();
+        let plenum_h = plenum_mixture.enthalpy(plenum.temperature_k);
         let plenum_composition = self.intake_composition();
         let share = (removable(self.intake) * 0.5 - flows.intake.mass_out_kg).max(0.0)
             / self.runner_count.max(1) as f64;
@@ -750,12 +783,14 @@ impl Manifolds {
         let mut plenum_species = Species::default();
         for i in 0..self.runner_count {
             let port = self.runner(i);
-            let upstream = if plenum.pressure_pa >= port.pressure_pa {
-                plenum
+            let port_mixture = self.runners[i].mixture();
+            let (upstream, upstream_mixture) = if plenum.pressure_pa >= port.pressure_pa {
+                (plenum, plenum_mixture)
             } else {
-                port
+                (port, port_mixture)
             };
-            let density = upstream.pressure_pa / (thermo::GAS_CONSTANT * upstream.temperature_k);
+            let density =
+                upstream.pressure_pa / (upstream_mixture.gas_constant() * upstream.temperature_k);
             let gain = dt * self.runner_area_m2 / self.runner_length_m;
             let old = self.runner_flow_kg_s[i];
             let loss = 0.5 * old.abs() / (2.0 * density * self.runner_area_m2.powi(2));
@@ -764,7 +799,7 @@ impl Manifolds {
                 .min(share)
                 .max(-(removable(self.runners[i]) - flows.runner[i].mass_out_kg).max(0.0));
             working.runner_flow_kg_s[i] = dm / dt;
-            let port_h = thermo::specific_enthalpy(port.temperature_k);
+            let port_h = port_mixture.enthalpy(port.temperature_k);
             let port_composition = self.runner_composition(i);
             plenum_exchange.add_signed(-dm, port_h);
             plenum_species.fresh_air_kg += (-dm).max(0.0) * port_composition.fresh_air_fraction;
@@ -795,8 +830,8 @@ impl Manifolds {
         }
         let intake_flux = if boundaries {
             rate(
-                self.supply,
-                self.intake(),
+                (self.supply, self.supply_composition.mixture()),
+                (self.intake(), plenum_mixture),
                 self.throttle_area_m2(throttle, idle_bypass),
                 0.75,
             ) * dt
@@ -810,10 +845,12 @@ impl Manifolds {
         intake_input.mass_in_kg += plenum_exchange.mass_in_kg;
         intake_input.enthalpy_in_j += plenum_exchange.enthalpy_in_j;
         intake_input.mass_out_kg += plenum_exchange.mass_out_kg;
-        intake_input.add_signed(
-            intake_flux,
-            thermo::specific_enthalpy(self.supply.temperature_k),
-        );
+        let supply_h = self
+            .supply_composition
+            .mixture()
+            .enthalpy(self.supply.temperature_k);
+        let intake_h = plenum_mixture.enthalpy(self.intake.temperature_k());
+        intake_input.add_signed(intake_flux, supply_h);
         result.intake_ledger = working.intake.step(
             self.intake.volume_m3(),
             EnergyInput {
@@ -824,10 +861,7 @@ impl Manifolds {
             },
         )?;
         result.intake_mass_flow_kg_s = intake_flux / dt;
-        result.supply_exchange.add_signed(
-            -intake_flux,
-            thermo::specific_enthalpy(self.intake.temperature_k()),
-        );
+        result.supply_exchange.add_signed(-intake_flux, intake_h);
         let old_intake_composition = self.intake_composition();
         result.supply_species = Species {
             fresh_air_kg: (-intake_flux).max(0.0) * old_intake_composition.fresh_air_fraction,
@@ -849,12 +883,10 @@ impl Manifolds {
         )?;
         if intake_flux >= 0.0 {
             result.external_mass_in_kg += intake_flux;
-            result.external_enthalpy_in_j +=
-                intake_flux * thermo::specific_enthalpy(self.supply.temperature_k);
+            result.external_enthalpy_in_j += intake_flux * supply_h;
         } else {
             result.external_mass_out_kg -= intake_flux;
-            result.external_enthalpy_out_j -=
-                intake_flux * thermo::specific_enthalpy(self.intake.temperature_k());
+            result.external_enthalpy_out_j -= intake_flux * intake_h;
         }
         let active_banks = self
             .active_bank_mask
@@ -877,7 +909,12 @@ impl Manifolds {
             } else {
                 (self.exhaust_area_m2, self.exhaust_cd, 0.9)
             };
-            let out = rate(self.exhaust_bank(i), reservoir(self.tailpipe[i]), area, cd) * dt;
+            let collector = (self.exhaust_bank(i), self.exhaust[i].mixture());
+            let tail = (reservoir(self.tailpipe[i]), self.tailpipe[i].mixture());
+            let collector_h = collector.1.enthalpy(collector.0.temperature_k);
+            let tail_h = tail.1.enthalpy(tail.0.temperature_k);
+            let ambient_h = Mixture::AIR.enthalpy(ATMOSPHERE.temperature_k);
+            let out = rate(collector, tail, area, cd) * dt;
             let cfl_mass = self.tailpipe[i].mass_kg() / TAIL_SPECIES_CELLS as f64 * 0.25;
             let bounded_out = out
                 .min(removable(self.exhaust[i]) - exchange.mass_out_kg)
@@ -885,10 +922,7 @@ impl Manifolds {
                 .clamp(-cfl_mass, cfl_mass);
             result.transport_limited_mass_kg += (out - bounded_out).abs();
             let out = bounded_out;
-            input.add_signed(
-                -out,
-                thermo::specific_enthalpy(self.tailpipe[i].temperature_k()),
-            );
+            input.add_signed(-out, tail_h);
             result.exhaust_ledger[i] = working.exhaust[i].step(
                 self.exhaust[i].volume_m3(),
                 EnergyInput {
@@ -916,8 +950,8 @@ impl Manifolds {
             )?;
             let tail_out = if boundaries {
                 rate(
-                    reservoir(self.tailpipe[i]),
-                    ATMOSPHERE,
+                    tail,
+                    (ATMOSPHERE, Mixture::AIR),
                     self.exhaust_area_m2,
                     tail_cd,
                 ) * dt
@@ -930,14 +964,8 @@ impl Manifolds {
             result.transport_limited_mass_kg += (tail_out - bounded_tail_out).abs();
             let tail_out = bounded_tail_out;
             let mut tail_input = Exchange::default();
-            tail_input.add_signed(
-                out,
-                thermo::specific_enthalpy(self.exhaust[i].temperature_k()),
-            );
-            tail_input.add_signed(
-                -tail_out,
-                thermo::specific_enthalpy(ATMOSPHERE.temperature_k),
-            );
+            tail_input.add_signed(out, collector_h);
+            tail_input.add_signed(-tail_out, ambient_h);
             result.tailpipe_ledger[i] = working.tailpipe[i].step(
                 self.tailpipe[i].volume_m3(),
                 EnergyInput {
@@ -959,16 +987,15 @@ impl Manifolds {
             result.external_tailpipe_mass_flow_kg_s[i] = tail_out / dt;
             if tail_out >= 0.0 {
                 result.external_mass_out_kg += tail_out;
-                result.external_enthalpy_out_j +=
-                    tail_out * thermo::specific_enthalpy(self.tailpipe[i].temperature_k());
+                result.external_enthalpy_out_j += tail_out * tail_h;
             } else {
                 result.external_mass_in_kg -= tail_out;
-                result.external_enthalpy_in_j -=
-                    tail_out * thermo::specific_enthalpy(ATMOSPHERE.temperature_k);
+                result.external_enthalpy_in_j -= tail_out * ambient_h;
             }
         }
         working.exhaust_heat_j = [0.0; 2];
         working.tailpipe_heat_j = [0.0; 2];
+        working.refresh_mixtures();
         *self = working;
         Ok(result)
     }
@@ -1000,7 +1027,7 @@ mod tests {
         let dormant_energy = second.tailpipe[0].internal_energy_j();
         for _ in 0..2000 {
             let mut a = Flows::default();
-            a.exhaust[0].add_signed(1e-7, thermo::specific_enthalpy(950.0));
+            a.exhaust[0].add_signed(1e-7, Mixture::from_fractions(0.2, 0.01).enthalpy(950.0));
             a.exhaust_species[0] = Species {
                 fresh_air_kg: 2e-8,
                 fuel_kg: 1e-9,
@@ -1073,7 +1100,7 @@ mod tests {
     #[test]
     fn collector_depression_reaspirates_resident_products_before_ambient_air() {
         let mut m = setup();
-        m.exhaust[0] = state(m.exhaust[0].volume_m3(), 50000.0, 650.0).unwrap();
+        m.exhaust[0] = state(m.exhaust[0].volume_m3(), 50000.0, 650.0, Mixture::PRODUCTS).unwrap();
         let s = m.step(DT, 0.0, 0.0, Flows::default()).unwrap();
         assert!(s.exhaust_mass_flow_kg_s[0] < 0.0);
         assert_eq!(s.external_tailpipe_mass_flow_kg_s[0], 0.0);
@@ -1089,7 +1116,7 @@ mod tests {
         let mut corrections = 0.0;
         for _ in 0..10000 {
             let mut f = Flows::default();
-            f.exhaust[0].add_signed(1e-7, thermo::specific_enthalpy(900.0));
+            f.exhaust[0].add_signed(1e-7, Mixture::PRODUCTS.enthalpy(900.0));
             m.set_tailpipe_heat_j([-0.001, 0.0]).unwrap();
             let s = m.step(DT, 0.0, 0.0, f).unwrap();
             assert_eq!(s.transport_limited_mass_kg, 0.0);
@@ -1125,13 +1152,13 @@ mod tests {
             let mut f = Flows::default();
             f.intake.mass_out_kg = dm;
             f.intake
-                .add_signed(dm, thermo::specific_enthalpy(m.exhaust().temperature_k));
+                .add_signed(dm, exhaust.mixture().enthalpy(m.exhaust().temperature_k));
             f.intake_species = Species {
                 fresh_air_kg: dm * exhaust.fresh_air_fraction,
                 fuel_kg: dm * exhaust.fuel_fraction,
             };
             f.exhaust[0].mass_out_kg = dm;
-            f.exhaust[0].add_signed(dm, thermo::specific_enthalpy(m.intake().temperature_k));
+            f.exhaust[0].add_signed(dm, intake.mixture().enthalpy(m.intake().temperature_k));
             f.exhaust_species[0] = Species {
                 fresh_air_kg: dm * intake.fresh_air_fraction,
                 fuel_kg: dm * intake.fuel_fraction,
@@ -1147,7 +1174,7 @@ mod tests {
     fn resident_reaction_consumes_manifold_constituents_not_total_mass() {
         let mut m = setup();
         let mut f = Flows::default();
-        f.exhaust[0].add_signed(0.0001, thermo::specific_enthalpy(3000.0));
+        f.exhaust[0].add_signed(0.0001, Mixture::from_fractions(0.9, 0.05).enthalpy(3000.0));
         f.exhaust_species[0] = Species {
             fresh_air_kg: 0.00009,
             fuel_kg: 0.000005,
@@ -1216,8 +1243,10 @@ mod tests {
             let dm = m.outgoing_budgets().exhaust_kg[0] * 0.001;
             let mut f = Flows::default();
             f.exhaust[0].mass_out_kg = dm;
-            f.intake
-                .add_signed(dm, thermo::specific_enthalpy(m.exhaust().temperature_k));
+            f.intake.add_signed(
+                dm,
+                m.exhaust[0].mixture().enthalpy(m.exhaust().temperature_k),
+            );
             let s = m.step_closed(DT, f).unwrap();
             assert!(s.intake_ledger.numerical_correction_j.abs() < 1e-9);
         }
@@ -1237,7 +1266,7 @@ mod tests {
                 let dm = m.runner_budget_kg(0) * 0.02;
                 f.runner[0].mass_out_kg = dm;
                 drawn += dm;
-                enthalpy += dm * thermo::specific_enthalpy(m.runner(0).temperature_k);
+                enthalpy += dm * m.runners[0].mixture().enthalpy(m.runner(0).temperature_k);
             }
             let s = m.step_closed(DT, f).unwrap();
             assert!(s.runner_correction_j.abs() < 1e-9);
@@ -1256,11 +1285,8 @@ mod tests {
             let mut m = setup();
             for _ in 0..48000 {
                 let p = m.intake();
-                let dm =
-                    (p.pressure_pa / (thermo::GAS_CONSTANT * p.temperature_k) * 0.002 * 1500.0
-                        / 120.0
-                        * DT)
-                        .min(m.outgoing_budgets().intake_kg);
+                let dm = (p.pressure_pa / (287.0 * p.temperature_k) * 0.002 * 1500.0 / 120.0 * DT)
+                    .min(m.outgoing_budgets().intake_kg);
                 m.step(
                     DT,
                     throttle,
@@ -1293,7 +1319,7 @@ mod tests {
             let mut m = Manifolds::new(&build, &tuning, 4, 0.002).unwrap();
             for _ in 0..20000 {
                 let mut f = Flows::default();
-                f.exhaust[0].add_signed(0.05 * DT, thermo::specific_enthalpy(800.0));
+                f.exhaust[0].add_signed(0.05 * DT, Mixture::PRODUCTS.enthalpy(800.0));
                 m.step(DT, 0.2, 0.0, f).unwrap();
             }
             m.exhaust().pressure_pa
@@ -1320,7 +1346,7 @@ mod tests {
         let before_m = m.total_mass_kg();
         let before_e = m.total_internal_energy_j();
         let mut f = Flows::default();
-        f.exhaust[0].add_signed(1e-6, thermo::specific_enthalpy(1800.0));
+        f.exhaust[0].add_signed(1e-6, Mixture::PRODUCTS.enthalpy(1800.0));
         let s = m.step(DT, 0.5, 0.0, f).unwrap();
         let correction = s.intake_ledger.numerical_correction_j
             + s.exhaust_ledger

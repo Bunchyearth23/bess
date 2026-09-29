@@ -648,6 +648,7 @@ impl Engine {
                         output.burn_fraction,
                         output.pressure_pa,
                         output.temperature_k,
+                        self.cylinders[i].gas_state().expect("stepped").mixture(),
                         dt,
                     );
                 }
@@ -1187,9 +1188,9 @@ mod mechanical_tests {
     }
     #[test]
     fn knock_rings_5_to_9_khz_only_in_the_observation_and_off_is_inert() {
-        let (off, quiet, _) = knock_band(0., 1., 15., true);
-        let (on, knocking, _) = knock_band(1., 1., 15., false);
-        let (controlled, retarded, _) = knock_band(1., 1., 15., true);
+        let (off, quiet, _) = knock_band(0., 1., 20., true);
+        let (on, knocking, _) = knock_band(1., 1., 20., false);
+        let (controlled, retarded, _) = knock_band(1., 1., 20., true);
         println!("5–9 kHz share: off {off:.3}, knock {on:.3}, with control {controlled:.3}");
         assert!(on > off * 5. && on > 0.1, "{off} → {on}");
         // Without control, gas, crank and exhaust never see the ring.
@@ -1198,9 +1199,10 @@ mod mechanical_tests {
             assert_eq!(a.torque_nm.to_bits(), b.torque_nm.to_bits());
             assert_eq!(a.heat_j.to_bits(), b.heat_j.to_bits());
         }
-        // Control reaches the gas only through spark retard. From 15° past
-        // MBT, 12° retard recovers torque (measured 175.67 → 178.06 N·m); at
-        // ON 70 the authority cannot silence the ring (0.011 → 0.263).
+        // Control reaches the gas only through spark retard. From 20° advance,
+        // 12° retard recovers torque towards MBT (≈ +10° at 4000/1.0 since
+        // X-026, flat within 1 % over +5…+15°; it was ≈ +5…+10° with the air
+        // cv, where 15° sufficed); ON 85 saturates the authority.
         let (base, late) = (mean_torque(&quiet), mean_torque(&retarded));
         println!("torque {base:.2} → {late:.2} N·m with control");
         assert!(late > base && late < base * 1.1, "{base} → {late}");
@@ -1292,14 +1294,125 @@ mod mechanical_tests {
     }
     #[test]
     fn knock_control_makes_events_sporadic_within_its_authority() {
-        // Since the X-024 runners fill the cylinder better at high speed, only
-        // ≈ RON 95 stays within the 12° authority at 6000/1.0 (≈ 9.6° retard,
-        // 100 → 1 events per 100 cycles); lower octane saturates it (X-025).
-        let free = knock_stats(1e-4, 6000., 1., false);
-        let controlled = knock_stats(1e-4, 6000., 1., true);
-        println!("6000/1.0 RON 95: {free:?} -> {controlled:?}");
+        // X-026: with fuel–air properties the RON 95 end gas no longer knocks
+        // at 6000/1.0 and stays within the 12° authority from 3000 rpm up
+        // (3000/1.0: ≈ 7.6° retard, 100 → 2 events per 100 cycles; before,
+        // 12° saturated at 100 → 100).
+        let free = knock_stats(1e-4, 3000., 1., false);
+        let controlled = knock_stats(1e-4, 3000., 1., true);
+        println!("3000/1.0 RON 95: {free:?} -> {controlled:?}");
         assert!(controlled[0] < free[0] * 0.5, "{free:?} -> {controlled:?}");
         assert!(controlled[1] > 0. && controlled[1] <= 12.);
         assert!(controlled.iter().all(|v| v.is_finite()));
+    }
+    #[test]
+    #[ignore = "measurement table: cargo test --release --lib spark_sweep -- --ignored --nocapture"]
+    fn spark_sweep() {
+        for advance in [-10., -5., 0., 5., 10., 15.] {
+            let (_, samples, _) = knock_band(0., 1., advance, true);
+            println!(
+                "4000/1.0 advance {advance:+}°: torque {:.2} N·m",
+                mean_torque(&samples)
+            );
+        }
+    }
+    #[test]
+    #[ignore = "measurement table: cargo test --release --lib knock_ron95_grid -- --ignored --nocapture"]
+    fn knock_ron95_grid() {
+        for rpm in [2000., 3000., 4000., 5000., 6000.] {
+            let free = knock_stats(1e-4, rpm, 1., false);
+            let controlled = knock_stats(1e-4, rpm, 1., true);
+            println!(
+                "RON 95 {rpm}/1.0: events/100 cyc {:.1} -> {:.1}, retard {:.2}°, torque {:.2} -> {:.2} N·m",
+                free[0], controlled[0], controlled[1], free[2], controlled[2]
+            );
+        }
+    }
+    /// Cylinder 0 over whole cycles at imposed speed (default NA I4): motored
+    /// (spark off, fuel on) and fired polytropic exponent over −90…−40°, charge
+    /// state at BDC and −35°, gross (BDC–BDC around firing TDC) and net
+    /// indicated work against burned heat and injected fuel energy (43 MJ/kg).
+    #[test]
+    #[ignore = "measurement table: cargo test --release --lib cycle_statistics -- --ignored --nocapture"]
+    fn cycle_statistics() {
+        for (rpm, throttle) in [(2000., 1.), (3000., 1.), (4000., 1.), (3000., 0.3)] {
+            for fired in [false, true] {
+                let scratch = Scratch::default();
+                let mut engine = Engine::new(&scratch, 96_000).unwrap();
+                if !fired {
+                    engine.spark_enabled = [false; 12];
+                }
+                let command = Commands {
+                    imposed_rpm: Some(rpm),
+                    throttle,
+                    ..Default::default()
+                };
+                let n = engine.cylinders.len() as f64;
+                let wrap = |a: f64| (a + TAU).rem_euclid(2. * TAU) - TAU;
+                let mut previous: Option<(f64, f64, f64)> = None;
+                let (mut gross, mut net, mut heat, mut fuel, mut texh) = (0., 0., 0., 0., 0.);
+                let (mut bdc, mut spark, mut exponent, mut cycles) = ([0.; 2], [0.; 2], 0., 0.);
+                let mut at90 = (0., 0.);
+                let (settle, window) = (96_000 * 3 / 2, 96_000);
+                for k in 0..settle + window {
+                    let s = engine.next(command);
+                    assert!(!engine.failed());
+                    let gas = engine.cylinders[0].gas_state().unwrap();
+                    let (p, v, t) = (gas.pressure_pa(), gas.volume_m3(), gas.temperature_k());
+                    let phase = wrap(engine.angle - engine.phases[0]);
+                    if k >= settle {
+                        heat += s.heat_j;
+                        fuel += s.fuel_injected_kg * 43e6;
+                        texh += engine.manifolds.exhaust_bank(0).temperature_k;
+                        if let Some((p0, v0, a0)) = previous
+                            && a0 < phase
+                        {
+                            let work = 0.5 * (p + p0) * (v - v0);
+                            net += work;
+                            if (-PI..PI).contains(&(0.5 * (a0 + phase))) {
+                                gross += work;
+                            }
+                            let crossed = |x: f64| a0 < x && phase >= x;
+                            if crossed(-PI) {
+                                bdc[0] += t;
+                                bdc[1] += p;
+                                cycles += 1.;
+                            }
+                            if crossed(-90_f64.to_radians()) {
+                                at90 = (p, v);
+                            }
+                            if crossed(-40_f64.to_radians()) && at90.0 > 0. {
+                                exponent += (p / at90.0).ln() / (at90.1 / v).ln();
+                            }
+                            if crossed(-35_f64.to_radians()) {
+                                spark[0] += t;
+                                spark[1] += p;
+                            }
+                        }
+                    }
+                    previous = Some((p, v, phase));
+                }
+                let per_cycle = window as f64 / 96_000. * rpm / 120. * n;
+                println!(
+                    "{} {rpm}/{throttle}: n(-90..-40) {:.4}, BDC {:.1} K {:.3} bar, -35° {:.1} K {:.2} bar, \
+                     gross {:.1} J net {:.1} J, heat {:.1} J fuel {:.1} J, eta_gross/heat {:.4} /fuel {:.4}, \
+                     eta_net/fuel {:.4}, exhaust {:.0} K",
+                    if fired { "fired" } else { "motored" },
+                    exponent / cycles,
+                    bdc[0] / cycles,
+                    bdc[1] / cycles / 1e5,
+                    spark[0] / cycles,
+                    spark[1] / cycles / 1e5,
+                    gross / cycles,
+                    net / cycles,
+                    heat / per_cycle,
+                    fuel / per_cycle,
+                    gross / cycles / (heat / per_cycle),
+                    gross / cycles / (fuel / per_cycle),
+                    net / cycles / (fuel / per_cycle),
+                    texh / window as f64,
+                );
+            }
+        }
     }
 }
