@@ -10,6 +10,7 @@ use bess::{
     hybrid::Settings,
     project::{self, Parameters, Project},
     render,
+    room::Room,
     scratch::{EngineDesign, Layout, Scratch, ScratchModel},
 };
 use eframe::egui::{self, Color32, RichText};
@@ -73,6 +74,8 @@ struct App {
     playing: bool,
     audition_mix: AuditionMix,
     camera: BeamNgCamera,
+    room: Room,
+    room_mix: f32,
     driving: Controls,
     restart: u64,
     show_driving: bool,
@@ -153,6 +156,8 @@ impl App {
             playing: false,
             audition_mix: AuditionMix::Live,
             camera: BeamNgCamera::Cockpit,
+            room: Room::Off,
+            room_mix: 0.35,
             driving: Controls {
                 mode: Mode::Simulated,
                 ..Default::default()
@@ -622,6 +627,17 @@ impl App {
                     ui.selectable_value(&mut self.camera, camera, label);
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Room:");
+                for room in Room::ALL {
+                    ui.selectable_value(&mut self.room, room, room.label());
+                }
+                ui.add_enabled(
+                    self.room != Room::Off,
+                    egui::Slider::new(&mut self.room_mix, 0.0..=1.0).text("wet"),
+                );
+            });
+            ui.small("Room is for listening only; WAV and BeamNG exports stay dry.");
             ui.small("Scratch engine: there is no Automation source A, only the designed sound.");
         } else {
             ui.horizontal(|ui| {
@@ -2018,6 +2034,8 @@ impl eframe::App for App {
             restart: self.restart,
             audition_mix: self.audition_mix,
             camera: self.camera,
+            room: self.room,
+            room_mix: self.room_mix,
         };
         if self.sent != Some(command)
             && let Some(audio) = &self.audio
@@ -2200,6 +2218,8 @@ fn main() -> eframe::Result {
                     restart: 0,
                     audition_mix: AuditionMix::Live,
                     camera: BeamNgCamera::Cockpit,
+                    room: Room::Off,
+                    room_mix: 0.,
                 });
                 a
             } else if let Some(path) = args.get(3) {
@@ -2221,6 +2241,8 @@ fn main() -> eframe::Result {
                     restart: 0,
                     audition_mix: AuditionMix::Live,
                     camera: BeamNgCamera::Cockpit,
+                    room: Room::Off,
+                    room_mix: 0.,
                 });
                 a
             } else {

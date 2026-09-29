@@ -451,6 +451,43 @@ mod tests {
     }
 
     #[test]
+    fn room_off_is_bit_identical_and_only_an_enabled_room_changes_output() {
+        use crate::room::Room;
+        let make = || {
+            RenderEngine::scratch(
+                48_000,
+                Parameters::default(),
+                Settings::default(),
+                Controls::default(),
+                &Scratch::default(),
+            )
+            .unwrap()
+        };
+        let (mut dry, mut live) = (make(), make());
+        live.bench.enable_room();
+        live.bench.set_room(Room::Off, 0.7);
+        for i in 0..24_000 {
+            let expected = dry.next_sample(true);
+            assert_eq!(live.next_sample(true).to_bits(), expected.to_bits(), "{i}");
+        }
+        // A room on a render engine that never enabled it is inert.
+        dry.bench.set_room(Room::Hall, 1.);
+        live.bench.set_room(Room::Hall, 0.7);
+        let mut differs = false;
+        for _ in 0..24_000 {
+            let expected = dry.next_sample(true);
+            differs |= live.next_sample(true).to_bits() != expected.to_bits();
+        }
+        assert!(differs);
+        let mut plain = make();
+        for _ in 0..48_000 {
+            plain.next_sample(true);
+        }
+        let expected = plain.next_sample(true);
+        assert_eq!(dry.next_sample(true).to_bits(), expected.to_bits());
+    }
+
+    #[test]
     fn scratch_supports_exact_double_rate_at_44k_and_192k() {
         for rate in [44_100, 192_000] {
             let mut engine = RenderEngine::scratch(

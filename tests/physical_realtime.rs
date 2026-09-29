@@ -127,6 +127,45 @@ fn prepared_sound_retunes_preserve_running_bench_and_allocate_or_drop_no_buffers
         "each complete prepared model must return to the owner"
     );
 }
+#[test]
+fn live_room_switching_allocates_or_drops_nothing() {
+    use bess::room::Room;
+    let mut bench = Bench::from_scratch(
+        96_000,
+        Parameters {
+            volume: 0.2,
+            ..Default::default()
+        },
+        Settings::default(),
+        Controls::default(),
+        ScratchModel::build(&Scratch::default(), 96_000).unwrap(),
+    );
+    bench.enable_room();
+    for _ in 0..9600 {
+        bench.next(true);
+    }
+    ALLOCATIONS.with(|v| v.set(0));
+    DEALLOCATIONS.with(|v| v.set(0));
+    TRACK.with(|v| v.set(true));
+    // Includes a switch requested while the previous crossfade is running.
+    for (room, mix, frames) in [
+        (Room::Garage, 0.5, 9600),
+        (Room::Hall, 0.5, 400),
+        (Room::Outdoor, 1., 9600),
+        (Room::Hall, 0.2, 9600),
+        (Room::Off, 0.2, 9600),
+        (Room::Garage, 0.8, 9600),
+    ] {
+        bench.set_room(room, mix);
+        for _ in 0..frames {
+            assert!(bench.next(true).is_finite());
+        }
+    }
+    TRACK.with(|v| v.set(false));
+    assert!(!bench.failed());
+    assert_eq!(ALLOCATIONS.with(|v| v.get()), 0);
+    assert_eq!(DEALLOCATIONS.with(|v| v.get()), 0);
+}
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
