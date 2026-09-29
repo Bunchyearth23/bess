@@ -36,9 +36,8 @@ impl Tube {
         }
     }
     /// Waves arriving at the far and near ends, with viscothermal losses.
-    /// The loss low-pass group delay, (1 - g) / g samples, is taken off the line.
-    fn read(&mut self, delay: f64, filter: f64, loss: f64) -> [f64; 2] {
-        let delay = (delay - (1. - filter) / filter).max(1.) as f32;
+    /// `delay` comes from `line_delay` for the same `filter`.
+    fn read(&mut self, delay: f32, filter: f64, loss: f64) -> [f64; 2] {
         let x = [self.forward.read_at(delay), self.backward.read_at(delay)];
         for (state, x) in self.state.iter_mut().zip(x) {
             *state += filter * (f64::from(x) - *state);
@@ -49,6 +48,12 @@ impl Tube {
         self.forward.write(near.clamp(-200000., 200000.) as f32);
         self.backward.write(far.clamp(-200000., 200000.) as f32);
     }
+}
+
+/// Line read delay: the loss low-pass group delay, (1 - g) / g samples, is
+/// taken off the acoustic delay.
+fn line_delay(delay: f64, filter: f64) -> f32 {
+    (delay - (1. - filter) / filter).max(1.) as f32
 }
 
 struct Runner {
@@ -176,7 +181,7 @@ impl IntakeAcoustic {
     pub fn next(&mut self, flow_kg_s: &[f64; 12], open: f64, jet_m_s: f64) -> f32 {
         let throttle = throttle_transmission(open, jet_m_s);
         self.length_m += self.length_slew * (self.target_length_m - self.length_m);
-        let delay = self.length_m * self.rate / C;
+        let delay = line_delay(self.length_m * self.rate / C, self.filter);
         let runner_loss = loss(self.length_m);
         let mut arrivals = [[0.; 2]; 12];
         for (arrival, r) in arrivals.iter_mut().zip(&mut self.runners) {
@@ -185,8 +190,12 @@ impl IntakeAcoustic {
         let mut far = [0.; 12];
         let mut volume_flow = 0.;
         if let Some(a) = &mut self.airbox {
-            let duct = a.duct.read(a.delay[0], self.filter, a.loss[0]);
-            let snorkel = a.snorkel.read(a.delay[1], self.filter, a.loss[1]);
+            let duct = a
+                .duct
+                .read(line_delay(a.delay[0], self.filter), self.filter, a.loss[0]);
+            let snorkel =
+                a.snorkel
+                    .read(line_delay(a.delay[1], self.filter), self.filter, a.loss[1]);
             // Compliant junction, areas as admittances (rho*c cancels):
             // V/c dp/dt = sum A (2 a - p), backward Euler, passive.
             // The duct joins through the throttle resistance: admittance k A.
