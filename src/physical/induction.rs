@@ -74,7 +74,14 @@ impl Induction {
         if !(1e-6..=0.5).contains(&total_displacement_m3) {
             return Err("Invalid induction displacement".into());
         }
-        let volume = (total_displacement_m3 * 0.75).max(0.0002);
+        // Compressor outlet to throttle: hot pipe, intercooler core and tanks,
+        // cold pipe, ≈3 L at 2 L (estimate; research_notes' deceleration_physics
+        // takes ≈5 L). The former 0.75 × displacement (outlet volume alone) put
+        // the duct/charge Helmholtz mode at ≈47 Hz, the 1200–1400 rpm firing
+        // frequency: pulses swung compressor flow across the speed-line peak and
+        // locked 1200 rpm WOT into surge once X-026 moved it 1 % closer (38 kPa
+        // at 27 Hz). At 1.5 × the mode sits at ≈33 Hz, below boosted firing.
+        let volume = (total_displacement_m3 * 1.5).max(0.0002);
         let charge = GasState::at_pressure(
             volume,
             ATMOSPHERE.pressure_pa,
@@ -513,7 +520,10 @@ mod tests {
         let initial_energy = no.charge_internal_energy_j();
         let mut signed_mass = 0.0;
         let mut signed_enthalpy = 0.0;
-        for i in 0..20000 {
+        // Two volume-scaled deep-surge cycles: the 3 L charge (was 1.5 L) blows
+        // down and refills half as often, so the window is twice the former 20000.
+        const STEPS: u32 = 40000;
+        for i in 0..STEPS {
             let sn = no
                 .step(DT, 3000.0, 0.0, ATMOSPHERE, 0.0, Exchange::default())
                 .unwrap();
@@ -547,8 +557,8 @@ mod tests {
         }
         println!(
             "surge preboost_pa={preboost:.1}, reverse_none_kg={reverse_no:.9}, reverse_vent_kg={reverse_vent:.9}, crossings={reversals}, guard_kg={guard:e}, mean_none_pa={}, mean_vent_pa={}",
-            pressure_no / 20000.0,
-            pressure_vent / 20000.0
+            pressure_no / f64::from(STEPS),
+            pressure_vent / f64::from(STEPS)
         );
         assert!(preboost > 120000.0);
         assert!(reverse_no > 1e-4 && reversals >= 4);
@@ -558,7 +568,7 @@ mod tests {
         assert!(a > 0.0 && b > 0.0);
         // Surge can have a lower *mean* pressure than a stable vented machine;
         // what the BOV should suppress is cyclic backflow and pressure swing.
-        assert!(pressure_vent / 20000.0 < preboost);
+        assert!(pressure_vent / f64::from(STEPS) < preboost);
         assert!(bounds_vent.1 - bounds_vent.0 < (bounds_no.1 - bounds_no.0) * 0.5);
         assert!(corrections < 1e-7);
         assert!((no.charge_mass_kg() - initial_mass - signed_mass).abs() < 1e-12);
