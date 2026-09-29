@@ -1,6 +1,7 @@
 //! Coupled engine: physical cylinders, manifold states, shaft and acoustic ports.
 //! All evolving gas/shaft state is f64. Audio is an explicitly calibrated f32
 //! observation of mass-flow waves and mechanical impacts, never a torque curve.
+use super::radiation::Modes;
 use super::{
     acoustic::Acoustic,
     config::CylinderConfig,
@@ -15,7 +16,6 @@ use crate::{
     engine_build::{Aspiration, Fuel},
     scratch::Scratch,
 };
-use bdsp::svf::{StateVariableFilter, SvfMode};
 use std::f64::consts::{PI, TAU};
 
 #[derive(Clone, Copy, Debug)]
@@ -97,9 +97,9 @@ pub struct Engine {
     intake_phase: f64,
     afterfire_armed: bool,
     afterfire_remaining_s: f64,
-    mechanics: StateVariableFilter,
+    mechanics: Modes,
     tone: Tone,
-    previous_mechanics: Option<StateVariableFilter>,
+    previous_mechanics: Option<Modes>,
     previous_tone: Option<Tone>,
     sound_fade: f32,
     last: Sample,
@@ -183,11 +183,13 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         let acoustic = Acoustic::new(rate, &scratch.design, &scratch.build, &scratch.sound);
         let tone = Tone::new(rate, &scratch.sound);
-        let mechanics = StateVariableFilter::new(
+        let mechanics = Modes::new(
             rate as f32,
-            scratch.sound.mechanical_pitch_hz.min(rate as f32 * 0.4),
+            scratch.sound.mechanical_pitch_hz,
             scratch.sound.mechanical_resonance,
-            SvfMode::Bandpass,
+            scratch.build.block,
+            scratch.build.bore_mm,
+            seed,
         );
         let induction = if scratch.build.aspiration == Aspiration::Natural {
             None
@@ -275,8 +277,7 @@ impl Engine {
         self.previous_tone = Some(std::mem::replace(&mut self.tone, incoming));
         self.previous_mechanics = Some(self.mechanics.clone());
         self.mechanics
-            .set_cutoff(sound.mechanical_pitch_hz.min(self.rate as f32 * 0.4));
-        self.mechanics.set_q(sound.mechanical_resonance);
+            .retune(sound.mechanical_pitch_hz, sound.mechanical_resonance);
         self.sound_fade = 0.;
         self.acoustic.retune(&sound);
         // Cycle inputs read new ignition/variation/duration settings; existing
@@ -300,8 +301,7 @@ impl Engine {
         ));
         self.previous_mechanics = Some(self.mechanics.clone());
         self.mechanics
-            .set_cutoff(sound.mechanical_pitch_hz.min(self.rate as f32 * 0.4));
-        self.mechanics.set_q(sound.mechanical_resonance);
+            .retune(sound.mechanical_pitch_hz, sound.mechanical_resonance);
         self.sound_fade = 0.;
         self.acoustic.retune(sound);
         self.scratch.sound = *sound;
@@ -711,7 +711,7 @@ impl Engine {
         let (intake_audio, contact) =
             self.radiation
                 .next(self.intake_ac as f32, intake_flow as f32, impact as f32);
-        let mut mechanical = self.mechanics.next_sample(contact);
+        let mut mechanical = self.mechanics.next(contact, 0.);
         let normalized_rpm = ((self.rpm as f32 - self.scratch.idle_rpm)
             / (self.scratch.redline_rpm - self.scratch.idle_rpm))
             .clamp(0., 1.);
@@ -731,7 +731,7 @@ impl Engine {
             shaped_exhaust = old.0 + (shaped_exhaust - old.0) * self.sound_fade;
             shaped_intake = old.1 + (shaped_intake - old.1) * self.sound_fade;
             if let Some(previous) = &mut self.previous_mechanics {
-                let old = previous.next_sample(contact);
+                let old = previous.next(contact, 0.);
                 mechanical = old + (mechanical - old) * self.sound_fade;
             }
             self.sound_fade = (self.sound_fade + 1. / (self.rate as f32 * 0.03)).min(1.);
