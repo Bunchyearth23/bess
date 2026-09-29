@@ -127,7 +127,10 @@ impl Engine {
         }
         let mut scratch = scratch.clone();
         scratch.design.resolve_cam_revolutions();
-        let config = CylinderConfig::from_build(&scratch.build)?;
+        let tuning = scratch
+            .tuning
+            .resolve(&scratch.build, scratch.design.cylinders);
+        let config = CylinderConfig::from_tuning(&scratch.build, &tuning)?;
         let n = scratch.design.cylinders as usize;
         let displacement = config.displacement_m3() * n as f64;
         if !(1e-6..=0.5).contains(&displacement) {
@@ -171,7 +174,7 @@ impl Engine {
         for &b in &banks[..n] {
             bank_counts[b] += 1;
         }
-        let mut manifolds = Manifolds::new(&scratch.build, n as u32, displacement)?;
+        let mut manifolds = Manifolds::new(&scratch.build, &tuning, n as u32, displacement)?;
         manifolds
             .set_active_bank_mask(bank_counts.map(|count| count > 0))
             .map_err(|e| format!("Manifolds: {e:?}"))?;
@@ -198,7 +201,7 @@ impl Engine {
         let induction = if scratch.build.aspiration == Aspiration::Natural {
             None
         } else {
-            Some(Induction::new(&scratch.build, displacement)?)
+            Some(Induction::new(&scratch.build, &tuning, displacement)?)
         };
         let aftertreatment = std::array::from_fn(|_| AfterTreatment::new(scratch.build.catalyst));
         let substeps = (96000. / f64::from(rate)).ceil().max(1.) as usize;
@@ -327,14 +330,16 @@ impl Engine {
         self.rpm = f64::from(self.scratch.idle_rpm);
         self.crank = Crank::new(self.inertia(), self.config.stroke_m, displacement, self.rpm)
             .expect("validated crank");
-        self.manifolds = Manifolds::new(&self.scratch.build, n as u32, displacement)
+        let tuning = self.scratch.tuning.resolve(&self.scratch.build, n as u32);
+        self.manifolds = Manifolds::new(&self.scratch.build, &tuning, n as u32, displacement)
             .expect("validated manifolds");
         self.manifolds
             .set_active_bank_mask(self.bank_counts.map(|count| count > 0))
             .expect("valid banks");
         if self.induction.is_some() {
             self.induction = Some(
-                Induction::new(&self.scratch.build, displacement).expect("validated induction"),
+                Induction::new(&self.scratch.build, &tuning, displacement)
+                    .expect("validated induction"),
             );
         }
         self.aftertreatment =
