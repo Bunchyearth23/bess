@@ -11,6 +11,7 @@ pub mod gas;
 pub mod induction;
 pub mod intake_acoustic;
 pub mod manifolds;
+mod mechanical;
 pub mod thermo;
 pub mod tone;
 
