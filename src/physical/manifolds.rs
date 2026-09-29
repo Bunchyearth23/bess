@@ -213,7 +213,10 @@ impl Composition {
 }
 impl Species {
     pub fn composition(self, mass: f64) -> Composition {
-        let inverse = 1.0 / mass;
+        self.composition_per_kg(1.0 / mass)
+    }
+    /// `composition(mass)` with `inverse = 1.0 / mass` already evaluated.
+    fn composition_per_kg(self, inverse: f64) -> Composition {
         Composition {
             fresh_air_fraction: (self.fresh_air_kg * inverse).clamp(0.0, 1.0),
             fuel_fraction: (self.fuel_kg * inverse).clamp(0.0, 1.0),
@@ -318,8 +321,12 @@ fn reservoir(gas: GasState) -> Reservoir {
 /// Mass removable at old-state enthalpy before the 200 K floor, with a factor
 /// two margin. This budget is shared across every connection to the donor.
 fn removable(gas: GasState) -> f64 {
+    removable_at(gas, gas.temperature_k())
+}
+/// `removable` with the donor's already evaluated `temperature_k()`.
+fn removable_at(gas: GasState, temperature_k: f64) -> f64 {
     let floor_u = gas.mixture().internal_energy(MIN_TEMPERATURE_K);
-    let h = gas.mixture().enthalpy(gas.temperature_k());
+    let h = gas.mixture().enthalpy(temperature_k);
     ((gas.internal_energy_j() - gas.mass_kg() * floor_u) / (h - floor_u))
         .max(0.0)
         .min(gas.mass_kg() * 0.9)
@@ -363,6 +370,7 @@ fn advect_tail(
     collector: Composition,
 ) -> Result<Species, ThermoError> {
     let cell_mass = old_mass / TAIL_SPECIES_CELLS as f64;
+    let per_kg = 1.0 / cell_mass;
     let mut flux = [Species::default(); TAIL_SPECIES_CELLS + 1];
     for (face, transfer) in flux.iter_mut().enumerate() {
         let dm = left + (right - left) * face as f64 / TAIL_SPECIES_CELLS as f64;
@@ -370,7 +378,7 @@ fn advect_tail(
             if face == 0 {
                 collector
             } else {
-                cells[face - 1].composition(cell_mass)
+                cells[face - 1].composition_per_kg(per_kg)
             }
         } else if face == TAIL_SPECIES_CELLS {
             Composition {
@@ -378,7 +386,7 @@ fn advect_tail(
                 fuel_fraction: 0.0,
             }
         } else {
-            cells[face].composition(cell_mass)
+            cells[face].composition_per_kg(per_kg)
         };
         *transfer = Species {
             fresh_air_kg: dm * donor.fresh_air_fraction,
@@ -543,6 +551,40 @@ impl Manifolds {
     /// for reverse flow into the plenum.
     pub fn runner_budget_kg(&self, i: usize) -> f64 {
         removable(self.runners[i]) * 0.5
+    }
+    /// `(runner(i), runner_composition(i), runner_budget_kg(i))` from one
+    /// temperature evaluation, for the per-cylinder hot path.
+    pub fn runner_port(&self, i: usize) -> (Reservoir, Composition, f64) {
+        let gas = self.runners[i];
+        let (temperature_k, pressure_pa) = gas.temperature_pressure();
+        (
+            Reservoir {
+                pressure_pa,
+                temperature_k,
+            },
+            self.runner_composition(i),
+            removable_at(gas, temperature_k) * 0.5,
+        )
+    }
+    /// `(exhaust_bank(b), exhaust_composition(b), outgoing_budgets().exhaust_kg[b])`
+    /// from one temperature evaluation.
+    pub fn exhaust_port(&self, bank: usize) -> (Reservoir, Composition, f64) {
+        let bank = bank.min(1);
+        let gas = self.exhaust[bank];
+        let (temperature_k, pressure_pa) = gas.temperature_pressure();
+        let budget = if self.active_bank_mask[bank] {
+            removable_at(gas, temperature_k) * 0.5
+        } else {
+            0.0
+        };
+        (
+            Reservoir {
+                pressure_pa,
+                temperature_k,
+            },
+            self.exhaust_composition(bank),
+            budget,
+        )
     }
     pub fn exhaust_composition(&self, bank: usize) -> Composition {
         self.exhaust_species[bank.min(1)].composition(self.exhaust[bank.min(1)].mass_kg())
@@ -760,11 +802,33 @@ impl Manifolds {
         {
             return Err(ThermoError::InvalidInput);
         }
-        let budgets = self.outgoing_budgets();
-        if flows.intake.mass_out_kg > budgets.intake_kg * (1.0 + 1e-12)
+        // Old-state reservoirs and removable masses, each evaluated once.
+        let old = |gas: GasState| {
+            let (temperature_k, pressure_pa) = gas.temperature_pressure();
+            let reservoir = Reservoir {
+                pressure_pa,
+                temperature_k,
+            };
+            (reservoir, removable_at(gas, temperature_k))
+        };
+        let (plenum, intake_removable) = old(self.intake);
+        let mut runners = [(ATMOSPHERE, 0.0); 12];
+        for (runner, gas) in runners.iter_mut().zip(&self.runners[..self.runner_count]) {
+            *runner = old(*gas);
+        }
+        let active = |i: usize, gas: GasState| {
+            if self.active_bank_mask[i] {
+                old(gas)
+            } else {
+                (ATMOSPHERE, 0.0)
+            }
+        };
+        let collectors = [0, 1].map(|i| active(i, self.exhaust[i]));
+        let tails = [0, 1].map(|i| active(i, self.tailpipe[i]));
+        if flows.intake.mass_out_kg > intake_removable * 0.5 * (1.0 + 1e-12)
             || (0..self.runner_count)
-                .any(|i| flows.runner[i].mass_out_kg > self.runner_budget_kg(i) * (1.0 + 1e-12))
-            || (0..2).any(|i| flows.exhaust[i].mass_out_kg > budgets.exhaust_kg[i] * (1.0 + 1e-12))
+                .any(|i| flows.runner[i].mass_out_kg > runners[i].1 * 0.5 * (1.0 + 1e-12))
+            || (0..2).any(|i| flows.exhaust[i].mass_out_kg > collectors[i].1 * 0.5 * (1.0 + 1e-12))
         {
             return Err(ThermoError::InvalidInput);
         }
@@ -774,16 +838,15 @@ impl Manifolds {
         // entry/bend loss K = 0.5 (sharp-edged plenum entry, Idelchik) taken
         // semi-implicitly. Inertia lets flow overshoot pressure equilibrium:
         // that is the ram effect, so only mass/thermal budgets limit it.
-        let plenum = self.intake();
         let plenum_mixture = self.intake.mixture();
         let plenum_h = plenum_mixture.enthalpy(plenum.temperature_k);
         let plenum_composition = self.intake_composition();
-        let share = (removable(self.intake) * 0.5 - flows.intake.mass_out_kg).max(0.0)
+        let share = (intake_removable * 0.5 - flows.intake.mass_out_kg).max(0.0)
             / self.runner_count.max(1) as f64;
         let mut plenum_exchange = Exchange::default();
         let mut plenum_species = Species::default();
         for i in 0..self.runner_count {
-            let port = self.runner(i);
+            let (port, port_removable) = runners[i];
             let port_mixture = self.runners[i].mixture();
             let (upstream, upstream_mixture) = if plenum.pressure_pa >= port.pressure_pa {
                 (plenum, plenum_mixture)
@@ -798,7 +861,7 @@ impl Manifolds {
             let flow = (old + gain * (plenum.pressure_pa - port.pressure_pa)) / (1.0 + gain * loss);
             let dm = (flow * dt)
                 .min(share)
-                .max(-(removable(self.runners[i]) - flows.runner[i].mass_out_kg).max(0.0));
+                .max(-(port_removable - flows.runner[i].mass_out_kg).max(0.0));
             working.runner_flow_kg_s[i] = dm / dt;
             let port_h = port_mixture.enthalpy(port.temperature_k);
             let port_composition = self.runner_composition(i);
@@ -829,10 +892,11 @@ impl Manifolds {
                 ledger.mass_in_kg,
             )?;
         }
+        let supply_mixture = self.supply_composition.mixture();
         let intake_flux = if boundaries {
             rate(
-                (self.supply, self.supply_composition.mixture()),
-                (self.intake(), plenum_mixture),
+                (self.supply, supply_mixture),
+                (plenum, plenum_mixture),
                 self.throttle_area_m2(throttle, idle_bypass),
                 0.75,
             ) * dt
@@ -840,17 +904,14 @@ impl Manifolds {
             0.0
         };
         let intake_flux = intake_flux
-            .max(-(removable(self.intake) - flows.intake.mass_out_kg - plenum_exchange.mass_out_kg))
+            .max(-(intake_removable - flows.intake.mass_out_kg - plenum_exchange.mass_out_kg))
             .min(self.supply_mass_limit_kg);
         let mut intake_input = flows.intake;
         intake_input.mass_in_kg += plenum_exchange.mass_in_kg;
         intake_input.enthalpy_in_j += plenum_exchange.enthalpy_in_j;
         intake_input.mass_out_kg += plenum_exchange.mass_out_kg;
-        let supply_h = self
-            .supply_composition
-            .mixture()
-            .enthalpy(self.supply.temperature_k);
-        let intake_h = plenum_mixture.enthalpy(self.intake.temperature_k());
+        let supply_h = supply_mixture.enthalpy(self.supply.temperature_k);
+        let intake_h = plenum_mixture.enthalpy(plenum.temperature_k);
         intake_input.add_signed(intake_flux, supply_h);
         result.intake_ledger = working.intake.step(
             self.intake.volume_m3(),
@@ -863,10 +924,9 @@ impl Manifolds {
         )?;
         result.intake_mass_flow_kg_s = intake_flux / dt;
         result.supply_exchange.add_signed(-intake_flux, intake_h);
-        let old_intake_composition = self.intake_composition();
         result.supply_species = Species {
-            fresh_air_kg: (-intake_flux).max(0.0) * old_intake_composition.fresh_air_fraction,
-            fuel_kg: (-intake_flux).max(0.0) * old_intake_composition.fuel_fraction,
+            fresh_air_kg: (-intake_flux).max(0.0) * plenum_composition.fresh_air_fraction,
+            fuel_kg: (-intake_flux).max(0.0) * plenum_composition.fuel_fraction,
         };
         let incoming_species = Species {
             fresh_air_kg: flows.intake_species.fresh_air_kg
@@ -910,16 +970,18 @@ impl Manifolds {
             } else {
                 (self.exhaust_area_m2, self.exhaust_cd, 0.9)
             };
-            let collector = (self.exhaust_bank(i), self.exhaust[i].mixture());
-            let tail = (reservoir(self.tailpipe[i]), self.tailpipe[i].mixture());
+            let (collector_reservoir, collector_removable) = collectors[i];
+            let (tail_reservoir, tail_removable) = tails[i];
+            let collector = (collector_reservoir, self.exhaust[i].mixture());
+            let tail = (tail_reservoir, self.tailpipe[i].mixture());
             let collector_h = collector.1.enthalpy(collector.0.temperature_k);
             let tail_h = tail.1.enthalpy(tail.0.temperature_k);
             let ambient_h = Mixture::AIR.enthalpy(ATMOSPHERE.temperature_k);
             let out = rate(collector, tail, area, cd) * dt;
             let cfl_mass = self.tailpipe[i].mass_kg() / TAIL_SPECIES_CELLS as f64 * 0.25;
             let bounded_out = out
-                .min(removable(self.exhaust[i]) - exchange.mass_out_kg)
-                .max(-removable(self.tailpipe[i]) * 0.5)
+                .min(collector_removable - exchange.mass_out_kg)
+                .max(-tail_removable * 0.5)
                 .clamp(-cfl_mass, cfl_mass);
             result.transport_limited_mass_kg += (out - bounded_out).abs();
             let out = bounded_out;
@@ -960,7 +1022,7 @@ impl Manifolds {
                 0.0
             };
             let bounded_tail_out = tail_out
-                .min(removable(self.tailpipe[i]) - (-out).max(0.0))
+                .min(tail_removable - (-out).max(0.0))
                 .clamp(-cfl_mass, cfl_mass);
             result.transport_limited_mass_kg += (tail_out - bounded_tail_out).abs();
             let tail_out = bounded_tail_out;

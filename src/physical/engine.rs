@@ -533,15 +533,8 @@ impl Engine {
                     .set_supply_limit(induction.outgoing_budget_kg())
                     .map_err(|_| ())?;
             }
-            let exhaust_composition = [
-                self.manifolds.exhaust_composition(0),
-                self.manifolds.exhaust_composition(1),
-            ];
-            let exhaust = [
-                self.manifolds.exhaust_bank(0),
-                self.manifolds.exhaust_bank(1),
-            ];
-            let budgets = self.manifolds.outgoing_budgets();
+            let exhaust_ports = [0, 1].map(|bank| self.manifolds.exhaust_port(bank));
+            let exhaust = exhaust_ports.map(|port| port.0);
             let mut flows = Flows::default();
             torque = 0.;
             pressure = 0.;
@@ -565,6 +558,11 @@ impl Engine {
                 0.
             };
             self.intake_phase += (vvt_target - self.intake_phase) * (dt / 0.05).min(1.);
+            let ignition_retard = f64::from(self.scratch.sound.ignition_retard_deg).to_radians();
+            let variation = f64::from(self.scratch.build.cam)
+                * 0.4
+                * f64::from(self.scratch.sound.cycle_variation);
+            let burn_duration_scale = f64::from(self.scratch.sound.combustion_duration);
             for (i, cylinder_flow) in flow.iter_mut().enumerate().take(n) {
                 let bank = self.banks[i];
                 // The conservative 0D system supplies the valve mass flow.
@@ -586,35 +584,32 @@ impl Engine {
                 }
                 let port = coupled.then(|| self.acoustic.port(i, boundary.pressure_pa));
                 self.cylinders[i].set_exhaust_port(port);
+                let (intake, intake_composition, intake_budget) = self.manifolds.runner_port(i);
+                let (_, exhaust_composition, exhaust_budget) = exhaust_ports[bank];
                 let output = self.cylinders[i]
                     .step(CycleInput {
                         angle_rad: angle,
                         rpm: self.rpm,
                         dt_s: dt,
-                        intake: self.manifolds.runner(i),
+                        intake,
                         exhaust: boundary,
-                        intake_fresh_air_fraction: self
-                            .manifolds
-                            .runner_composition(i)
-                            .fresh_air_fraction,
-                        intake_fuel_fraction: self.manifolds.runner_composition(i).fuel_fraction,
-                        exhaust_fresh_air_fraction: exhaust_composition[bank].fresh_air_fraction,
-                        exhaust_fuel_fraction: exhaust_composition[bank].fuel_fraction,
-                        intake_mass_limit_kg: self.manifolds.runner_budget_kg(i),
-                        exhaust_mass_limit_kg: budgets.exhaust_kg[bank]
+                        intake_fresh_air_fraction: intake_composition.fresh_air_fraction,
+                        intake_fuel_fraction: intake_composition.fuel_fraction,
+                        exhaust_fresh_air_fraction: exhaust_composition.fresh_air_fraction,
+                        exhaust_fuel_fraction: exhaust_composition.fuel_fraction,
+                        intake_mass_limit_kg: intake_budget,
+                        exhaust_mass_limit_kg: exhaust_budget
                             / self.bank_counts[bank].max(1) as f64,
                         fuel_multiplier: controller.fuel_multiplier,
                         spark_enabled,
                         spark_shift_rad: controller.spark_shift_rad
                             + self.spark_shift[i]
-                            + f64::from(self.scratch.sound.ignition_retard_deg).to_radians()
+                            + ignition_retard
                             // Zero unless knock is enabled (bit-identical off).
                             + self.knock.retard[i],
                         intake_phase_rad: self.intake_phase,
-                        variation: f64::from(self.scratch.build.cam)
-                            * 0.4
-                            * f64::from(self.scratch.sound.cycle_variation),
-                        burn_duration_scale: f64::from(self.scratch.sound.combustion_duration),
+                        variation,
+                        burn_duration_scale,
                     })
                     .map_err(|_| ())?;
                 add_exchange(
