@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut original = zip::ZipArchive::new(fs::File::open(&path)?)?;
         let zip_name = manifest["zip_file"].as_str().ok_or("ZIP name")?;
         let mut exported = zip::ZipArchive::new(fs::File::open(dir.join(zip_name))?)?;
-        assert_eq!(original.len(), exported.len());
+        assert_eq!(original.len() + usize::from(!exhaust_only), exported.len());
         let mut preserved = 0;
         let mut labelled = 0;
         let mut seam_ratio = 0f32;

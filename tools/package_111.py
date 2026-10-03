@@ -1,7 +1,7 @@
 """Package BESS 0.11.1 with original-reference / physical-engine playback.
 
-Users import their own Automation exports and create their own selectable
-BeamNG configurations. No vehicle, project or listening data are bundled.
+Users import their own Automation exports and re-export complete vehicles
+with a BABM sound handoff. No vehicle, project or listening data are bundled.
 """
 
 from __future__ import annotations
@@ -35,10 +35,10 @@ def start_page() -> str:
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BESS 0.11.1 — Windows portable</title>
 <style>body{background:#10171f;color:#e6edf5;font:17px/1.55 system-ui;max-width:880px;margin:40px auto;padding:0 24px}a{color:#9ad3ff}h2{color:#8be5c6;margin-top:32px}section{background:#1b2633;padding:20px 24px;border-radius:12px;margin:18px 0}</style>
-<h1>BESS 0.11.1</h1><p>Bunchy's Engine Synthesis System connects Automation engine sounds to selectable BeamNG.drive configurations.</p>
+<h1>BESS 0.11.1</h1><p>Bunchy's Engine Synthesis System recreates Automation engine sounds for BeamNG.drive and exchanges complete vehicle exports with BABM.</p>
 <section><h2>1. Import your vehicle</h2><p>Run <a href="BESS.exe">BESS.exe</a> and select <strong>Import Automation ZIP</strong>. Choose a vehicle exported from your own Automation installation. BESS reads its RPM/load sound bank while leaving the original ZIP untouched.</p></section>
 <section><h2>2. Shape and inspect the sound</h2><p><strong>A</strong> plays the original Automation recordings. <strong>B</strong> uses the BESS physical engine reconstructed from the vehicle's verified engine metadata. Review the displayed estimates, adjust sound controls, and use <strong>Calculate BeamNG level</strong> to inspect exported WAV levels. Camera previews provide Cockpit, Hood, Tailpipe and Orbit listening perspectives. A new engine uses the same physical solver without an imported recording.</p></section>
-<section><h2>3. Export a selectable BeamNG configuration</h2><p>Choose <strong>Create BeamNG configuration</strong>. BESS writes an add-on ZIP for the imported vehicle. Keep the original Automation ZIP enabled and place the new add-on ZIP in your active BeamNG mods folder. In the vehicle selector, choose the original vehicle and its trim marked <strong>(BESS)</strong>. Remove an older BESS add-on for that same vehicle before enabling the new one.</p></section>
+<section><h2>3. Export and apply the vehicle sound</h2><p>Choose <strong>Export vehicle ZIP</strong>. BESS writes a complete vehicle ZIP with the replacement sounds. Choose <strong>Open BABM…</strong>, review the export in <strong>BESS sounds</strong>, then apply it to the matching individual vehicle or grouped pack. For a direct BeamNG test without BABM, enable only the BESS copy and keep the original archived for restoration.</p></section>
 <p><a href="README.md">Project guide</a> · <a href="RELEASE_NOTES_0.11.1.md">Release notes</a> · <a href="SHA256.json">File hashes</a></p>
 </html>'''
 
@@ -51,9 +51,10 @@ Import an Automation vehicle ZIP you own. **A** plays the original Automation
 recordings. **B** uses the BESS physical engine, configured from verified engine
 metadata. Review the displayed assumptions for component details that were not
 exported. New engines use the same physical solver.
-Compare A and B, adjust sound controls, and use **Create BeamNG
-configuration** to export a selectable add-on. Keep the original Automation ZIP
-enabled beside the BESS add-on. Remove an older BESS add-on for the same vehicle.
+Compare A and B, adjust sound controls, and use **Export vehicle ZIP**.
+In BABM, refresh **BESS sounds** and apply the export to the matching vehicle or
+grouped pack. For a direct BeamNG test without BABM, enable only the BESS copy
+of the vehicle. Keep the original archived for restoration.
 
 See the [release notes](RELEASE_NOTES_0.11.1.md) for changes and scope. The
 portable folder contains no vehicle, prepared add-on or sound-bank data.

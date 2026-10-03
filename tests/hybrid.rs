@@ -226,7 +226,8 @@ fn beamng_copy_labels_vehicle_and_preserves_all_other_non_audio_entries() {
     );
     let mut new =
         zip::ZipArchive::new(std::fs::File::open(dir.join(&package_name)).unwrap()).unwrap();
-    assert_eq!(old.len(), new.len());
+    assert_eq!(old.len() + 1, new.len());
+    assert!(new.by_name(bess::babm_exchange::MARKER_PATH).is_ok());
     for i in 0..old.len() {
         let mut entry = old.by_index(i).unwrap();
         let name = entry.name().to_owned();

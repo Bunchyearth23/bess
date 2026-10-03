@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod audio;
+mod beamng_ui;
 #[cfg(test)]
 mod control_count;
 mod spectrum;
@@ -67,6 +68,9 @@ impl LevelKey {
     }
 }
 struct App {
+    beamng_workspace: beamng_ui::BeamngWorkspace,
+    scroll_to_source: bool,
+    scroll_to_exhaust: bool,
     capture: Option<PathBuf>,
     capture_level: bool,
     capture_requested: bool,
@@ -239,8 +243,18 @@ impl Dyno {
     }
 }
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        Self::with_ctx(&cc.egui_ctx, initial)
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial: Option<PathBuf>,
+        companion: Option<beamng_ui::CompanionWorkspace>,
+    ) -> Self {
+        let mut app = Self::with_ctx(&cc.egui_ctx, initial);
+        app.refresh_beamng_workspace(
+            companion
+                .map(beamng_ui::FolderRequest::Session)
+                .unwrap_or(beamng_ui::FolderRequest::Discover),
+        );
+        app
     }
     fn with_ctx(ctx: &egui::Context, initial: Option<PathBuf>) -> Self {
         ctx.set_visuals(egui::Visuals::dark());
@@ -250,6 +264,9 @@ impl App {
         style.visuals.selection.bg_fill = Color32::from_rgb(0, 115, 110);
         ctx.set_style(style);
         let mut app = Self {
+            beamng_workspace: Default::default(),
+            scroll_to_source: false,
+            scroll_to_exhaust: false,
             capture: None,
             capture_level: false,
             capture_requested: false,
@@ -681,6 +698,10 @@ impl App {
             }
         });
         section(ui, "Exhaust sound", |ui| {
+            if self.scroll_to_exhaust {
+                ui.scroll_to_cursor(Some(egui::Align::Min));
+                self.scroll_to_exhaust = false;
+            }
             slider_help(
                 ui,
                 "Exhaust decay (ms)",
@@ -839,47 +860,23 @@ impl App {
             heading.scroll_to_me(Some(egui::Align::Min));
         }
         if self.bank.is_none() {
-            ui.small("Import an Automation vehicle ZIP to create a BeamNG configuration. Free engines can be exported as WAV below.");
+            ui.small("Import an Automation vehicle ZIP to re-export the complete vehicle. Free engines can be exported as WAV below.");
             return;
         }
-        ui.small("Adds a BESS configuration to the original Automation vehicle (keep the original mod enabled). It receives the same physical engine as B listening; the vehicle's own afterfire, turbo and startup sounds are preserved.");
-        ui.horizontal(|ui| {
-            ui.label("Sound profile name");
-            ui.text_edit_singleline(&mut self.profile_name);
-        });
-        ui.small("Named profiles appear as separate BESS configurations for the same vehicle.");
+        ui.small("Re-exports the complete imported vehicle with the current physical engine sound. Original vehicle files and sound paths are preserved in the copy; the source archive stays intact.");
+        self.beamng_export_destination_controls(ui);
         if ui
             .add_enabled(
-                self.bank.is_some()
-                    && self.engine_draft_valid()
-                    && self.worker.is_none()
-                    && self.level_worker.is_none()
-                    && project::validate_profile_name(&self.profile_name).is_ok(),
-                egui::Button::new("Create BeamNG configuration…"),
+                self.can_export_beamng(),
+                egui::Button::new("Export vehicle ZIP elsewhere…"),
             )
             .clicked()
-            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            && let Some(dir) = self
+                .beamng_file_dialog()
+                .set_title("Choose a folder for the complete vehicle export")
+                .pick_folder()
         {
-            let bank = self.bank.clone().unwrap();
-            let p = self.params;
-            let h = self.settings.for_beamng_export();
-            let profile = self.profile_name.trim().to_owned();
-            let (tx, rx) = mpsc::channel();
-            self.worker = Some(rx);
-            self.status = "Creating and verifying BeamNG configuration…".into();
-            std::thread::spawn(move || {
-                let folder = dir.join(format!(
-                    "BESS-BeamNG-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                ));
-                let _ = tx.send(bess::variant::package_named(&folder, p, h, bank, &profile));
-            });
-        }
-        if let Err(error) = project::validate_profile_name(&self.profile_name) {
-            ui.colored_label(Color32::LIGHT_RED, error);
+            self.start_beamng_export(dir);
         }
         if let Some(engine) = &self.scratch {
             ui.small(format!(
@@ -893,10 +890,13 @@ impl App {
                 engine.experimental.coupled_level_db,
             ));
         }
-        ui.small("Place the generated add-on ZIP in BeamNG's active mods folder, keep the original vehicle enabled, then select its (BESS - Profile) configuration. Regenerate the ZIP after changing the sound.");
+        ui.small("In BABM, refresh BESS sounds and apply the export to its vehicle or grouped pack. For a direct game test without BABM, enable only the exported copy. Regenerate the ZIP after changing the sound.");
+    }
+
+    fn addon_level_controls(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.strong("BeamNG volume estimate");
-                ui.small("Compare the WAV levels BESS will export with the original Automation samples. Listening volume does not change these files. Idle gain is set with the layer mix.");
+                ui.strong("Two-emitter add-on volume estimate");
+                ui.small("This analysis is for optional two-emitter add-ons. The complete-vehicle ZIP uses a combined mix through the original vehicle sound routing.");
                 if ui
                     .add_enabled(
                         self.bank.is_some()
@@ -905,7 +905,7 @@ impl App {
                             && self.level_worker.is_none()
                             && self.worker.is_none()
                             && self.importer.is_none(),
-                        egui::Button::new("Calculate BeamNG level"),
+                        egui::Button::new("Calculate add-on levels"),
                     )
                     .clicked()
                 {
@@ -1176,11 +1176,12 @@ impl App {
                     ui.selectable_value(
                         &mut self.audition_mix,
                         AuditionMix::BeamNgTwoEmitter,
-                        "BeamNG two-emitter preview",
+                        "Two-emitter add-on preview",
                     );
                     ui.selectable_value(&mut self.audition_mix, AuditionMix::Live, "BESS live mix");
                 });
                 if self.audition_mix == AuditionMix::BeamNgTwoEmitter {
+                    ui.small("Add-on preview only; complete-vehicle export follows the original sound routing.");
                     ui.small(self.camera.description());
                     if let Some(audio) = &self.audio {
                         let peak = f32::from_bits(audio.meter.peak.load(Ordering::Relaxed));
@@ -2719,6 +2720,7 @@ mod level_ui_tests {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_beamng_workspace();
         // Only a currently held, visible starter button can request cranking.
         self.settings.starter = false;
         let calibration_result =
@@ -2758,6 +2760,7 @@ impl eframe::App for App {
                 && self.frames > 20
                 && !self.capture_requested
                 && !self.dyno.busy()
+                && self.beamng_workspace.worker.is_none()
                 && (!self.capture_level || level_ready)
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -2845,6 +2848,7 @@ impl eframe::App for App {
         if let Some(rx) = &self.worker
             && let Ok(result) = rx.try_recv()
         {
+            self.finish_beamng_export(&result);
             self.status = result.unwrap_or_else(|e| format!("Error: {e}"));
             self.worker = None;
         }
@@ -2906,17 +2910,34 @@ impl eframe::App for App {
         egui::SidePanel::left("controls")
             .min_width(380.)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Vehicles").clicked() {
+                        self.scroll_to_source = true;
+                    }
+                    if ui
+                        .add_enabled(self.scratch.is_some(), egui::Button::new("Exhaust sound"))
+                        .clicked()
+                    {
+                        self.scroll_to_exhaust = true;
+                    }
+                });
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Engine and sound");
                     ui.separator();
-                    ui.heading("01 / Source vehicle");
+                    let source_heading = ui.heading("01 / Source vehicle");
+                    if self.scroll_to_source {
+                        source_heading.scroll_to_me(Some(egui::Align::Min));
+                        self.scroll_to_source = false;
+                    }
+                    self.beamng_source_controls(ui);
                     if ui
                         .add_enabled(
                             self.importer.is_none(),
                             egui::Button::new("Import Automation ZIP…"),
                         )
                         .clicked()
-                        && let Some(path) = rfd::FileDialog::new()
+                        && let Some(path) = self
+                            .beamng_file_dialog()
                             .add_filter("Vehicle", &["zip"])
                             .pick_file()
                     {
@@ -3009,7 +3030,7 @@ impl eframe::App for App {
             let scroll_to_export = ui.horizontal(|ui| {
                 let clicked = ui.button("BeamNG export").clicked();
                 ui.small(if self.bank.is_some() {
-                    "Create a configuration with the current engine sound."
+                    "Export the complete vehicle with the current engine sound."
                 } else {
                     "Requires an imported Automation vehicle."
                 });
@@ -3048,6 +3069,9 @@ impl eframe::App for App {
                 self.dyno_view(ui);
             }
             self.beamng_export_controls(ui, scroll_to_export);
+            if self.audition_mix == AuditionMix::BeamNgTwoEmitter || self.capture_level {
+                self.addon_level_controls(ui);
+            }
             ui.separator();ui.heading("Listening exports");
             ui.small("Reference calibration compares steady WAV recordings at the same RPM/load and microphone position. It creates a separate calibrated WAV and reusable filter; it does not identify engine physics.");
             if ui.add_enabled(self.worker.is_none(), egui::Button::new("Calibrate a WAV against a reference…")).clicked()
@@ -3464,13 +3488,19 @@ fn main() -> eframe::Result {
     } else {
         None
     };
-    let initial = if capture.is_some() {
-        args.get(3).map(PathBuf::from)
-    } else if args.get(1).map(String::as_str) == Some("--open") {
-        args.get(2).map(PathBuf::from)
-    } else {
-        None
-    };
+    let (initial, companion) =
+        if capture.is_some() || args.get(1).map(String::as_str) == Some("--open") {
+            let start = if capture.is_some() { 3 } else { 2 };
+            match beamng_ui::initial_and_companion(args.get(start..).unwrap_or_default()) {
+                Ok(startup) => startup,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            (None, None)
+        };
     eframe::run_native(
         "BESS — Physical Engine Sound",
         eframe::NativeOptions {
@@ -3484,7 +3514,7 @@ fn main() -> eframe::Result {
             ..Default::default()
         },
         Box::new(move |cc| {
-            let mut app = App::new(cc, initial);
+            let mut app = App::new(cc, initial, companion);
             app.capture = capture;
             app.capture_level = capture_level;
             Ok(Box::new(app))

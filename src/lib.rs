@@ -1,9 +1,12 @@
 pub mod acoustics;
 pub mod automation_model;
 pub mod automation_voice;
+pub mod babm_exchange;
 pub mod bank;
 pub mod beamng;
 pub mod beamng_level;
+pub mod beamng_library;
+pub mod beamng_paths;
 pub mod bench;
 pub mod calibration;
 pub mod combustion;

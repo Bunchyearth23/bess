@@ -294,7 +294,7 @@ fn imported_workshop_retains_source_ab_controls_and_all_engine_controls() {
         .map(|(_, node)| node)
         .find(|node| {
             node.role() == egui::accesskit::Role::Button
-                && node.label() == Some("Create BeamNG configuration…")
+                && node.label() == Some("Export vehicle ZIP elsewhere…")
         })
         .expect("imported engines must expose BeamNG export");
     assert!(!export.is_disabled());
@@ -330,6 +330,6 @@ fn imported_workshop_retains_source_ab_controls_and_all_engine_controls() {
         update
             .nodes
             .iter()
-            .all(|(_, node)| node.label() != Some("Create BeamNG configuration…"))
+            .all(|(_, node)| node.label() != Some("Export vehicle ZIP elsewhere…"))
     );
 }

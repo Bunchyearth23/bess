@@ -1,4 +1,4 @@
-//! Standalone replacement mod: preserve every entry except referenced engine WAVs.
+//! Complete vehicle replacement plus a versioned, source-bound BABM audio handoff.
 use crate::{
     bank::{self, Bank},
     hybrid::{Hybrid, Settings},
@@ -494,6 +494,19 @@ fn package_inner(
         return Err("Silent or non-finite rendering".into());
     }
     let gain = exhaust_safety_gain(peak);
+    let mut handoff = if exhaust_only {
+        None
+    } else {
+        Some(crate::babm_exchange::prepare(
+            Path::new(&bank.source.archive),
+            &mut zip,
+            info_path
+                .strip_suffix("info.json")
+                .ok_or("Invalid vehicle root")?,
+            &bank.source.blend,
+            replacements.keys().cloned(),
+        )?)
+    };
     let zip_name = package_name(&bank);
     fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
     let result = (|| -> Result<String, String> {
@@ -504,6 +517,9 @@ fn package_inner(
         let mut measurements = Vec::new();
         for i in 0..zip.len() {
             let entry = zip.by_index(i).map_err(|e| e.to_string())?;
+            if handoff.is_some() && entry.name() == crate::babm_exchange::MARKER_PATH {
+                continue;
+            }
             if let Some(samples) = replacements.get(entry.name()) {
                 let mut wav = Cursor::new(Vec::new());
                 {
@@ -528,6 +544,9 @@ fn package_inner(
                     .start_file(entry.name(), options)
                     .map_err(|e| e.to_string())?;
                 output.write_all(wav.get_ref()).map_err(|e| e.to_string())?;
+                if let Some(handoff) = &mut handoff {
+                    handoff.record_rendered(entry.name(), wav.get_ref())?;
+                }
                 let mut measurement = json!({"path":entry.name(),"frames":samples.len(),"seam":(samples[0]-samples[samples.len()-1]).abs()*gain});
                 if let Some(level_gain) = exhaust_level_gains.get(entry.name()) {
                     measurement["exhaust_level_gain"] = json!(level_gain);
@@ -543,6 +562,14 @@ fn package_inner(
             } else {
                 output.raw_copy_file(entry).map_err(|e| e.to_string())?;
             }
+        }
+        if let Some(handoff) = &handoff {
+            output
+                .start_file(crate::babm_exchange::MARKER_PATH, options)
+                .map_err(|e| e.to_string())?;
+            output
+                .write_all(&handoff.bytes()?)
+                .map_err(|e| e.to_string())?;
         }
         output.finish().map_err(|e| e.to_string())?;
         // Reimport the real produced archive, not only an in-memory rendering.
@@ -585,6 +612,7 @@ fn package_inner(
             "gain":gain,
             "loops":measurements,
             "render_channel":if exhaust_only {"exhaust"} else {"mixed"},
+            "babm_export":handoff,
             "render_model":"physical_automation",
             "engine_definition":h.engine,
             "engine_baseline":physical_model.baseline,
@@ -606,7 +634,7 @@ fn package_inner(
             "BESS intermediate exhaust-stem render\n\nDo not install this ZIP directly. It contains only the exhaust half of the selectable BESS sound and is an input to variant conversion. Install the final bess-variant-*.zip beside the original Automation vehicle instead.\n".to_owned()
         } else {
             format!(
-                "BESS — full vehicle with modified engine loops\n\nThe vehicle selector shows: {display_name}\n\n1. Keep a backup of the original Automation ZIP.\n2. Disable the original vehicle in BeamNG's mod manager.\n3. Install {zip_name} in the mods folder under your BeamNG user folder.\n4. Enable only this copy. Do not enable both versions at once.\n5. Reload the vehicle and compare idle, acceleration, lift-off, and camera views.\n6. To restore the original, disable the BESS copy and re-enable the original.\n\nEach BESS copy has a distinct ZIP name to avoid collisions between vehicles.\nThe off-load and on-load loops cover every RPM point in the original blend.\nEvents and physics remain those of the original vehicle. BESS transients are not exported as a BeamNG driving script.\nThe listening volume is not applied to the mod; one common safety gain preserves the relative dynamics.\nIn-game validation is still required.\n"
+                "BESS — full vehicle with modified engine loops\n\nThe vehicle selector shows: {display_name}\n\nWith BABM: refresh BESS sounds, then apply this export to its original vehicle or existing grouped pack. BABM checks the source identity and replaces only the associated sound files, retaining the previous pack. The embedded bess-export.json travels with {zip_name}.\n\nFor a direct BeamNG test without BABM:\n1. Keep a backup of the original Automation ZIP.\n2. Disable the original vehicle in BeamNG's mod manager.\n3. Install {zip_name} in the mods folder under your BeamNG user folder.\n4. Enable only this copy. Do not enable both versions at once.\n5. Reload the vehicle and compare idle, acceleration, lift-off, and camera views.\n6. To restore the original, disable the BESS copy and re-enable the original.\n\nEach BESS copy has a distinct ZIP name to avoid collisions between vehicles.\nThe off-load and on-load loops cover every RPM point in the original blend.\nEvents and physics remain those of the original vehicle. BESS transients are not exported as a BeamNG driving script.\nThe listening volume is not applied to the mod; one common safety gain preserves the relative dynamics.\nIn-game validation is still required.\n"
             )
         };
         fs::write(dir.join("INSTALLATION.txt"), instructions).map_err(|e| e.to_string())?;
