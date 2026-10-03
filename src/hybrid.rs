@@ -225,6 +225,7 @@ pub struct Hybrid {
     rate: f32,
     cycle: f64,
     gain: f32,
+    master_gain: f32,
     blend: f32,
     fast_load: f32,
     tick: u64,
@@ -270,6 +271,7 @@ impl Hybrid {
             rate: rate.max(8000) as f32,
             cycle: 0.,
             gain: 0.,
+            master_gain: p.master_gain,
             blend: if h.enhanced { 1. } else { 0. },
             fast_load: p.load,
             tick: 0,
@@ -392,6 +394,7 @@ impl Hybrid {
         commands: Option<crate::physical::engine::Commands>,
     ) -> HybridStems {
         let smooth = 1. / (self.rate * 0.025);
+        self.master_gain += (self.target.master_gain - self.master_gain).clamp(-smooth, smooth);
         self.gain += (if playing { self.target.volume } else { 0. } - self.gain) * smooth;
         self.blend += (if self.h.enhanced { 1. } else { 0. } - self.blend) * smooth;
         let rpm_smooth = 1. / (self.rate * (0.025 + self.h.response * 0.35));
@@ -471,7 +474,9 @@ impl Hybrid {
         let b_gain = self.compensation * self.idle_gain_mult();
         // Only audition is limited. Export receives physical stems at the same
         // volume*bank.gain scale as its existing normalization contract.
-        let b = self.physical_limiter.next(wet * b_gain * self.gain);
+        // Master attenuation follows matching and limiting, so neither can
+        // compensate it. The original Automation A branch is untouched.
+        let b = self.physical_limiter.next(wet * b_gain * self.gain) * self.master_gain;
         let out = self
             .transition_level
             .mix(raw * self.gain, b, self.blend, self.rate);
@@ -482,8 +487,8 @@ impl Hybrid {
             out
         };
         HybridStems {
-            exhaust: exhaust * b_gain * self.blend * self.gain,
-            engine: engine * b_gain * self.blend * self.gain,
+            exhaust: exhaust * b_gain * self.blend * self.gain * self.master_gain,
+            engine: engine * b_gain * self.blend * self.gain * self.master_gain,
             source_reference: raw * source_scale * self.gain,
             mixed,
         }
@@ -522,6 +527,49 @@ pub fn audition(t: f32, base: Parameters, max: f32) -> Parameters {
 #[cfg(test)]
 mod transition_tests {
     use super::TransitionLevel;
+
+    #[test]
+    fn direct_hybrid_master_gain_preserves_source_and_applies_after_matching() {
+        use super::{Hybrid, Parameters, Settings};
+        let source = crate::test_support::automation_fixture();
+        let bank = std::sync::Arc::new(crate::bank::Bank::load(&source, None).unwrap());
+        for enhanced in [false, true] {
+            let make = |master_gain| {
+                Hybrid::new(
+                    48_000,
+                    Parameters {
+                        rpm: 3200.,
+                        load: 0.7,
+                        master_gain,
+                        ..Default::default()
+                    },
+                    Settings {
+                        enhanced,
+                        level_match: true,
+                        ..Default::default()
+                    },
+                    Some(bank.clone()),
+                )
+            };
+            let (mut full, mut muted) = (make(1.), make(0.));
+            let mut energy = 0.;
+            for _ in 0..4096 {
+                let a = full.next_stems(true);
+                let b = muted.next_stems(true);
+                energy += a.mixed * a.mixed;
+                assert_eq!(a.source_reference, b.source_reference);
+                if enhanced {
+                    assert_eq!(b.mixed, 0.);
+                    assert_eq!(b.exhaust, 0.);
+                    assert_eq!(b.engine, 0.);
+                } else {
+                    assert_eq!(a.mixed, b.mixed);
+                }
+            }
+            assert!(energy > 1e-10);
+        }
+        std::fs::remove_file(source).unwrap();
+    }
 
     #[test]
     fn anti_correlated_ab_transition_keeps_level_without_changing_endpoints() {

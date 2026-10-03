@@ -338,6 +338,7 @@ pub struct Bench {
     physical_commands: PhysicalCommands,
     physical_fade: f32,
     physical_gain: f32,
+    master_gain: f32,
     physical_idle_rpm: f32,
     listener: Option<Listener>,
     sim: Simulator,
@@ -381,7 +382,7 @@ impl Bench {
             params.rpm = min;
             params.load = 0.1;
         }
-        let engine = Hybrid::new(rate, params, settings, bank);
+        let engine = Hybrid::new(rate, Self::unscaled_params(params), settings, bank);
         let range = engine.physical_range().unwrap_or((min, max));
         Self::with_engine(engine, rate, params, settings, controls, range)
     }
@@ -400,9 +401,10 @@ impl Bench {
             params.load = 0.1;
         }
         let physical = model.physical.take();
-        let engine = Hybrid::new(rate, params, settings, None);
+        let engine = Hybrid::new(rate, Self::unscaled_params(params), settings, None);
         let mut bench = Self::with_engine(engine, rate, params, settings, controls, range);
         bench.physical = physical;
+        bench.master_gain = params.master_gain;
         bench.listener = Some(Listener::new(rate));
         bench.beamng_camera = BeamNgCamera::Orbit;
         bench
@@ -454,6 +456,11 @@ impl Bench {
             physical_commands: PhysicalCommands::default(),
             physical_fade: 1.,
             physical_gain: 0.,
+            master_gain: if settings.enhanced {
+                params.master_gain
+            } else {
+                1.
+            },
             physical_idle_rpm: min,
             listener: None,
             sim: Simulator::new(min, max, controls),
@@ -473,6 +480,15 @@ impl Bench {
     }
     pub fn set_cycle_seconds(&mut self, seconds: f32) {
         self.cycle_seconds = seconds;
+    }
+    // Preview calibration, level matching, camera filtering and room all see
+    // the unchanged signal. One final attenuation controls the audible BESS
+    // result; forwarding it to Hybrid as well would apply it twice.
+    fn unscaled_params(params: Parameters) -> Parameters {
+        Parameters {
+            master_gain: 1.,
+            ..params
+        }
     }
     pub fn set_audition_mix(&mut self, mix: AuditionMix) {
         self.audition_mix = mix;
@@ -519,10 +535,21 @@ impl Bench {
         self.controls = c;
         self.reset_token = reset_token;
         if c.mode == Mode::Direct {
-            self.engine.set(p, self.effective_settings());
+            self.engine
+                .set(Self::unscaled_params(p), self.effective_settings());
         }
     }
     pub fn next(&mut self, playing: bool) -> f32 {
+        let target = if self.physical.is_some() || self.settings.enhanced {
+            self.params.master_gain
+        } else {
+            1.
+        };
+        let step = 1. / (self.rate as f32 * 0.025);
+        self.master_gain += (target - self.master_gain).clamp(-step, step);
+        self.next_unscaled(playing) * self.master_gain
+    }
+    fn next_unscaled(&mut self, playing: bool) -> f32 {
         if self.physical.is_some() {
             return self.next_physical(playing);
         }
@@ -539,7 +566,8 @@ impl Bench {
                     load: self.physical_commands.throttle as f32,
                     ..self.params
                 };
-                self.engine.set(p, self.effective_settings());
+                self.engine
+                    .set(Self::unscaled_params(p), self.effective_settings());
             }
             let stems = self
                 .engine
@@ -572,7 +600,8 @@ impl Bench {
                         self.max,
                     ),
                 };
-                self.engine.set(p, self.effective_settings());
+                self.engine
+                    .set(Self::unscaled_params(p), self.effective_settings());
             }
             self.physics_accumulator += TICK_RATE;
             self.frames += 1;
@@ -740,6 +769,113 @@ impl Bench {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn master_gain_follows_preview_level_matching_and_room_without_changing_a() {
+        let source = crate::test_support::automation_fixture();
+        let bank = Arc::new(Bank::load(&source, None).unwrap());
+        for (enhanced, mix) in [
+            (true, AuditionMix::Live),
+            (true, AuditionMix::BeamNgTwoEmitter),
+            (false, AuditionMix::Live),
+            (false, AuditionMix::BeamNgTwoEmitter),
+        ] {
+            let make = |master_gain| {
+                let params = Parameters {
+                    rpm: 3200.,
+                    load: 0.7,
+                    master_gain,
+                    ..Default::default()
+                };
+                let settings = Settings {
+                    enhanced,
+                    level_match: true,
+                    ..Default::default()
+                };
+                let mut bench = Bench::new(
+                    48_000,
+                    params,
+                    settings,
+                    Controls {
+                        mode: Mode::Direct,
+                        ..Default::default()
+                    },
+                    Some(bank.clone()),
+                );
+                bench.set_audition_mix(mix);
+                bench.enable_room();
+                bench.set_room(Room::Garage, 0.8);
+                bench
+            };
+            let (mut full, mut half, mut muted) = (make(1.), make(0.5), make(0.));
+            let mut energy = 0.;
+            for _ in 0..4096 {
+                let expected = full.next(true);
+                energy += expected * expected;
+                assert_eq!(half.next(true), expected * if enhanced { 0.5 } else { 1. });
+                assert_eq!(muted.next(true), expected * if enhanced { 0. } else { 1. });
+            }
+            assert!(energy > 1e-10);
+            assert!(!full.failed() && !half.failed() && !muted.failed());
+        }
+        std::fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn live_master_gain_uses_a_finite_ramp_and_scratch_obeys_the_same_scale() {
+        let scratch = crate::scratch::Scratch::default();
+        let params = Parameters {
+            rpm: 3200.,
+            load: 0.7,
+            ..Default::default()
+        };
+        let controls = Controls {
+            mode: Mode::Direct,
+            ..Default::default()
+        };
+        let make = |master_gain| {
+            let model = ScratchModel::build(&scratch, 48_000).unwrap();
+            Bench::from_scratch(
+                48_000,
+                Parameters {
+                    master_gain,
+                    ..params
+                },
+                Settings::default(),
+                controls,
+                model,
+            )
+        };
+        let (mut full, mut half, mut muted) = (make(1.), make(0.5), make(0.));
+        let mut energy = 0.;
+        for _ in 0..4096 {
+            let expected = full.next(true);
+            energy += expected * expected;
+            assert_eq!(half.next(true), expected * 0.5);
+            assert_eq!(muted.next(true), 0.);
+        }
+        assert!(energy > 1e-10);
+        full.set(
+            Parameters {
+                master_gain: 0.,
+                ..params
+            },
+            Settings::default(),
+            controls,
+            0,
+        );
+        let previous = full.master_gain;
+        full.next(true);
+        assert!(full.master_gain > 0. && full.master_gain < previous);
+        for _ in 0..1300 {
+            full.next(true);
+        }
+        assert_eq!(full.master_gain, 0.);
+        for _ in 0..64 {
+            assert_eq!(full.next(true), 0.);
+        }
+        assert!(!full.failed());
+    }
 
     #[test]
     fn disabled_imported_room_preserves_original_peaks_above_preview_ceiling() {

@@ -3,18 +3,60 @@
 ## User workflow
 
 1. In BABM, choose **Edit sound in BESS** for an individual original. Grouped vehicles use their preserved original archives. BESS also lists those originals in its detected BeamNG library, without activating or moving them.
-2. In BESS, adjust the engine, save the project if you want to continue editing it, and choose **Export vehicle ZIP**. The result remains a complete vehicle ZIP, with the original structure and replacement engine WAVs.
+2. In BESS, adjust the engine, name the variant, and export the complete vehicle with its BESS variant. The ZIP contains every original file unchanged plus a separately selectable BESS configuration and its own sound files. Save the project to continue editing later.
 3. Choose **Open BABM…**, or open BABM and refresh **BESS sounds**. BESS passes its selected mods folder and the parent of its last successful export when opening the companion. An export saved elsewhere is therefore discoverable without changing the saved default. BABM otherwise discovers the sibling `BESS-exports` directory and BESS's saved output preference. One level of per-export subdirectories is scanned.
-4. Review the matched vehicle and select **Apply BESS sounds**. Discovery is read-only; applying is explicit. For an already grouped pack, only the original trim's associated WAVs and BABM's update receipt change. Other trims, user variables, JBeam parts, configurations and legacy add-on sounds remain intact.
-5. Repeat the export/apply cycle after another edit. Applied, older, conflicting or unavailable exports have distinct states. Reopening an already processed complete ZIP in BESS retains the verified original source identity.
+4. Review the matched vehicle and select **Import BESS variant**. Discovery is read-only; importing is explicit. BABM adds the variant to the standalone vehicle or remaps its paths into an existing grouped pack. The original configuration and sounds remain intact.
+5. Repeat after another edit. The same source and profile identify the same variant. BABM checks its previously imported files before replacing only that variant's owned files. Other profiles, trims, variables and original configurations remain intact. Applied, older, conflicting or unavailable exports have distinct states.
 
-The original trim receives the new sound. Older selectable BESS add-on configurations remain separate and retain their own sound routing. In BeamNG, choose the original trim/engine routing to hear a full-vehicle sound update. Actual in-game audio and ergonomics remain user acceptance checks.
+In BeamNG, choose the configuration labelled **BESS** to hear the generated sound; the original trim retains the Automation sound. BABM owns vehicle merging. A complete BESS ZIP already includes its original, so an initial merge must not duplicate that original when both source archives are present. Actual in-game audio and ergonomics remain user acceptance checks.
 
 BABM preserves pristine sources and prior archive revisions. BESS can rediscover the pristine original after both standalone and grouped updates. Unmerging restores original individual source archives. Neither application silently installs a second full vehicle alongside its original.
 
-## Embedded contract
+When this source already received a legacy sound replacement, importing its first
+selectable variant restores the original WAVs from the pristine backup in the same
+atomic update. BABM first verifies that the installed WAVs still match its legacy
+receipt. Missing originals or outside edits block the migration; unrelated sources
+and older independent variants remain untouched.
 
-Only BESS's complete mixed vehicle export writes `bess-export.json` at the ZIP root. Exhaust-only intermediate renders and historical selectable add-ons do not become full-vehicle handoffs.
+## Current complete-variant contract
+
+The complete ZIP carries `bess-export.json` with a distinct kind. It is not a WAV
+replacement request: its added configuration, JBeam and blend routing must travel
+with the added WAVs.
+
+```json
+{
+  "version": 1,
+  "kind": "bess-variant-vehicle",
+  "source_archive_sha256": "64 lowercase hexadecimal characters",
+  "source_archive_name": "original.zip",
+  "vehicle_root": "vehicles/original_vehicle/",
+  "blend_path": "art/sound/blends/original.sfxBlend2D.json",
+  "exported_at_unix_ms": 1791057600000,
+  "variant_id": "stable identity derived from source and profile",
+  "configuration_path": "vehicles/original_vehicle/bess_configuration.pc",
+  "added_files": [
+    {"path": "vehicles/original_vehicle/bess_configuration.pc", "sha256": "SHA-256 of the added bytes"}
+  ]
+}
+```
+
+`added_files` lists every added member except the marker itself. Each path is
+disjoint from the original archive. The source hash identifies the pristine
+archive; it is not the hash of the larger complete export. BABM validates the
+added payload, remaps only the added vehicle paths as needed, and records ownership
+and transformed hashes. Initial merging also compares the original members against
+the pristine source when that source is available among the inputs or backups.
+Without that separate source, the added-file checks do not independently establish
+the provenance of the original members. An external change or a collision blocks
+replacement instead of overwriting unrelated content.
+
+## Legacy full-replacement contract
+
+The explicit `--beamng-replacement` command retains `bess-full-vehicle` below.
+For these older exports, **Apply BESS sounds** replaces the original trim's sound
+files and does not create a new configuration. Exhaust-only intermediate renders
+and historical add-on-only ZIPs do not use this replacement contract.
 
 ```json
 {

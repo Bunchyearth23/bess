@@ -1,6 +1,7 @@
 //! Reproduce an exported project's settings and record bounded export progress.
 //! Usage: export_project_probe PROJECT NEW_OUTPUT [--source ZIP] [--workers 1..8]
 //!        [--baseline ZIP] [--cancel-after SECONDS]
+//!        [--format replacement|complete-variant]
 //! Cancellation is timed from first observing the Rendering phase.
 use bess::{
     bank::Bank,
@@ -26,6 +27,7 @@ struct Arguments {
     baseline: Option<PathBuf>,
     workers: usize,
     cancel_after: Option<f64>,
+    complete_variant: bool,
 }
 
 fn arguments() -> Result<Arguments, String> {
@@ -39,12 +41,20 @@ fn arguments() -> Result<Arguments, String> {
         baseline: None,
         workers: 8,
         cancel_after: None,
+        complete_variant: false,
     };
     while let Some(flag) = args.next() {
         let value = args.next().ok_or("Option requires a value")?;
         match flag.to_str() {
             Some("--source") => result.source = Some(PathBuf::from(value)),
             Some("--baseline") => result.baseline = Some(PathBuf::from(value)),
+            Some("--format") => {
+                result.complete_variant = match value.to_str() {
+                    Some("replacement") => false,
+                    Some("complete-variant") => true,
+                    _ => return Err("Format must be replacement or complete-variant".into()),
+                };
+            }
             Some("--workers") => {
                 result.workers = value
                     .to_string_lossy()
@@ -157,20 +167,31 @@ fn run() -> Result<(), String> {
         return Err("Copied source identity does not match the saved project".into());
     }
     let setup_seconds = setup.elapsed().as_secs_f64();
-    let zip_path = args.output.join(export::package_name(&bank));
     let job = ExportJob::with_worker_limit(args.workers);
     let worker_job = job.clone();
     let output = args.output.clone();
+    let complete_variant = args.complete_variant;
     let (tx, rx) = mpsc::channel();
     let started = Instant::now();
     let worker = std::thread::spawn(move || {
-        let result = export::package_with_job(
-            &output,
-            project.parameters,
-            project.hybrid.for_beamng_export(),
-            bank,
-            &worker_job,
-        );
+        let result = if complete_variant {
+            bess::variant::package_complete_with_job(
+                &output,
+                project.parameters,
+                project.hybrid.for_beamng_export(),
+                bank,
+                &project.profile_name,
+                &worker_job,
+            )
+        } else {
+            export::package_with_job(
+                &output,
+                project.parameters,
+                project.hybrid.for_beamng_export(),
+                bank,
+                &worker_job,
+            )
+        };
         let _ = tx.send(result);
     });
     let mut snapshots = Vec::new();
@@ -229,6 +250,18 @@ fn run() -> Result<(), String> {
         cancellation_started.map(|start| start.elapsed().as_secs_f64());
     let final_progress = job.snapshot();
     let comparison = if result.is_ok() {
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(args.output.join("manifest.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let zip_file = manifest["zip_file"]
+            .as_str()
+            .filter(|name| {
+                Path::new(name).file_name().and_then(|name| name.to_str()) == Some(*name)
+                    && name.ends_with(".zip")
+            })
+            .ok_or("Output manifest has no safe ZIP filename")?;
+        let zip_path = args.output.join(zip_file);
         args.baseline
             .as_deref()
             .map(|reference| baseline_comparison(reference, &zip_path))
@@ -251,6 +284,7 @@ fn run() -> Result<(), String> {
         };
     let report = json!({
         "project": args.project, "source": source_path, "output": args.output,
+        "format": if args.complete_variant { "complete-variant" } else { "replacement" },
         "requested_workers": args.workers, "setup_seconds": setup_seconds,
         "export_seconds": elapsed_seconds, "success": result.is_ok(), "result": result,
         "snapshots": snapshots, "final_stage": format!("{:?}", final_progress.stage),

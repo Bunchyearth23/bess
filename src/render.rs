@@ -155,6 +155,12 @@ pub fn comparison(
     bank: Arc<Bank>,
 ) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    params.validate()?;
+    let master_gain = params.master_gain;
+    let params = Parameters {
+        master_gain: 1.,
+        ..params
+    };
     let a = hybrid_samples(
         params,
         Settings {
@@ -187,13 +193,13 @@ pub fn comparison(
     let safe = (0.95 / peak.max(1e-9)).min(1.);
     let a: Vec<f32> = a.iter().map(|s| s * safe).collect();
     for s in &mut b {
-        *s *= safe;
+        *s *= safe * master_gain;
     }
     write_pcm(&dir.join("01-source-automation.wav"), &a)?;
     write_pcm(&dir.join("02-bess-enhanced.wav"), &b)?;
     let mode = "physical engine resynthesis";
     let report = format!(
-        "Automation source playback and BESS {mode}, using the same 16-second scenario.\nSource RMS: {:.6}\nBESS RMS: {:.6}\nBESS level adjustment: {:.3} dB\nRMS is not a LUFS measurement. The source is reconstructed from the bank, not recorded from Automation gameplay.\n",
+        "Automation source playback and BESS {mode}, using the same 16-second scenario.\nSource RMS: {:.6}\nBESS RMS: {:.6}\nBESS level adjustment before master gain: {:.3} dB\nBESS engine sound gain: {master_gain:.3}\nRMS is not a LUFS measurement. The source is reconstructed from the bank, not recorded from Automation gameplay.\n",
         rms(&a),
         rms(&b),
         20. * gain.log10()

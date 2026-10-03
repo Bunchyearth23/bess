@@ -1,4 +1,8 @@
 //! Add a selectable BESS configuration without replacing the Automation vehicle.
+#[path = "variant_complete.rs"]
+mod complete;
+pub use complete::package_complete_with_job;
+
 use crate::{
     bank::{self, Bank},
     export,
@@ -47,8 +51,13 @@ fn render_identity(
     // from the source knots; listening volume and legacy DSP controls are
     // not baked into these files and must not split otherwise equal variants.
     hash.update(
-        serde_json::to_vec(&(parameters.exhaust, parameters.intake, parameters.mechanical))
-            .map_err(|e| e.to_string())?,
+        serde_json::to_vec(&(
+            parameters.exhaust,
+            parameters.intake,
+            parameters.mechanical,
+            parameters.master_gain,
+        ))
+        .map_err(|e| e.to_string())?,
     );
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -653,8 +662,16 @@ fn build(
         .zip(exhaust_wavs.iter().zip(engine_loops.iter()))
         .zip(engine_gains.iter())
     {
-        write_file(&mut output, exhaust_path, wav)?;
-        write_file(&mut output, engine_path, &pcm24(engine, gain)?)?;
+        write_file(
+            &mut output,
+            exhaust_path,
+            &export::apply_master_gain(wav.clone(), p.master_gain)?,
+        )?;
+        write_file(
+            &mut output,
+            engine_path,
+            &export::apply_master_gain(pcm24(engine, gain)?, p.master_gain)?,
+        )?;
     }
     output.finish().map_err(|e| e.to_string())?;
     let mut check = ZipArchive::new(File::open(&partial).map_err(|e| e.to_string())?)
@@ -719,6 +736,8 @@ fn build(
         "settings":h,
         "parameters":previous["parameters"],
         "gain":previous["gain"],
+        "master_gain":p.master_gain,
+        "master_gain_applied":true,
         "exhaust_level_reference":previous["exhaust_level_reference"],
         "validation":"Add-on paths are disjoint from the original; BeamNG driving and audible behavior still require in-game testing"
     });
@@ -850,6 +869,10 @@ mod tests {
             Parameters { intake: 0.7, ..mix },
             Parameters {
                 mechanical: 0.4,
+                ..mix
+            },
+            Parameters {
+                master_gain: 0.5,
                 ..mix
             },
         ] {

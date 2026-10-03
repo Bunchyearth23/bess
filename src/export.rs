@@ -203,6 +203,113 @@ pub(crate) fn exhaust_safety_gain(peak: f32) -> f32 {
     (0.95 / peak).min(1.)
 }
 
+/// Attenuate the finished recording after all synthesis and calibration. Keeping
+/// this out of the level estimators prevents normalization from undoing the gain.
+pub(crate) fn apply_master_gain(bytes: Vec<u8>, gain: f32) -> Result<Vec<u8>, String> {
+    if !gain.is_finite() || !(0. ..=1.).contains(&gain) {
+        return Err("BESS master gain out of range".into());
+    }
+    if gain == 1. {
+        return Ok(bytes);
+    }
+    let mut input = hound::WavReader::new(Cursor::new(&bytes)).map_err(|e| e.to_string())?;
+    let spec = input.spec();
+    if spec.channels != 1
+        || spec.sample_rate != 48_000
+        || spec.bits_per_sample != 24
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        return Err("Master gain requires a finished mono 48 kHz PCM24 recording".into());
+    }
+    let mut output = Cursor::new(Vec::with_capacity(bytes.len()));
+    {
+        let mut writer = hound::WavWriter::new(&mut output, spec).map_err(|e| e.to_string())?;
+        for sample in input.samples::<i32>() {
+            let sample = sample.map_err(|e| e.to_string())?;
+            writer
+                .write_sample((sample as f32 * gain) as i32)
+                .map_err(|e| e.to_string())?;
+        }
+        writer.finalize().map_err(|e| e.to_string())?;
+    }
+    Ok(output.into_inner())
+}
+
+/// Validate exported PCM without audition-bank normalization, which rejects
+/// intentional silence and very quiet recordings produced by the master gain.
+pub(crate) fn verify_generated_bank(
+    zip: &mut zip::ZipArchive<File>,
+    blend: &str,
+    expected_loops: usize,
+    nominal_frames: usize,
+    job: &ExportJob,
+) -> Result<(), String> {
+    let mut read = |name: &str, limit: u64| -> Result<Vec<u8>, String> {
+        job.check()?;
+        let entry = zip.by_name(name).map_err(|e| e.to_string())?;
+        if entry.size() > limit {
+            return Err(format!("Oversized generated member: {name}"));
+        }
+        let mut bytes = Vec::new();
+        entry
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("Oversized generated member: {name}"));
+        }
+        Ok(bytes)
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&read(blend, 4_000_000)?).map_err(|e| e.to_string())?;
+    let layers = value["samples"]
+        .as_array()
+        .filter(|a| a.len() == 2)
+        .ok_or("Generated blend needs both load layers")?;
+    let mut paths = std::collections::HashSet::new();
+    for layer in layers {
+        let points = layer
+            .as_array()
+            .filter(|a| !a.is_empty() && a.len() <= 128)
+            .ok_or("Invalid generated RPM points")?;
+        let mut rpms = std::collections::HashSet::new();
+        for point in points {
+            let path = point[0].as_str().ok_or("Invalid generated WAV path")?;
+            let rpm = point[1]
+                .as_f64()
+                .filter(|v| v.is_finite() && (200. ..=20_000.).contains(v))
+                .ok_or("Invalid generated RPM")?;
+            if !paths.insert(path.to_owned()) || !rpms.insert(rpm.to_bits()) {
+                return Err("Duplicate generated sound knot".into());
+            }
+            let bytes = read(path, MAX_SOURCE_WAV_BYTES)?;
+            let spec = hound::WavReader::new(Cursor::new(&bytes))
+                .map_err(|e| e.to_string())?
+                .spec();
+            let (rate, samples) = bank::decode_wav(&bytes)?;
+            // Match the renderer's existing f32 whole-cycle calculation. At
+            // 2370 RPM its four-second loop is 191999 frames, as in the legacy
+            // exporter; imposing a mathematical 192000 minimum rejects valid
+            // audio. Exact per-knot length still rejects truncated recordings.
+            let cycle = 48_000. * 120. / rpm as f32;
+            let expected_frames = (cycle * (nominal_frames as f32 / cycle).ceil()) as usize;
+            if spec.channels != 1
+                || rate != 48_000
+                || spec.bits_per_sample != 24
+                || spec.sample_format != hound::SampleFormat::Int
+                || samples.len() != expected_frames
+                || samples.iter().any(|x| !x.is_finite())
+            {
+                return Err(format!("Invalid generated recording: {path}"));
+            }
+        }
+    }
+    if paths.len() != expected_loops {
+        return Err("Incomplete generated loop coverage".into());
+    }
+    Ok(())
+}
+
 /// Per-knot level calibration for the selectable two-emitter export only.
 /// RMS inputs are AC levels measured after subtracting each signal's mean.
 /// Inputs must first pass `signal_stats`. Absolute peak safety takes precedence over
@@ -366,6 +473,9 @@ fn render_stems_controlled(
     p.load = load;
     p.volume = 0.8;
     p.validate()?;
+    // Export calibration sees the unattenuated physical stems. The final PCM
+    // receives master_gain once, after its common and per-emitter gains.
+    p.master_gain = 1.;
     (h, _) = resolved_settings(&bank, h)?;
     h.enhanced = true;
     h.level_match = false;
@@ -499,22 +609,30 @@ fn run_package(
     result
 }
 
-struct RenderPlan {
-    name: String,
-    rpm: f32,
-    load: f32,
+pub(crate) struct RenderPlan {
+    pub name: String,
+    pub rpm: f32,
+    pub load: f32,
 }
-struct RenderedLoop {
+pub(crate) struct RenderedLoop {
     index: usize,
-    samples: Vec<f32>,
-    exhaust_level_gain: Option<f32>,
+    pub samples: Vec<f32>,
+    pub engine: Option<Vec<f32>>,
+    pub exhaust_level_gain: Option<f32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    Mixed,
+    Exhaust,
+    TwoEmitters,
 }
 
 struct RenderContext<'a> {
     bank: &'a Arc<Bank>,
     parameters: Parameters,
     settings: Settings,
-    exhaust_only: bool,
+    mode: RenderMode,
     job: &'a ExportJob,
     abort: &'a AtomicBool,
 }
@@ -533,16 +651,24 @@ impl RenderContext<'_> {
             self.settings,
             plan.rpm,
             plan.load,
-            2.,
+            if self.mode == RenderMode::TwoEmitters {
+                4.
+            } else {
+                2.
+            },
             Some(RenderControl {
                 job,
                 abort: self.abort,
                 index,
             }),
         )?;
-        let mut rendered = if self.exhaust_only { stems.0 } else { stems.2 };
+        let mut rendered = if self.mode == RenderMode::Mixed {
+            stems.2
+        } else {
+            stems.0
+        };
         job.check()?;
-        let level_gain = if self.exhaust_only {
+        let level_gain = if self.mode != RenderMode::Mixed {
             let (source_rate, source) = source_wav(
                 source_zip.as_mut().ok_or("Missing calibration source")?,
                 &plan.name,
@@ -566,6 +692,7 @@ impl RenderContext<'_> {
         Ok(RenderedLoop {
             index,
             samples: rendered,
+            engine: (self.mode == RenderMode::TwoEmitters).then_some(stems.1),
             exhaust_level_gain: level_gain,
         })
     }
@@ -579,12 +706,45 @@ fn render_parallel(
     exhaust_only: bool,
     job: &ExportJob,
 ) -> Result<Vec<RenderedLoop>, String> {
+    render_parallel_mode(
+        plans,
+        bank,
+        p,
+        h,
+        if exhaust_only {
+            RenderMode::Exhaust
+        } else {
+            RenderMode::Mixed
+        },
+        job,
+    )
+}
+
+/// Render both independently routed stems in one engine pass per RPM/load knot.
+pub(crate) fn render_variant_stems(
+    plans: &[RenderPlan],
+    bank: Arc<Bank>,
+    p: Parameters,
+    h: Settings,
+    job: &ExportJob,
+) -> Result<Vec<RenderedLoop>, String> {
+    render_parallel_mode(plans, bank, p, h, RenderMode::TwoEmitters, job)
+}
+
+fn render_parallel_mode(
+    plans: &[RenderPlan],
+    bank: Arc<Bank>,
+    p: Parameters,
+    h: Settings,
+    mode: RenderMode,
+    job: &ExportJob,
+) -> Result<Vec<RenderedLoop>, String> {
     let workers = job.worker_count(plans.len());
     job.begin(
         ExportStage::Rendering,
         plans.len(),
         workers,
-        "Generating replacement engine loops",
+        "Generating engine sound loops",
     );
     let next = AtomicUsize::new(0);
     let abort = AtomicBool::new(false);
@@ -599,7 +759,7 @@ fn render_parallel(
                 .name(format!("bess-export-{worker}"))
                 .spawn_scoped(scope, move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut source_zip = if exhaust_only {
+                        let mut source_zip = if mode != RenderMode::Mixed {
                             Some(
                                 zip::ZipArchive::new(
                                     File::open(&bank.source.archive).map_err(|e| e.to_string())?,
@@ -614,7 +774,7 @@ fn render_parallel(
                             bank: &bank,
                             parameters: p,
                             settings: h,
-                            exhaust_only,
+                            mode,
                             job,
                             abort,
                         };
@@ -682,13 +842,13 @@ fn render_parallel(
 
 /// Only paths reserved by this export are removed after failure/cancellation.
 /// A caller-owned folder or a file added by another process is never traversed.
-struct OutputFiles {
+pub(crate) struct OutputFiles {
     dir: PathBuf,
     paths: Vec<PathBuf>,
     complete: bool,
 }
 impl OutputFiles {
-    fn create(dir: &Path) -> Result<Self, String> {
+    pub(crate) fn create(dir: &Path) -> Result<Self, String> {
         fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -696,7 +856,7 @@ impl OutputFiles {
             complete: false,
         })
     }
-    fn reserve(&mut self, name: &str) -> Result<File, String> {
+    pub(crate) fn reserve(&mut self, name: &str) -> Result<File, String> {
         let path = self.dir.join(name);
         let file = fs::OpenOptions::new()
             .write(true)
@@ -706,10 +866,38 @@ impl OutputFiles {
         self.paths.push(path);
         Ok(file)
     }
-    fn write(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn write(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
         self.reserve(name)?
             .write_all(bytes)
             .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn publish(&mut self, partial: &str, name: &str) -> Result<String, String> {
+        let target = self.dir.join(name);
+        let source = self.dir.join(partial);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn MoveFileExW(source: *const u16, target: *const u16, flags: u32) -> i32;
+            }
+            let source: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
+            let target: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
+            // No REPLACE_EXISTING flag: publish atomically without overwriting
+            // a foreign file, including on volumes without hard-link support.
+            // SAFETY: both pointers remain valid NUL-terminated UTF-16 here.
+            if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        #[cfg(not(windows))]
+        fs::hard_link(&source, &target).map_err(|e| e.to_string())?;
+        self.paths.push(target);
+        #[cfg(not(windows))]
+        fs::remove_file(source).map_err(|e| e.to_string())?;
+        self.complete = true;
+        Ok(name.to_owned())
     }
 }
 impl Drop for OutputFiles {
@@ -850,6 +1038,9 @@ fn package_inner(
         return Err("Silent or non-finite rendering".into());
     }
     let gain = exhaust_safety_gain(peak);
+    // The intermediate exhaust archive feeds the legacy two-emitter calibrator;
+    // its master attenuation belongs to the final variant, not this input.
+    let final_master_gain = if exhaust_only { 1. } else { p.master_gain };
     let zip_name = package_name(&bank);
     job.check()?;
     job.begin(
@@ -898,11 +1089,12 @@ fn package_inner(
                 output
                     .start_file(entry.name(), options)
                     .map_err(|e| e.to_string())?;
-                output.write_all(wav.get_ref()).map_err(|e| e.to_string())?;
+                let wav = apply_master_gain(wav.into_inner(), final_master_gain)?;
+                output.write_all(&wav).map_err(|e| e.to_string())?;
                 if let Some(handoff) = &mut handoff {
-                    handoff.record_rendered(entry.name(), wav.get_ref())?;
+                    handoff.record_rendered(entry.name(), &wav)?;
                 }
-                let mut measurement = json!({"path":entry.name(),"frames":samples.len(),"seam":(samples[0]-samples[samples.len()-1]).abs()*gain});
+                let mut measurement = json!({"path":entry.name(),"frames":samples.len(),"seam":(samples[0]-samples[samples.len()-1]).abs()*gain*final_master_gain});
                 if let Some(level_gain) = exhaust_level_gains.get(entry.name()) {
                     measurement["exhaust_level_gain"] = json!(level_gain);
                 }
@@ -937,15 +1129,16 @@ fn package_inner(
             workers,
             "Reopening the generated vehicle ZIP",
         );
-        // Reimport the real produced archive, not only an in-memory rendering.
-        let check = Bank::load(&partial, Some(&bank.source.blend))?;
-        job.check()?;
-        if check.layers.iter().map(Vec::len).sum::<usize>() != replacements.len() {
-            return Err("Incomplete loop coverage".into());
-        }
-        job.advance(1, "Generated sound archive reimported");
         let mut check_zip = zip::ZipArchive::new(File::open(&partial).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
+        verify_generated_bank(
+            &mut check_zip,
+            &bank.source.blend,
+            replacements.len(),
+            96_000,
+            job,
+        )?;
+        job.advance(1, "Generated sound archive verified");
         let mut check_info = Vec::new();
         check_zip
             .by_name(&info_path)
@@ -979,6 +1172,8 @@ fn package_inner(
             "settings":h,
             "parameters":p,
             "gain":gain,
+            "master_gain":p.master_gain,
+            "master_gain_applied":!exhaust_only,
             "loops":measurements,
             "render_channel":if exhaust_only {"exhaust"} else {"mixed"},
             "babm_export":handoff,
@@ -992,7 +1187,7 @@ fn package_inner(
             "physical_warmup":"at least 2 seconds, whole 720-degree cycles",
             "exhaust_level_reference":if exhaust_only {"estimated post-80-Hz low-cut RMS; absolute PCM peak still bounds gain"} else {"unfiltered AC RMS"},
             "runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.",
-            "validation":"BESS reimported the generated archive; testing in BeamNG is still required"
+            "validation":"BESS verified the generated PCM recordings and blend coverage; testing in BeamNG is still required"
         });
         job.check()?;
         files.write(

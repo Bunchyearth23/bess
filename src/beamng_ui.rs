@@ -429,6 +429,7 @@ impl App {
     pub(super) fn can_export_beamng(&self) -> bool {
         self.bank.is_some()
             && self.engine_draft_valid()
+            && project::validate_profile_name(&self.profile_name).is_ok()
             && self.worker.is_none()
             && self.level_worker.is_none()
             && self.importer.is_none()
@@ -441,7 +442,7 @@ impl App {
             if ui
                 .add_enabled(
                     self.can_export_beamng() && self.beamng_workspace.worker.is_none(),
-                    egui::Button::new("Export vehicle ZIP"),
+                    egui::Button::new("Export vehicle + BESS variant ZIP"),
                 )
                 .clicked()
             {
@@ -458,7 +459,7 @@ impl App {
             .clicked()
             && let Some(path) = self
                 .beamng_file_dialog()
-                .set_title("Choose where BESS writes complete vehicle ZIPs")
+                .set_title("Choose where BESS writes the original vehicle and BESS variant ZIP")
                 .pick_folder()
         {
             let mods = self
@@ -481,7 +482,7 @@ impl App {
                 Err(error) => self.status = format!("Export folder: {error}"),
             }
         }
-        ui.small("Creates a complete vehicle ZIP. BABM finds this export under BESS sounds and can apply it to the matching vehicle or grouped pack.");
+        ui.small("Creates one complete vehicle ZIP with the original configuration and a separate BESS configuration. BABM can merge it with your other variants.");
         if let Some(directory) = self.babm_export_directory() {
             ui.small(format!("BABM export folder: {}", folder_label(directory)));
         }
@@ -519,7 +520,7 @@ impl App {
         let mut command = self.babm_command(&companion);
         self.status = match command.spawn() {
             Ok(_) => {
-                "BABM opened. Review the matching vehicle under BESS sounds, then apply the export."
+                "BABM opened. Under BESS sounds, choose Import BESS variant for the matching vehicle or grouped pack."
                     .into()
             }
             Err(error) => format!("Could not open BABM: {error}"),
@@ -558,12 +559,13 @@ impl App {
         let bank = self.bank.clone().unwrap();
         let p = self.params;
         let h = self.settings.for_beamng_export();
+        let profile = self.profile_name.trim().to_owned();
         let (tx, rx) = mpsc::channel();
         self.beamng_workspace.pending_export_dir = Some(parent.clone());
         let job = ExportJob::default();
         self.beamng_workspace.export_job = Some(job.clone());
         self.worker = Some(rx);
-        self.status = "Creating and verifying the complete vehicle ZIP…".into();
+        self.status = format!("Creating the complete vehicle ZIP with BESS variant ‘{profile}’…");
         std::thread::spawn(move || {
             let result = (|| {
                 std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
@@ -575,7 +577,7 @@ impl App {
                         .map_err(|e| e.to_string())?
                         .as_nanos()
                 ));
-                bess::export::package_with_job(&folder, p, h, bank, &job)
+                bess::variant::package_complete_with_job(&folder, p, h, bank, &profile, &job)
             })();
             let _ = tx.send(result);
         });
@@ -838,11 +840,12 @@ mod tests {
         let bank = Arc::new(Bank::load(&source, None).unwrap());
         let job = ExportJob::default();
         job.cancel();
-        let result = bess::export::package_with_job(
+        let result = bess::variant::package_complete_with_job(
             &destination,
             Parameters::default(),
             Settings::default(),
             bank,
+            "Cancelled test variant",
             &job,
         );
         assert!(result.is_err());

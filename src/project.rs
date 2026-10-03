@@ -14,7 +14,13 @@ pub struct Parameters {
     pub brightness: f32,
     pub resonance: f32,
     pub pipe_length: f32,
+    /// Final BESS engine level, independent of listening volume and original A.
+    #[serde(default = "default_master_gain")]
+    pub master_gain: f32,
     pub volume: f32,
+}
+fn default_master_gain() -> f32 {
+    1.
 }
 impl Default for Parameters {
     fn default() -> Self {
@@ -29,6 +35,7 @@ impl Default for Parameters {
             brightness: 2600.0,
             resonance: 1.2,
             pipe_length: 1.8,
+            master_gain: default_master_gain(),
             volume: 0.35,
         }
     }
@@ -50,6 +57,7 @@ impl Parameters {
             ("Brightness", self.brightness, 200., 10000.),
             ("Resonance", self.resonance, 0.5, 4.),
             ("Length", self.pipe_length, 0.2, 5.),
+            ("BESS master gain", self.master_gain, 0., 1.),
             ("Volume", self.volume, 0., 1.),
         ] {
             if !v.is_finite() || v < min || v > max {
@@ -205,6 +213,42 @@ pub fn load_project(path: &Path) -> Result<Project, String> {
 mod tests {
     use super::*;
     use crate::{bank::SourceRef, engine_definition::EngineDefinition, scratch::Scratch};
+
+    #[test]
+    fn master_gain_defaults_for_legacy_projects_and_persists_valid_limits() {
+        for version in 1..=4 {
+            let mut legacy = serde_json::to_value(project(version)).unwrap();
+            legacy["parameters"]
+                .as_object_mut()
+                .unwrap()
+                .remove("master_gain");
+            let mut loaded: Project = serde_json::from_value(legacy).unwrap();
+            loaded.normalize().unwrap();
+            loaded.validate().unwrap();
+            assert_eq!(loaded.parameters.master_gain, 1.);
+        }
+        for gain in [0., 0.5, 1.] {
+            let mut saved = project(4);
+            saved.parameters.master_gain = gain;
+            let mut loaded: Project =
+                serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+            loaded.normalize().unwrap();
+            loaded.validate().unwrap();
+            assert_eq!(loaded.parameters.master_gain, gain);
+            assert_eq!(loaded.parameters.volume, saved.parameters.volume);
+        }
+        for gain in [-0.01, 1.01, f32::NAN, f32::INFINITY] {
+            assert!(
+                Parameters {
+                    master_gain: gain,
+                    ..Parameters::default()
+                }
+                .validate()
+                .unwrap_err()
+                .contains("master gain")
+            );
+        }
+    }
 
     fn project(version: u32) -> Project {
         Project {

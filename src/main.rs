@@ -865,17 +865,29 @@ impl App {
             ui.small("Import an Automation vehicle ZIP to re-export the complete vehicle. Free engines can be exported as WAV below.");
             return;
         }
-        ui.small("Re-exports the complete imported vehicle with the current physical engine sound. Original vehicle files and sound paths are preserved in the copy; the source archive stays intact.");
+        ui.small("Exports the complete vehicle with its original configuration and an independent BESS sound configuration. The original sounds and source archive stay intact.");
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("BESS variant name");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile_name)
+                    .hint_text("Natural")
+                    .desired_width(230.),
+            )
+            .labelled_by(label.id);
+        });
+        if let Err(error) = project::validate_profile_name(&self.profile_name) {
+            ui.colored_label(Color32::YELLOW, error);
+        }
         self.beamng_export_destination_controls(ui);
         if ui
             .add_enabled(
                 self.can_export_beamng(),
-                egui::Button::new("Export vehicle ZIP elsewhere…"),
+                egui::Button::new("Export vehicle + BESS variant ZIP elsewhere…"),
             )
             .clicked()
             && let Some(dir) = self
                 .beamng_file_dialog()
-                .set_title("Choose a folder for the complete vehicle export")
+                .set_title("Choose a folder for the original vehicle and BESS variant ZIP")
                 .pick_folder()
         {
             self.start_beamng_export(dir);
@@ -892,13 +904,13 @@ impl App {
                 engine.experimental.coupled_level_db,
             ));
         }
-        ui.small("In BABM, refresh BESS sounds and apply the export to its vehicle or grouped pack. For a direct game test without BABM, enable only the exported copy. Regenerate the ZIP after changing the sound.");
+        ui.small("In BeamNG, choose the BESS configuration to hear this sound; the original configuration keeps its original sound. BABM handles merging this ZIP with your other variants. For a direct game test, enable only the exported copy. Export again after changing the sound.");
     }
 
     fn addon_level_controls(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.strong("Two-emitter add-on volume estimate");
-                ui.small("This analysis is for optional two-emitter add-ons. The complete-vehicle ZIP uses a combined mix through the original vehicle sound routing.");
+                ui.strong("BESS variant volume estimate");
+                ui.small("Estimates the engine and exhaust emitters of the selectable BESS configuration. The original configuration is unchanged.");
                 if ui
                     .add_enabled(
                         self.bank.is_some()
@@ -907,7 +919,7 @@ impl App {
                             && self.level_worker.is_none()
                             && self.worker.is_none()
                             && self.importer.is_none(),
-                        egui::Button::new("Calculate add-on levels"),
+                        egui::Button::new("Calculate BESS variant levels"),
                     )
                     .clicked()
                 {
@@ -1069,6 +1081,14 @@ impl App {
     }
     fn listen_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Sound comparison bench");
+        slider_help(
+            ui,
+            "Engine sound gain",
+            &mut self.params.master_gain,
+            0.0..=1.0,
+            "Overall BESS sound in listening and exports. 0 = silence; 1 = current level. The original Automation reference and listening volume are separate.",
+        );
+        ui.small("0 = silence · 1 = current level. Applies to BESS listening and exports.");
         let rpm = self
             .audio
             .as_ref()
@@ -1178,12 +1198,12 @@ impl App {
                     ui.selectable_value(
                         &mut self.audition_mix,
                         AuditionMix::BeamNgTwoEmitter,
-                        "Two-emitter add-on preview",
+                        "BESS variant preview",
                     );
                     ui.selectable_value(&mut self.audition_mix, AuditionMix::Live, "BESS live mix");
                 });
                 if self.audition_mix == AuditionMix::BeamNgTwoEmitter {
-                    ui.small("Add-on preview only; complete-vehicle export follows the original sound routing.");
+                    ui.small("Preview of the selectable BESS configuration with separate engine and exhaust emitters.");
                     ui.small(self.camera.description());
                     if let Some(audio) = &self.audio {
                         let peak = f32::from_bits(audio.meter.peak.load(Ordering::Relaxed));
@@ -3027,7 +3047,7 @@ impl eframe::App for App {
             let scroll_to_export = ui.horizontal(|ui| {
                 let clicked = ui.button("BeamNG export").clicked();
                 ui.small(if self.bank.is_some() {
-                    "Export the complete vehicle with the current engine sound."
+                    "Export the vehicle with its original sound and a selectable BESS variant."
                 } else {
                     "Requires an imported Automation vehicle."
                 });
@@ -3209,7 +3229,12 @@ fn main() -> eframe::Result {
     if matches!(
         args.get(1).map(String::as_str),
         Some(
-            "--compare" | "--drive-demo" | "--beamng" | "--beamng-profile" | "--beamng-replacement"
+            "--compare"
+                | "--drive-demo"
+                | "--beamng"
+                | "--beamng-profile"
+                | "--beamng-replacement"
+                | "--beamng-complete"
         )
     ) {
         let result = (|| {
@@ -3243,6 +3268,19 @@ fn main() -> eframe::Result {
                 bess::variant::package(Path::new(dir), params, settings, bank)
             } else if args[1] == "--beamng-replacement" {
                 bess::export::package(Path::new(dir), params, settings, bank)
+            } else if args[1] == "--beamng-complete" {
+                let profile = args
+                    .get(4)
+                    .cloned()
+                    .unwrap_or_else(project::default_profile_name);
+                bess::variant::package_complete_with_job(
+                    Path::new(dir),
+                    params,
+                    settings,
+                    bank,
+                    &profile,
+                    &bess::export_job::ExportJob::default(),
+                )
             } else if args[1] == "--drive-demo" {
                 render::drive_demo(Path::new(dir), params, bank)
             } else {

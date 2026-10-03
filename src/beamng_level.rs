@@ -112,17 +112,25 @@ impl Stats {
         Self::measure(samples.iter().copied())
     }
 
+    #[cfg(test)]
     fn from_pcm24(samples: &[f32], gain: f32) -> Result<Self, String> {
+        Self::from_pcm24_with_master(samples, gain, 1.)
+    }
+
+    fn from_pcm24_with_master(
+        samples: &[f32],
+        gain: f32,
+        master_gain: f32,
+    ) -> Result<Self, String> {
         if !gain.is_finite() || gain < 0. {
             return Err("Invalid BeamNG export gain".into());
         }
         // Match hound's PCM24 write followed by Bank::decode_wav. The exhaust
         // is decoded by variant::build before the engine stem is balanced.
-        Self::measure(
-            samples
-                .iter()
-                .map(|&sample| ((sample * gain * PCM24_SCALE) as i32) as f32 / PCM24_DECODE_SCALE),
-        )
+        Self::measure(samples.iter().map(|&sample| {
+            let neutral = (sample * gain * PCM24_SCALE) as i32;
+            ((neutral as f32 * master_gain) as i32) as f32 / PCM24_DECODE_SCALE
+        }))
     }
 
     fn measure(samples: impl Iterator<Item = f32>) -> Result<Self, String> {
@@ -196,6 +204,14 @@ fn dbfs_allow_silence(value: f32) -> Result<f32, String> {
     } else {
         dbfs(value)
     }
+}
+
+fn measured_low_cut_rms(samples: &[f32]) -> Result<f32, String> {
+    use bdsp::svf::{StateVariableFilter, SvfMode};
+    let mut filter = StateVariableFilter::new(48_000., 80., 0.707, SvfMode::Highpass);
+    // Unlike calibration, file measurement accepts intentionally quiet/silent
+    // PCM after master attenuation, including values below the calibration floor.
+    Ok(Stats::measure(samples.iter().map(|&sample| filter.next_sample(sample)))?.rms)
 }
 
 /// Render every original blend point using the variant export's audio path.
@@ -299,10 +315,10 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
                 })
                 .collect::<Vec<_>>()
         };
-        let exhaust = Stats::from_samples(&exhaust_pcm)?;
+        let neutral_exhaust = Stats::from_samples(&exhaust_pcm)?;
         let engine_raw = Stats::from_samples(&item.engine)?;
         let engine_gain = variant::engine_stem_gain(
-            exhaust.raw_rms,
+            neutral_exhaust.raw_rms,
             engine_raw.raw_rms,
             engine_raw.peak,
             item.load,
@@ -312,22 +328,35 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
         if engine_raw.peak * engine_gain > 0.951 {
             return Err("Engine stem would clip PCM24".into());
         }
-        let engine = Stats::from_pcm24(&item.engine, engine_gain)?;
+        // Calibrate both emitters at unity, then attenuate their encoded PCM24
+        // integers once, matching export::apply_master_gain exactly.
+        let exhaust_pcm: Vec<_> = exhaust_pcm
+            .iter()
+            .map(|&sample| {
+                ((sample * PCM24_DECODE_SCALE * p.master_gain) as i32) as f32 / PCM24_DECODE_SCALE
+            })
+            .collect();
+        let exhaust = Stats::from_samples(&exhaust_pcm)?;
+        let engine = Stats::from_pcm24_with_master(&item.engine, engine_gain, p.master_gain)?;
         let source_rms_dbfs = dbfs(item.source.rms)?;
-        let exhaust_rms_dbfs = dbfs(exhaust.rms)?;
+        let exhaust_rms_dbfs = dbfs_allow_silence(exhaust.rms)?;
         let engine_rms_dbfs = dbfs_allow_silence(engine.rms)?;
-        let exhaust_vs_source_db =
-            dbfs(export::low_cut_rms(&exhaust_pcm, 48_000)?)? - dbfs(item.source_post_low_cut_rms)?;
+        let exhaust_vs_source_db = dbfs_allow_silence(measured_low_cut_rms(&exhaust_pcm)?)?
+            - dbfs(item.source_post_low_cut_rms)?;
         points.push(Point {
             rpm: item.rpm,
             load: item.load,
             source_rms_dbfs,
             exhaust_rms_dbfs,
             engine_rms_dbfs,
-            exhaust_peak_dbfs: dbfs(exhaust.peak)?,
+            exhaust_peak_dbfs: dbfs_allow_silence(exhaust.peak)?,
             engine_peak_dbfs: dbfs_allow_silence(engine.peak)?,
             exhaust_vs_source_db,
-            engine_vs_exhaust_db: engine_rms_dbfs - exhaust_rms_dbfs,
+            engine_vs_exhaust_db: if exhaust.rms == 0. {
+                f32::NEG_INFINITY
+            } else {
+                engine_rms_dbfs - exhaust_rms_dbfs
+            },
         });
     }
     Ok(Report {
@@ -367,10 +396,20 @@ mod tests {
             }
             writer.finalize().unwrap();
         }
-        let (_, decoded) = bank::decode_wav(&wav.into_inner()).unwrap();
+        let bytes = wav.into_inner();
+        let (_, decoded) = bank::decode_wav(&bytes).unwrap();
         let actual = Stats::from_samples(&decoded).unwrap();
         assert!((measured.rms - actual.rms).abs() < 1e-8);
         assert_eq!(measured.peak, actual.peak);
+        for master in [0., 0.000_001, 0.5, 1.] {
+            let final_bytes = export::apply_master_gain(bytes.clone(), master).unwrap();
+            let (_, decoded) = bank::decode_wav(&final_bytes).unwrap();
+            let actual = Stats::from_samples(&decoded).unwrap();
+            let measured = Stats::from_pcm24_with_master(&samples, gain, master).unwrap();
+            assert_eq!(measured.rms, actual.rms);
+            assert_eq!(measured.peak, actual.peak);
+            assert!(measured_low_cut_rms(&decoded).unwrap().is_finite());
+        }
     }
 
     #[test]
@@ -466,8 +505,12 @@ mod tests {
             ..Settings::default()
         };
         let output = work.join("variant");
-        variant::package(&output, Parameters::default(), settings, bank.clone()).unwrap();
-        let report = analyze(bank.clone(), Parameters::default(), settings).unwrap();
+        let params = Parameters {
+            master_gain: 0.5,
+            ..Parameters::default()
+        };
+        variant::package(&output, params, settings, bank.clone()).unwrap();
+        let report = analyze(bank.clone(), params, settings).unwrap();
         assert_eq!(report.engine, engine);
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output.join("manifest.json")).unwrap()).unwrap();
@@ -486,6 +529,7 @@ mod tests {
         );
         assert_eq!(manifest["loop_policy"]["mode"], "stationary_rpm_load_loops");
         let saved = crate::project::load_project(&output.join("settings.bess.json")).unwrap();
+        assert_eq!(saved.parameters.master_gain, 0.5);
         assert_eq!(saved.hybrid.engine, Some(engine));
         assert_eq!(saved.hybrid.engine_baseline, Some(saved_baseline));
 
@@ -525,7 +569,7 @@ mod tests {
         assert_eq!(physical["torque"][2][1], 170);
         assert_eq!(physical["afterFireAudioCoef"], 1.7);
         let muted = analyze(
-            bank,
+            bank.clone(),
             Parameters::default(),
             Settings {
                 engine_gain: 0.,
@@ -536,6 +580,24 @@ mod tests {
         for point in muted.points {
             assert_eq!(point.engine_rms_dbfs, f32::NEG_INFINITY);
             assert_eq!(point.engine_peak_dbfs, f32::NEG_INFINITY);
+            assert_eq!(point.engine_vs_exhaust_db, f32::NEG_INFINITY);
+        }
+        let muted = analyze(
+            bank,
+            Parameters {
+                master_gain: 0.,
+                ..params
+            },
+            settings,
+        )
+        .unwrap();
+        for point in muted.points {
+            assert!(point.source_rms_dbfs.is_finite());
+            assert_eq!(point.exhaust_rms_dbfs, f32::NEG_INFINITY);
+            assert_eq!(point.engine_rms_dbfs, f32::NEG_INFINITY);
+            assert_eq!(point.exhaust_peak_dbfs, f32::NEG_INFINITY);
+            assert_eq!(point.engine_peak_dbfs, f32::NEG_INFINITY);
+            assert_eq!(point.exhaust_vs_source_db, f32::NEG_INFINITY);
             assert_eq!(point.engine_vs_exhaust_db, f32::NEG_INFINITY);
         }
         assert_eq!(std::fs::read(&source).unwrap(), before);

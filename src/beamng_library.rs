@@ -348,8 +348,8 @@ fn inspect_archive(path: PathBuf, hidden_backup: bool) -> Option<(VehicleArchive
         .iter()
         .filter_map(|member| normalized_member(&member.name))
         .collect();
-    // A rendered full vehicle is valid for manual project reopening, but must
-    // not displace an untouched original in the automatic reference library.
+    // Both replacement exports and original-plus-BESS-variant vehicle ZIPs
+    // must not displace an untouched original in the reference library.
     if names.iter().any(|name| name == "bess-export.json") {
         return None;
     }
@@ -662,6 +662,48 @@ mod tests {
                 .iter()
                 .all(|vehicle| vehicle.path.file_name().unwrap() != "rendered.zip")
         );
+    }
+
+    #[test]
+    fn library_preserves_original_reference_beside_a_complete_selectable_variant() {
+        let directory = Directory::new();
+        let source = directory.0.join("original.zip");
+        original(&source, br#"{"Name":"Original reference"}"#);
+        let entries: Vec<(&str, &[u8])> = vec![
+            ("vehicles/test/test.car", b"Automation metadata"),
+            ("vehicles/test/eng_694e8/camso_engine_694e8.jbeam", b"{}"),
+            ("vehicles/test/test.pc", b"{}"),
+            (
+                "art/sound/blends/694E80154252F6189DE80988120C7F13.sfxBlend2D.json",
+                b"{}",
+            ),
+            (
+                "vehicles/test/info.json",
+                br#"{"Name":"Original reference"}"#,
+            ),
+            ("vehicles/test/bess_engine_natural.jbeam", b"{}"),
+            ("vehicles/test/bess_natural.pc", b"{}"),
+            (
+                "art/sound/blends/694E80154252F6189DE80988120C7F13_BESS_natural.sfxBlend2D.json",
+                b"{}",
+            ),
+            (
+                "art/sound/blends/694E80154252F6189DE80988120C7F13_BESS_natural_engine.sfxBlend2D.json",
+                b"{}",
+            ),
+        ];
+        archive(&directory.0.join("complete-without-marker.zip"), &entries);
+        let mut marked = entries;
+        marked.push((
+            "bess-export.json",
+            br#"{"version":1,"kind":"bess-variant-vehicle"}"#,
+        ));
+        archive(&directory.0.join("complete-with-marker.zip"), &marked);
+        let found = scan_automation_archives(&directory.0).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, source);
+        assert_eq!(found[0].name, "Original reference");
+        assert!(found[0].unavailable_reason.is_none());
     }
 
     #[test]

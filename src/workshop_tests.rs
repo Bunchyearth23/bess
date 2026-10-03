@@ -15,6 +15,71 @@ fn imported_app(ctx: &egui::Context) -> App {
 }
 
 #[test]
+fn selectable_bess_variant_name_is_visible_persisted_and_required_for_export() {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = imported_app(&ctx);
+    app.profile_name = "Road tune".into();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| app.beamng_export_controls(ui, false));
+    });
+    let update = output.platform_output.accesskit_update.unwrap();
+    assert!(
+        update
+            .nodes
+            .iter()
+            .any(|(_, node)| node.value() == Some("BESS variant name"))
+    );
+    assert!(
+        update
+            .nodes
+            .iter()
+            .any(|(_, node)| node.value() == Some("Road tune"))
+    );
+    let export = update
+        .nodes
+        .iter()
+        .map(|(_, node)| node)
+        .find(|node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.label() == Some("Export vehicle + BESS variant ZIP elsewhere…")
+        })
+        .expect("imported engine exposes the complete selectable variant export");
+    assert!(!export.is_disabled());
+    assert!(update.nodes.iter().any(|(_, node)| {
+        node.value()
+            .is_some_and(|text| text.contains("original configuration keeps its original sound"))
+    }));
+    let saved = serde_json::to_string(&app.project()).unwrap();
+    let restored: Project = serde_json::from_str(&saved).unwrap();
+    assert_eq!(restored.profile_name, "Road tune");
+    for invalid in [String::new(), "bad/name".into(), "a".repeat(49)] {
+        app.profile_name = invalid;
+        assert!(!app.can_export_beamng());
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.beamng_export_controls(ui, false));
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        let export = update
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| {
+                node.role() == egui::accesskit::Role::Button
+                    && node.label() == Some("Export vehicle + BESS variant ZIP elsewhere…")
+            })
+            .unwrap();
+        assert!(export.is_disabled());
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.value()
+                .is_some_and(|text| text.contains("Profile name must be"))
+        }));
+    }
+    app.profile_name = restored.profile_name;
+    assert!(app.can_export_beamng());
+}
+
+#[test]
 fn new_engine_mixes_mute_mechanics_and_saved_projects_keep_their_level() {
     use bess::engine_build::{Fuel, Head};
 
@@ -146,6 +211,7 @@ fn changing_engine_parts_preserves_vehicle_and_listening_settings() {
     params.exhaust = 0.43;
     params.intake = 0.27;
     params.mechanical = 0.19;
+    params.master_gain = 0.37;
     settings.fuel_cut = 0.36;
     scratch.idle_rpm = 812.;
     scratch.redline_rpm = 7123.;
@@ -153,6 +219,7 @@ fn changing_engine_parts_preserves_vehicle_and_listening_settings() {
     scratch.build.compression = 11.7;
     refresh_engine_build(&mut scratch, true, &mut settings, &mut params, &mut driving);
     assert_eq!(driving, vehicle);
+    assert_eq!(params.master_gain, 0.37);
     assert_eq!(
         (scratch.idle_rpm, scratch.redline_rpm, scratch.inertia),
         (812., 7123., 0.27)
@@ -180,6 +247,7 @@ fn changing_engine_parts_preserves_vehicle_and_listening_settings() {
 fn restoring_one_imported_section_keeps_other_edits() {
     let ctx = egui::Context::default();
     let mut app = imported_app(&ctx);
+    app.params.master_gain = 0.37;
     let baseline = app.settings.engine.unwrap();
     let mut edited = baseline;
     edited.build.compression = 11.7;
@@ -190,6 +258,39 @@ fn restoring_one_imported_section_keeps_other_edits() {
     let saved = app.project().hybrid.engine.unwrap();
     assert_eq!(saved.build, baseline.build);
     assert_eq!(saved.sound.exhaust_bass_db, 0.7);
+    assert_eq!(app.params.master_gain, 0.37);
+}
+
+#[test]
+fn engine_sound_gain_is_visible_saved_and_invalidates_export_levels() {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut app = imported_app(&ctx);
+    let original = app.level_key().unwrap();
+    app.params.master_gain = 0.37;
+    let scaled = app.level_key().unwrap();
+    assert!(scaled != original);
+    app.params.volume = 0.19;
+    assert!(app.level_key().unwrap() == scaled);
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| app.listen_controls(ui));
+    });
+    let update = output.platform_output.accesskit_update.unwrap();
+    assert_eq!(
+        update
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Slider
+                    && node.label() == Some("Engine sound gain")
+            })
+            .count(),
+        1
+    );
+    let saved = serde_json::to_string(&app.project()).unwrap();
+    let restored: Project = serde_json::from_str(&saved).unwrap();
+    assert_eq!(restored.parameters.master_gain, 0.37);
+    assert_eq!(restored.parameters.volume, 0.19);
 }
 
 #[test]
@@ -232,6 +333,7 @@ fn imported_workshop_retains_source_ab_controls_and_all_engine_controls() {
             .any(|label| label.contains("B · BESS physical engine")),
         "{labels:?}"
     );
+    assert!(labels.contains(&"BESS variant preview"), "{labels:?}");
     // Both origins render the same full editor; import adds only restoration
     // buttons and provenance, never replaces the engine controls with a subset.
     fn slider_count(ctx: &egui::Context, app: &mut App) -> usize {
@@ -292,7 +394,7 @@ fn imported_workshop_retains_source_ab_controls_and_all_engine_controls() {
         .map(|(_, node)| node)
         .find(|node| {
             node.role() == egui::accesskit::Role::Button
-                && node.label() == Some("Export vehicle ZIP elsewhere…")
+                && node.label() == Some("Export vehicle + BESS variant ZIP elsewhere…")
         })
         .expect("imported engines must expose BeamNG export");
     assert!(!export.is_disabled());
@@ -328,6 +430,6 @@ fn imported_workshop_retains_source_ab_controls_and_all_engine_controls() {
         update
             .nodes
             .iter()
-            .all(|(_, node)| node.label() != Some("Export vehicle ZIP elsewhere…"))
+            .all(|(_, node)| node.label() != Some("Export vehicle + BESS variant ZIP elsewhere…"))
     );
 }
