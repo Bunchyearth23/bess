@@ -1,4 +1,4 @@
-//! Forward-only listening-bench driveline, not a reconstruction of the imported car.
+//! Forward-only listening-bench driveline with optional imported vehicle parameters.
 //! A fixed 1 ms step couples engine and wheel inertias through a slipping clutch.
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,9 @@ pub struct Controls {
     pub wheel_radius: f32,
     pub final_drive: f32,
     pub ratios: [f32; 6],
+    /// The original six ratios retain their JSON layout for older projects.
+    pub gear_count: u8,
+    pub extra_ratios: [f32; 6],
 }
 impl Default for Controls {
     fn default() -> Self {
@@ -44,13 +47,56 @@ impl Default for Controls {
             wheel_radius: 0.32,
             final_drive: 3.7,
             ratios: [3.3, 2.1, 1.5, 1.15, 0.95, 0.78],
+            gear_count: 6,
+            extra_ratios: [0.65, 0.55, 0.46, 0.39, 0.33, 0.28],
         }
     }
 }
 impl Controls {
+    pub fn ratio(&self, index: usize) -> f32 {
+        if index < 6 {
+            self.ratios[index]
+        } else {
+            self.extra_ratios[index - 6]
+        }
+    }
+    pub fn set_ratio(&mut self, index: usize, value: f32) {
+        if index < 6 {
+            self.ratios[index] = value;
+        } else {
+            self.extra_ratios[index - 6] = value;
+        }
+    }
+    /// Keep hidden user/imported ratios when a smaller gearbox is restored.
+    /// Derive only newly activated ratios that no longer fit their predecessor.
+    pub fn set_gear_count(&mut self, count: u8) -> Result<(), String> {
+        if !(1..=12).contains(&count) {
+            return Err("Choose 1–12 forward gears".into());
+        }
+        let mut updated = *self;
+        for i in self.gear_count as usize..count as usize {
+            let previous = updated.ratio(i - 1);
+            let stored = updated.ratio(i);
+            let next = if stored.is_finite() && (0.05..=20.).contains(&stored) && stored < previous
+            {
+                stored
+            } else {
+                (previous * 0.85).max(0.05)
+            };
+            if next >= previous {
+                return Err("Increase the last ratio before adding another gear".into());
+            }
+            updated.set_ratio(i, next);
+        }
+        updated.gear_count = count;
+        updated.gear = updated.gear.min(count);
+        updated.validate()?;
+        *self = updated;
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), String> {
-        if self.gear > 6 {
-            return Err("Gear must be N or 1–6".into());
+        if !(1..=12).contains(&self.gear_count) || self.gear > self.gear_count {
+            return Err("Choose 1–12 forward gears and an available gear or N".into());
         }
         for (value, min, max) in [
             (self.throttle, 0., 1.),
@@ -61,19 +107,22 @@ impl Controls {
             (self.peak_torque_nm, 30., 2000.),
             (self.inertia, 0.1, 2.),
             (self.wheel_radius, 0.2, 0.6),
-            (self.final_drive, 1.5, 6.),
+            (self.final_drive, 0.5, 15.),
         ] {
             if !value.is_finite() || !(min..=max).contains(&value) {
                 return Err("Driving setting out of range".into());
             }
         }
-        if self
-            .ratios
-            .iter()
-            .any(|r| !r.is_finite() || !(0.4..=5.).contains(r))
-            || self.ratios.windows(2).any(|r| r[0] <= r[1])
-        {
-            return Err("The six gear ratios must decrease and stay between 0.4 and 5".into());
+        for i in 0..self.gear_count as usize {
+            let ratio = self.ratio(i);
+            if !ratio.is_finite()
+                || !(0.05..=20.).contains(&ratio)
+                || (i > 0 && self.ratio(i - 1) <= ratio)
+            {
+                return Err(
+                    "Forward gear ratios must decrease and stay between 0.05 and 20".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -155,7 +204,7 @@ impl Simulator {
         if gear == 0 {
             0.
         } else {
-            c.ratios[(gear - 1) as usize] * c.final_drive
+            c.ratio((gear.min(c.gear_count) - 1) as usize) * c.final_drive
         }
     }
     fn shift(&mut self, c: Controls, gear: u8) {
@@ -173,6 +222,7 @@ impl Simulator {
     }
     /// Controls have been validated at the transport boundary. No allocation.
     pub fn step(&mut self, c: Controls) -> State {
+        self.state.gear = self.state.gear.min(c.gear_count);
         let pending_safe = self.state.shift_rejected
             && c.gear != self.state.gear
             && self.wheel * Self::ratio(c, c.gear) <= self.maximum * 0.98;
@@ -189,7 +239,9 @@ impl Simulator {
         let ratio = Self::ratio(c, self.state.gear);
         if c.automatic && self.shift_cooldown == 0. {
             let coupled = self.wheel * ratio;
-            if self.omega > self.maximum * 0.87 && coupled > self.omega * 0.8 && self.state.gear < 6
+            if self.omega > self.maximum * 0.87
+                && coupled > self.omega * 0.8
+                && self.state.gear < c.gear_count
             {
                 self.shift(c, self.state.gear + 1);
             } else if self.omega < self.maximum * 0.34 && self.state.gear > 1 {
@@ -259,6 +311,7 @@ impl Simulator {
     /// A negative load means the wheels are back-driving the crank. For impulse
     /// consistency `c.inertia` must equal the physical crank's inertia.
     pub fn step_physical(&mut self, c: Controls, rpm: f32) -> (State, f64, f32) {
+        self.state.gear = self.state.gear.min(c.gear_count);
         self.omega = if rpm.is_finite() {
             rpm.max(0.) / RPM_PER_RAD
         } else {
@@ -280,7 +333,9 @@ impl Simulator {
         let ratio = Self::ratio(c, self.state.gear);
         if c.automatic && self.shift_cooldown == 0. {
             let coupled = self.wheel * ratio;
-            if self.omega > self.maximum * 0.87 && coupled > self.omega * 0.8 && self.state.gear < 6
+            if self.omega > self.maximum * 0.87
+                && coupled > self.omega * 0.8
+                && self.state.gear < c.gear_count
             {
                 self.shift(c, self.state.gear + 1);
             } else if self.omega < self.maximum * 0.34 && self.state.gear > 1 {
@@ -328,6 +383,57 @@ impl Simulator {
 #[cfg(test)]
 mod physical_tests {
     use super::*;
+
+    #[test]
+    fn old_projects_keep_six_gears_and_seven_gear_imports_drive() {
+        let old = serde_json::json!({"ratios": [3.3, 2.1, 1.5, 1.15, 0.95, 0.78]});
+        let c: Controls = serde_json::from_value(old).unwrap();
+        assert_eq!(c.gear_count, 6);
+        c.validate().unwrap();
+        let mut seven = Controls {
+            gear_count: 7,
+            gear: 7,
+            automatic: false,
+            ..c
+        };
+        for (i, value) in [2.17, 1.73, 1.34, 1.05, 0.85, 0.71, 0.60]
+            .into_iter()
+            .enumerate()
+        {
+            seven.set_ratio(i, value);
+        }
+        seven.validate().unwrap();
+        assert_eq!(Simulator::ratio(seven, 7), 0.60 * seven.final_drive);
+        let mut sim = Simulator::new(850., 7000., seven);
+        for _ in 0..1000 {
+            let (state, load, _) = sim.step_physical(seven, 2500.);
+            assert!(state.speed_kmh.is_finite() && load.is_finite());
+            assert_eq!(state.gear, 7);
+        }
+        seven.gear_count = 4;
+        seven.gear = 4;
+        assert_eq!(sim.step_physical(seven, 2500.).0.gear, 4);
+    }
+
+    #[test]
+    fn restoring_hidden_gears_preserves_imported_and_custom_ratios() {
+        let mut c = Controls::default();
+        c.set_ratio(6, 0.603);
+        c.set_gear_count(7).unwrap();
+        c.set_gear_count(4).unwrap();
+        c.set_gear_count(7).unwrap();
+        assert_eq!(c.ratio(6), 0.603);
+        c.set_ratio(7, 0.9); // This hidden ratio no longer fits below seventh.
+        c.set_gear_count(8).unwrap();
+        assert!(c.ratio(7) < c.ratio(6));
+        c.set_ratio(7, 0.05);
+        let before = c;
+        assert!(c.set_gear_count(9).is_err());
+        assert_eq!(
+            c, before,
+            "an impossible extension must not modify the gearbox"
+        );
+    }
 
     #[test]
     fn physical_rpm_is_never_restored_to_idle_or_clamped_to_redline() {

@@ -116,7 +116,8 @@ impl Exhaust {
     }
 }
 
-/// Reverberation time of a scratch exhaust network, seconds.
+/// Historical default propagation-loss duration, seconds. The complete
+/// network's measured tail also depends on its geometry and terminations.
 const NETWORK_T60: f32 = 0.12;
 
 /// Which parts sit between the collector and the tailpipe of a scratch engine.
@@ -143,6 +144,7 @@ struct Segment {
     /// Fraction of the header gas temperature (°C) this far downstream.
     cooling: f32,
     absorption: f32,
+    target_loss: f32,
 }
 
 /// Series of stages, each one or more parallel tubes, joined by N-port
@@ -161,6 +163,8 @@ pub struct ExhaustNetwork {
     arrivals: Vec<Vec<(f32, f32)>>,
     arrivals_prepared: bool,
     chamber_length_scale: f32,
+    decay_seconds: f32,
+    loss_fade_remaining: u32,
 }
 
 impl ExhaustNetwork {
@@ -172,6 +176,7 @@ impl ExhaustNetwork {
             role,
             cooling,
             absorption,
+            target_loss: 0.97,
         };
         let mut stages = vec![
             vec![segment(Role::Header, pipe, 1., 0.03)],
@@ -209,6 +214,8 @@ impl ExhaustNetwork {
             arrivals: stages.iter().map(|s| vec![(0., 0.); s.len()]).collect(),
             arrivals_prepared: false,
             chamber_length_scale: 1.,
+            decay_seconds: NETWORK_T60,
+            loss_fade_remaining: 0,
             stages,
             rate,
             inlet_reflection: 0.4,
@@ -228,7 +235,24 @@ impl ExhaustNetwork {
             1.
         };
     }
+    /// Acoustic loss duration, independent of any listening-room effect.
+    /// Call `tune` afterwards. Live changes interpolate per-pass losses over
+    /// 30 ms; initial tuning adopts the requested losses without a fade.
+    pub fn set_decay_ms(&mut self, decay_ms: f32) {
+        let seconds = if decay_ms.is_finite() {
+            decay_ms.clamp(10., 250.) / 1000.
+        } else {
+            NETWORK_T60
+        };
+        if seconds != self.decay_seconds {
+            self.decay_seconds = seconds;
+            self.loss_fade_remaining = (self.rate * 0.03).ceil().max(1.) as u32;
+        }
+    }
     pub fn tune(&mut self, g: Geometry, initial: bool) {
+        if initial {
+            self.loss_fade_remaining = 0;
+        }
         self.inlet_reflection = 0.1 + (g.resonance - 0.5) / 3.5 * 0.48;
         let radius = g.diameter_mm * 0.0005;
         let pipe = std::f32::consts::PI * radius * radius;
@@ -251,12 +275,18 @@ impl ExhaustNetwork {
                     Role::Chamber(_) => (s.absorption + g.absorption * 0.3).min(1.),
                     _ => s.absorption,
                 };
+                let previous_loss = s.tube.loss;
                 s.tube.tune(length, speed, self.rate, absorption, initial);
-                // Flow, heat and junction losses damp a real exhaust within a
-                // tenth of a second; near-lossless pipes rang for half a
-                // second and smeared every lift-off. Loss per pass for T60.
+                // User-selected propagation loss (10–250 ms). This per-pass
+                // T60 model damps acoustic memory; the full network's measured
+                // tail also depends on junctions, wall filters and radiation.
                 let pass = length / speed;
-                s.tube.loss = s.tube.loss.min(0.001f32.powf(pass / NETWORK_T60));
+                s.target_loss = s.tube.loss.min(0.001f32.powf(pass / self.decay_seconds));
+                s.tube.loss = if self.loss_fade_remaining == 0 {
+                    s.target_loss
+                } else {
+                    previous_loss
+                };
                 tail_speed = speed;
             }
         }
@@ -276,9 +306,14 @@ impl ExhaustNetwork {
         if !self.arrivals_prepared {
             for (stage, arrivals) in self.stages.iter_mut().zip(&mut self.arrivals) {
                 for (s, a) in stage.iter_mut().zip(arrivals.iter_mut()) {
+                    if self.loss_fade_remaining > 0 {
+                        s.tube.loss +=
+                            (s.target_loss - s.tube.loss) / self.loss_fade_remaining as f32;
+                    }
                     *a = s.tube.arrivals();
                 }
             }
+            self.loss_fade_remaining = self.loss_fade_remaining.saturating_sub(1);
             self.arrivals_prepared = true;
         }
         self.inlet_wave()
@@ -358,6 +393,132 @@ impl Intake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decay_fixture() -> Geometry {
+        Geometry {
+            header: 0.05,
+            tail: 1.4,
+            diameter_mm: 55.,
+            chamber_litres: 6.,
+            absorption: 0.4,
+            resonance: 1.,
+            temperature_c: 400.,
+        }
+    }
+
+    #[test]
+    fn exhaust_decay_orders_impulse_tails_at_native_and_double_rates() {
+        let geometry = decay_fixture();
+        for rate in [48000., 96000.] {
+            let mut fractions = Vec::new();
+            for decay in [10., 40., 120., 250.] {
+                let mut network = ExhaustNetwork::new(
+                    rate,
+                    geometry,
+                    ExhaustLayout {
+                        catalyst: false,
+                        muffler: 2,
+                    },
+                );
+                network.set_decay_ms(decay);
+                network.tune(geometry, true);
+                let (mut total, mut late) = (0_f64, 0_f64);
+                for i in 0..(rate * 0.5) as usize {
+                    let y = network.next(f32::from(i == 0));
+                    assert!(y.is_finite());
+                    let energy = f64::from(y).powi(2);
+                    total += energy;
+                    if i >= (rate * 0.05) as usize {
+                        late += energy;
+                    }
+                }
+                assert!(total > 0.);
+                fractions.push(late / total);
+            }
+            assert!(
+                fractions.windows(2).all(|w| w[0] < w[1]),
+                "{rate}: {fractions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exhaust_decay_live_retune_preserves_waves_and_ramps_losses() {
+        let geometry = decay_fixture();
+        let mut network = ExhaustNetwork::new(
+            48000.,
+            geometry,
+            ExhaustLayout {
+                catalyst: false,
+                muffler: 2,
+            },
+        );
+        for i in 0..4800 {
+            network.next((i as f32 * 0.07).sin() * 0.01);
+        }
+        let before: Vec<_> = network
+            .stages
+            .iter()
+            .flatten()
+            .map(|s| {
+                (
+                    s.tube.loss,
+                    s.tube.delay,
+                    s.tube.forward.read_at(10.),
+                    s.tube.backward.read_at(10.),
+                )
+            })
+            .collect();
+        let end_state = network.end_state;
+        network.set_decay_ms(10.);
+        network.tune(geometry, false);
+        assert_eq!(network.end_state, end_state);
+        for (s, &(loss, delay, forward, backward)) in network.stages.iter().flatten().zip(&before) {
+            assert_eq!(s.tube.loss.to_bits(), loss.to_bits());
+            assert_eq!(s.tube.delay.to_bits(), delay.to_bits());
+            assert_eq!(s.tube.forward.read_at(10.).to_bits(), forward.to_bits());
+            assert_eq!(s.tube.backward.read_at(10.).to_bits(), backward.to_bits());
+            assert!(s.target_loss < loss);
+        }
+        let total_steps = network.loss_fade_remaining;
+        network.next(0.);
+        for (s, &(loss, ..)) in network.stages.iter().flatten().zip(&before) {
+            assert!(s.tube.loss < loss && s.tube.loss > s.target_loss);
+            assert!((loss - s.tube.loss) < (loss - s.target_loss) * 0.002);
+        }
+        for _ in 1..total_steps {
+            assert!(network.next(0.).is_finite());
+        }
+        for s in network.stages.iter().flatten() {
+            assert_eq!(s.tube.loss.to_bits(), s.target_loss.to_bits());
+        }
+    }
+
+    #[test]
+    fn explicit_default_decay_is_bit_exact_and_repeated_set_is_inert() {
+        let geometry = decay_fixture();
+        let layout = ExhaustLayout {
+            catalyst: true,
+            muffler: 3,
+        };
+        let mut a = ExhaustNetwork::new(48000., geometry, layout);
+        let mut b = ExhaustNetwork::new(48000., geometry, layout);
+        b.set_decay_ms(120.);
+        assert_eq!(b.decay_seconds.to_bits(), NETWORK_T60.to_bits());
+        assert_eq!(b.loss_fade_remaining, 0);
+        for i in 0..12000 {
+            if i % 128 == 0 {
+                b.set_decay_ms(120.);
+                b.tune(geometry, false);
+            }
+            let x = if i < 4800 {
+                (i as f32 * 0.17).sin() * 0.01
+            } else {
+                0.
+            };
+            assert_eq!(a.next(x).to_bits(), b.next(x).to_bits());
+        }
+    }
     #[test]
     fn chamber_scaling_is_continuous_past_legacy_bounds_without_reset() {
         for diameter_mm in [35., 100.] {

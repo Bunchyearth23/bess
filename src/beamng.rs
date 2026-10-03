@@ -9,6 +9,7 @@ pub struct Vehicle {
     pub max_rpm: Option<f32>,
     pub cylinders: Option<u32>,
     pub engine_files: usize,
+    pub setup: crate::vehicle_setup::VehicleSetup,
 }
 // JBeam permits omitted commas. Lex quoted keys instead of treating it as JSON5.
 // This intentionally inspects literals only; it does not evaluate JBeam parts.
@@ -109,6 +110,7 @@ pub fn inspect(path: &Path) -> Result<Vehicle, String> {
         max_rpm: None,
         cylinders: None,
         engine_files: 0,
+        setup: crate::vehicle_setup::VehicleSetup::default(),
     };
     for i in 0..zip.len() {
         let entry = zip.by_index(i).map_err(|e| e.to_string())?;
@@ -156,6 +158,14 @@ pub fn inspect(path: &Path) -> Result<Vehicle, String> {
     result.cylinders = unique(&cylinders)
         .filter(|n| *n >= 1. && *n <= 12. && n.fract() == 0.)
         .map(|n| n as u32);
+    result.setup = crate::vehicle_setup::inspect(path).unwrap_or_else(|error| {
+        crate::vehicle_setup::VehicleSetup {
+            notes: vec![format!(
+                "Vehicle setup unavailable; bench estimates retained: {error}"
+            )],
+            ..Default::default()
+        }
+    });
     Ok(result)
 }
 

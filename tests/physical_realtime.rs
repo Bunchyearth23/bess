@@ -69,6 +69,7 @@ fn prepared_sound_retunes_preserve_running_bench_and_allocate_or_drop_no_buffers
         load_brightness_db: -2.,
         intake_length_m: 0.55,
         intake_resonance: 1.2,
+        intake_air_noise: 0.7,
         mechanical_pitch_hz: 1600.,
         mechanical_resonance: 3.,
         cycle_variation: 1.3,
@@ -76,6 +77,7 @@ fn prepared_sound_retunes_preserve_running_bench_and_allocate_or_drop_no_buffers
         ignition_retard_deg: 8.,
         primary_length_scale: 1.2,
         tail_length_m: 2.2,
+        exhaust_decay_ms: 40.,
         muffler_volume_scale: 1.8,
         muffler_absorption: 0.7,
         exhaust_body_db: 6.,
@@ -88,6 +90,9 @@ fn prepared_sound_retunes_preserve_running_bench_and_allocate_or_drop_no_buffers
     let mut prepared: Vec<_> = (0..4)
         .map(|i| {
             tuning.sound.bass_db = 6. + i as f32;
+            // Include both damping bounds and a return to the historical value;
+            // rapid prepared swaps must not allocate, reset, or destroy buffers.
+            tuning.sound.exhaust_decay_ms = [10., 40., 120., 250.][i];
             Some(ScratchModel::build(&tuning, 96_000).unwrap())
         })
         .collect();

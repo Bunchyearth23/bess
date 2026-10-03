@@ -135,6 +135,7 @@ struct TwoEmitterPreview {
     cam_cabin_amount: f32,
     cabin_filter: StateVariableFilter,
     limiter: crate::output_limiter::OutputLimiter,
+    room: Option<Box<RoomReverb>>,
 }
 
 impl TwoEmitterPreview {
@@ -162,6 +163,7 @@ impl TwoEmitterPreview {
             cam_cabin_amount: 0.,
             cabin_filter: StateVariableFilter::new(rate as f32, 1100., 0.707, SvfMode::Lowpass),
             limiter: crate::output_limiter::OutputLimiter::new(rate),
+            room: None,
         }
     }
 
@@ -235,7 +237,20 @@ impl TwoEmitterPreview {
             + cabin_muffled * self.cam_cabin_amount)
             * self.cam_overall_gain;
         let two_emitters = self.limiter.next(combined);
-        stems.mixed + (two_emitters - stems.mixed) * self.blend
+        let mixed = stems.mixed + (two_emitters - stems.mixed) * self.blend;
+        match &mut self.room {
+            // Room is an audition effect only. Keep the dry sample exact and
+            // cap exceptional reflected overloads after the normal limiters.
+            Some(room) => {
+                let reverberated = room.next(mixed);
+                if reverberated.to_bits() == mixed.to_bits() {
+                    mixed
+                } else {
+                    reverberated.clamp(-0.95, 0.95)
+                }
+            }
+            None => mixed,
+        }
     }
 }
 
@@ -357,16 +372,18 @@ impl Bench {
         bank: Option<Arc<Bank>>,
     ) -> Self {
         let rate = rate.max(8000);
-        let (min, max) = bank
-            .as_ref()
-            .map(|b| (b.min_rpm, b.max_rpm))
+        let (min, max) = settings
+            .engine
+            .map(|engine| (engine.idle_rpm, engine.redline_rpm))
+            .or_else(|| bank.as_ref().map(|b| (b.min_rpm, b.max_rpm)))
             .unwrap_or((300., 8000.));
         if controls.mode == Mode::Simulated {
             params.rpm = min;
             params.load = 0.1;
         }
         let engine = Hybrid::new(rate, params, settings, bank);
-        Self::with_engine(engine, rate, params, settings, controls, (min, max))
+        let range = engine.physical_range().unwrap_or((min, max));
+        Self::with_engine(engine, rate, params, settings, controls, range)
     }
     /// A bench around an engine designed from scratch, built by `ScratchModel::build`.
     pub fn from_scratch(
@@ -395,6 +412,10 @@ impl Bench {
         self.sim.set_range(model.idle_rpm, model.redline_rpm);
         self.max = model.redline_rpm;
         self.physical_idle_rpm = model.idle_rpm;
+        if self.physical.is_none() {
+            self.physics_accumulator = self.rate;
+            return self.engine.swap_model(model);
+        }
         if let (Some(current), Some(prepared)) = (&mut self.physical, &mut model.physical)
             && current.apply_sound_tuning(prepared)
         {
@@ -413,7 +434,9 @@ impl Bench {
         None
     }
     pub fn take_retired(&mut self) -> Option<ScratchVoice> {
-        self.retired_physical.take()
+        self.retired_physical
+            .take()
+            .or_else(|| self.engine.take_retired())
     }
     fn with_engine(
         engine: Hybrid,
@@ -454,15 +477,20 @@ impl Bench {
     pub fn set_audition_mix(&mut self, mix: AuditionMix) {
         self.audition_mix = mix;
     }
-    /// Give the scratch listener a room (default `Off`). Only the live audio
+    /// Give either listening origin a room (default `Off`). Only the live audio
     /// path calls this; renders and exports keep a room-free listener.
     pub fn enable_room(&mut self) {
         if let Some(listener) = &mut self.listener {
             listener.room = Some(Box::new(RoomReverb::new(self.rate)));
+        } else {
+            self.two_emitter_preview.room = Some(Box::new(RoomReverb::new(self.rate)));
         }
     }
     pub fn set_room(&mut self, room: Room, mix: f32) {
         if let Some(reverb) = self.listener.as_mut().and_then(|l| l.room.as_mut()) {
+            reverb.set(room, mix);
+        }
+        if let Some(reverb) = &mut self.two_emitter_preview.room {
             reverb.set(room, mix);
         }
     }
@@ -484,6 +512,7 @@ impl Bench {
             if let Some(outgoing) = &mut self.outgoing_physical {
                 outgoing.reset();
             }
+            self.engine.reset_physical();
         }
         self.params = p;
         self.settings = h;
@@ -496,6 +525,33 @@ impl Bench {
     pub fn next(&mut self, playing: bool) -> f32 {
         if self.physical.is_some() {
             return self.next_physical(playing);
+        }
+        if self.engine.physical_state().is_some() {
+            if self.update_physical_commands(playing) {
+                let p = Parameters {
+                    rpm: self
+                        .physical_commands
+                        .imposed_rpm
+                        .unwrap_or_else(|| {
+                            self.engine.physical_state().expect("physical voice").0.rpm
+                        })
+                        .max(200.) as f32,
+                    load: self.physical_commands.throttle as f32,
+                    ..self.params
+                };
+                self.engine.set(p, self.effective_settings());
+            }
+            let stems = self
+                .engine
+                .next_command_stems(playing, Some(self.physical_commands));
+            return self.two_emitter_preview.next(
+                stems,
+                self.engine.load(),
+                self.engine.inferred_layer_weight() * self.settings.engine_gain,
+                self.engine.export_stem_normalizer(),
+                self.engine.exhaust_export_normalizer(),
+                self.audition_mix == AuditionMix::BeamNgTwoEmitter && self.settings.enhanced,
+            );
         }
         if playing {
             if self.physics_accumulator >= self.rate {
@@ -544,11 +600,22 @@ impl Bench {
             let sample = physical.state();
             state.rpm = sample.rpm as f32;
             state.load = (sample.map_pa / 101325.).clamp(0., 1.) as f32;
+        } else if let Some((sample, _)) = self.engine.physical_state() {
+            state.rpm = sample.rpm as f32;
+            state.load = (sample.map_pa / 101325.).clamp(0., 1.) as f32;
         } else {
             state.rpm = self.engine.rpm();
             state.load = self.engine.load();
         }
         state
+    }
+
+    /// Physical telemetry is independent of the source-A/audition mix.
+    pub fn physical_state(&self) -> Option<PhysicalSample> {
+        self.physical
+            .as_ref()
+            .map(|engine| engine.state())
+            .or_else(|| self.engine.physical_state().map(|(sample, _)| sample))
     }
 
     pub fn initialization_error(&self) -> Option<&str> {
@@ -561,11 +628,18 @@ impl Bench {
             .map_or_else(|| self.engine.failed(), |engine| engine.failed())
     }
 
-    fn next_physical(&mut self, playing: bool) -> f32 {
+    /// One physical command scheduler for imported and newly designed engines.
+    fn update_physical_commands(&mut self, playing: bool) -> bool {
+        let mut updated = false;
         if playing {
             if self.physics_accumulator >= self.rate {
                 self.physics_accumulator -= self.rate;
-                let physical = self.physical.as_ref().expect("physical branch");
+                let (sample, inertia) = self
+                    .physical
+                    .as_ref()
+                    .map(|physical| (physical.state(), physical.inertia()))
+                    .or_else(|| self.engine.physical_state())
+                    .expect("physical branch");
                 self.physical_commands = match self.controls.mode {
                     Mode::Direct => PhysicalCommands {
                         imposed_rpm: Some(self.params.rpm as f64),
@@ -595,11 +669,10 @@ impl Bench {
                     }
                     Mode::Simulated => {
                         let c = Controls {
-                            inertia: physical.inertia() as f32,
+                            inertia: inertia as f32,
                             ..self.controls
                         };
-                        let (_, load_nm, throttle) =
-                            self.sim.step_physical(c, physical.state().rpm as f32);
+                        let (_, load_nm, throttle) = self.sim.step_physical(c, sample.rpm as f32);
                         PhysicalCommands {
                             imposed_rpm: None,
                             throttle: throttle as f64,
@@ -611,10 +684,16 @@ impl Bench {
                         }
                     }
                 };
+                updated = true;
             }
             self.physics_accumulator += TICK_RATE;
             self.frames += 1;
         }
+        updated
+    }
+
+    fn next_physical(&mut self, playing: bool) -> f32 {
+        self.update_physical_commands(playing);
         self.physical_gain += ((if playing { self.params.volume } else { 0. })
             - self.physical_gain)
             / (self.rate as f32 * 0.025);
@@ -632,7 +711,7 @@ impl Bench {
                 sample.exhaust = old.exhaust + (sample.exhaust - old.exhaust) * mix;
                 sample.intake = old.intake + (sample.intake - old.intake) * mix;
                 sample.mechanical = old.mechanical + (sample.mechanical - old.mechanical) * mix;
-                if mix >= 1. {
+                if mix >= 1. && self.retired_physical.is_none() {
                     self.retired_physical =
                         self.outgoing_physical.take().map(ScratchVoice::Physical);
                 }
@@ -661,6 +740,25 @@ impl Bench {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn disabled_imported_room_preserves_original_peaks_above_preview_ceiling() {
+        let mut dry = TwoEmitterPreview::new(48000);
+        let mut room = TwoEmitterPreview::new(48000);
+        room.room = Some(Box::new(RoomReverb::new(48000)));
+        for mixed in [0.99, -0.99, 0.96, -0.96, 0.] {
+            let stems = HybridStems {
+                exhaust: 0.,
+                engine: 0.,
+                source_reference: mixed,
+                mixed,
+            };
+            assert_eq!(
+                dry.next(stems, 0., 1., 1., 1., false).to_bits(),
+                room.next(stems, 0., 1., 1., 1., false).to_bits(),
+            );
+        }
+    }
 
     #[test]
     fn scratch_ground_reflection_keeps_its_delay_at_double_device_rates() {

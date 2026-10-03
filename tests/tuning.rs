@@ -182,3 +182,113 @@ fn overrides_reach_cylinders_manifolds_and_turbo() {
     }
     assert_ne!(render(&small_turbo), render(&boosted));
 }
+
+#[test]
+fn separate_cams_preserve_legacy_shared_overrides_and_round_trip() {
+    // A real older tuning shape: missing new keys must keep both old cams.
+    let legacy: EngineTuning = serde_json::from_str(
+        r#"{"cam":{"duration_deg":248.0,"lift_mm":12.0,"lsa_deg":108.0,"intake_advance_deg":3.0}}"#,
+    )
+    .unwrap();
+    let build = EngineBuild::default();
+    let old = legacy.resolve(&build, 4);
+    assert_eq!(old.duration_at_050_deg, 248.);
+    assert_eq!(old.exhaust_duration_at_050_deg, 248.);
+    assert_eq!(old.lift_m.to_bits(), old.exhaust_lift_m.to_bits());
+    assert_eq!(old.exhaust_center_deg, 252.);
+    let mut edited = legacy;
+    edited.cam.intake_duration_deg = Some(260.);
+    edited.cam.intake_lift_mm = Some(13.);
+    let intake = edited.resolve(&build, 4);
+    assert_eq!(
+        intake.exhaust_duration_at_050_deg,
+        old.exhaust_duration_at_050_deg
+    );
+    assert_eq!(intake.exhaust_lift_m, old.exhaust_lift_m);
+    edited.cam.exhaust_duration_deg = Some(228.);
+    edited.cam.exhaust_lift_mm = Some(9.);
+    edited.cam.exhaust_advance_deg = Some(6.);
+    let exhaust = edited.resolve(&build, 4);
+    assert_eq!(exhaust.duration_at_050_deg, intake.duration_at_050_deg);
+    assert_eq!(exhaust.lift_m, intake.lift_m);
+    assert_eq!(exhaust.intake_center_deg, intake.intake_center_deg);
+    assert_eq!(exhaust.exhaust_center_deg, old.exhaust_center_deg - 6.);
+    edited.validate().unwrap();
+    let encoded = serde_json::to_string(&edited).unwrap();
+    assert_eq!(
+        serde_json::from_str::<EngineTuning>(&encoded).unwrap(),
+        edited
+    );
+    edited.cam.reset_exhaust();
+    assert_eq!(edited.resolve(&build, 4).exhaust_duration_at_050_deg, 248.);
+    assert_eq!(edited.cam.intake_duration_deg, Some(260.));
+    edited.cam.reset_intake();
+    assert_eq!(edited.resolve(&build, 4).duration_at_050_deg, 248.);
+    assert_eq!(edited.cam.duration_deg, Some(248.));
+}
+
+#[test]
+fn independent_exhaust_profiles_reach_real_cylinder_flow_and_sound() {
+    let base = Scratch::default();
+    let resolve = |s: &Scratch| {
+        CylinderConfig::from_tuning(&s.build, &s.tuning.resolve(&s.build, s.design.cylinders))
+            .unwrap()
+    };
+    let mut exhaust = base.clone();
+    exhaust.tuning.cam.exhaust_duration_deg = Some(250.);
+    exhaust.tuning.cam.exhaust_lift_mm = Some(13.);
+    exhaust.tuning.cam.exhaust_advance_deg = Some(5.);
+    let (a, b) = (resolve(&base), resolve(&exhaust));
+    assert_eq!(a.lift_m, b.lift_m);
+    assert_eq!(a.seat_duration_deg, b.seat_duration_deg);
+    assert_eq!(a.intake_center_deg, b.intake_center_deg);
+    assert_ne!(a.exhaust_lift_m, b.exhaust_lift_m);
+    assert_ne!(a.exhaust_seat_duration_deg, b.exhaust_seat_duration_deg);
+    let effective_at_050 = b.exhaust_seat_duration_deg / PI
+        * (2. * (0.00127 + b.lash_m) / b.exhaust_lift_m - 1.).acos();
+    assert!((effective_at_050 - 250.).abs() < 1e-10);
+    assert_ne!(render(&base), render(&exhaust));
+}
+
+#[test]
+fn individual_intakes_use_total_equivalent_area_without_double_multiplier() {
+    let single = EngineBuild::default();
+    let individual = EngineBuild {
+        throttle: Throttle::Individual,
+        ..single
+    };
+    let base = EngineTuning::default();
+    let a = base.resolve(&single, 4);
+    let b = base.resolve(&individual, 4);
+    assert_eq!(
+        b.throttle_area_m2.to_bits(),
+        (a.throttle_area_m2 * 1.35).to_bits()
+    );
+    assert!((b.plenum_volume_m3 / a.plenum_volume_m3 - 0.35 / 1.25).abs() < 1e-12);
+    let mut manual = base;
+    manual.intake.throttle_mm = Some(72.);
+    manual.intake.plenum_ratio = Some(0.6);
+    let a = manual.resolve(&single, 4);
+    let b = manual.resolve(&individual, 4);
+    assert_eq!(a.throttle_area_m2, b.throttle_area_m2);
+    assert_eq!(a.plenum_volume_m3, b.plenum_volume_m3);
+    let per_body_diameter = 0.072 / 4_f64.sqrt();
+    assert!((4. * PI * per_body_diameter.powi(2) / 4. - b.throttle_area_m2).abs() < 1e-15);
+}
+
+#[test]
+fn dormant_legacy_timbre_gains_do_not_drive_the_physical_stems() {
+    let base = Scratch::default();
+    let mut legacy = base.clone();
+    legacy.experimental.level = 0.29;
+    legacy.experimental.body = 0.1;
+    legacy.experimental.sharpness = 0.9;
+    legacy.experimental.brightness = -0.8;
+    legacy.experimental.rasp = 0.9;
+    legacy.experimental.flow = 0.9;
+    legacy.experimental.tonal = 0.3;
+    legacy.experimental.tone_db = [[9.; 7]; 2];
+    legacy.experimental.noise_db = [[-9.; 7]; 2];
+    legacy.validate().unwrap();
+    assert_eq!(render(&base), render(&legacy));
+}

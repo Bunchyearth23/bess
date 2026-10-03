@@ -324,7 +324,7 @@ fn turbo_spools_and_adds_manifold_pressure_under_open_throttle() {
 }
 
 #[test]
-fn intake_and_contacts_have_cycle_texture_without_free_running_noise() {
+fn intake_airflow_and_contacts_have_cycle_texture_without_free_running_noise() {
     use bess::physical::engine::{Commands, Engine};
     let mut engine = Engine::new(&bess::scratch::Scratch::default(), 48000).unwrap();
     let command = Commands {
@@ -338,7 +338,12 @@ fn intake_and_contacts_have_cycle_texture_without_free_running_noise() {
     for i in 0..96000 {
         let s = engine.next(command);
         assert!(!engine.failed());
-        for (stem, x) in [s.intake, s.mechanical].into_iter().enumerate() {
+        // Pipe pulsations are deliberately phase-locked. Judge stochastic
+        // texture on the airflow source, even when it sits below those pulses.
+        for (stem, x) in [engine.intake_sources()[1], s.mechanical]
+            .into_iter()
+            .enumerate()
+        {
             assert!(x.is_finite());
             if i >= 48000 {
                 difference[stem] += (x - prior[i % 1920][stem]).powi(2);

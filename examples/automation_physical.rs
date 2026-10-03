@@ -237,7 +237,7 @@ fn main() -> Result<(), String> {
         let project_path = output.join("listening").join(format!("{slug}.bess.json"));
         save_project(&project_path, &project)?;
         let loaded = load_project(&project_path)?;
-        if loaded.version != 3
+        if loaded.version != 4
             || loaded.source != project.source
             || loaded.parameters != p
             || loaded.hybrid.physical_sound != h.physical_sound

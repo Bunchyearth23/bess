@@ -1,6 +1,7 @@
 //! Coupled engine: physical cylinders, manifold states, shaft and acoustic ports.
 //! All evolving gas/shaft state is f64. Audio is an explicitly calibrated f32
 //! observation of mass-flow waves and mechanical impacts, never a torque curve.
+use super::excitation::{Combustion, Contacts};
 use super::mechanical::{Knock, Slap};
 use super::radiation::Modes;
 use super::{
@@ -18,8 +19,71 @@ use crate::{
     engine_build::{Aspiration, Fuel},
     scratch::Scratch,
 };
-use bdsp::svf::{StateVariableFilter, SvfMode};
+use bdsp::delay::DelayLine;
 use std::f64::consts::{PI, TAU};
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CoupledCalibration {
+    /// Least-squares offset in dB over equally weighted operating states.
+    pub gain_db: f32,
+    pub sample_rate: u32,
+    /// (RPM, throttle, uncoupled-minus-coupled RMS dB), before calibration.
+    pub points: Vec<(f64, f64, f64)>,
+}
+
+/// Offline measurement of one fixed coupled-exhaust observation gain. Both
+/// origins use the same audible synthesis path and selected rate policy.
+/// It does not modify `scratch`, fit its torque, or normalize during playback.
+pub fn calibrate_coupled_level(scratch: &Scratch) -> Result<CoupledCalibration, String> {
+    use crate::automation_voice::AutomationVoice;
+    scratch.validate()?;
+    let (idle, span) = (
+        f64::from(scratch.idle_rpm),
+        f64::from(scratch.redline_rpm - scratch.idle_rpm),
+    );
+    let mut points = Vec::with_capacity(4);
+    for fraction in [0., 0.3, 0.6, 0.9] {
+        let rpm = idle + fraction * span;
+        let throttle = if fraction == 0. { 0.05 } else { 1. };
+        let mut energy = [0.; 2];
+        for coupled in [false, true] {
+            let mut settings = scratch.clone();
+            settings.experimental.wave_coupling = coupled;
+            settings.experimental.coupled_level_db = 0.;
+            let mut voice = AutomationVoice::new(48000, &settings)?;
+            for i in 0..48000 {
+                let sample = voice.next_commands(Commands {
+                    imposed_rpm: Some(rpm),
+                    throttle,
+                    ..Default::default()
+                });
+                if voice.failed() {
+                    return Err(format!(
+                        "Coupled calibration failed at {rpm:.0} RPM, coupling={coupled}"
+                    ));
+                }
+                if i >= 24000 {
+                    energy[usize::from(coupled)] += f64::from(sample.exhaust).powi(2);
+                }
+            }
+        }
+        if energy.iter().any(|v| !v.is_finite() || *v <= 1e-20) {
+            return Err(format!(
+                "Coupled calibration has no usable exhaust energy at {rpm:.0} RPM"
+            ));
+        }
+        points.push((rpm, throttle, 10. * (energy[0] / energy[1]).log10()));
+    }
+    let gain_db = (points.iter().map(|p| p.2).sum::<f64>() / points.len() as f64) as f32;
+    if !(-24.0..=24.0).contains(&gain_db) {
+        return Err("Required coupled calibration is outside ±24 dB".into());
+    }
+    Ok(CoupledCalibration {
+        gain_db,
+        sample_rate: 48000,
+        points,
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Commands {
@@ -71,6 +135,30 @@ pub struct Sample {
     pub fuel_injected_kg: f64,
 }
 
+/// Offline attribution of the mechanical observation at fixed sound settings.
+/// Construct before the first engine sample, then feed every excitation,
+/// including warm-up. This owns only diagnostic filters; it never alters Engine.
+pub struct MechanicalProbe {
+    paths: [Modes; 3],
+}
+
+impl MechanicalProbe {
+    pub fn new(engine: &Engine) -> Self {
+        Self {
+            paths: std::array::from_fn(|_| engine.mechanics.clone()),
+        }
+    }
+
+    /// Contact, combustion and piston-slap outputs; optional knock is separate.
+    pub fn next(&mut self, excitation: [f32; 3]) -> [f32; 3] {
+        [
+            self.paths[0].next(excitation[0], 0.),
+            self.paths[1].next(0., excitation[1]),
+            self.paths[2].next(0., excitation[2]),
+        ]
+    }
+}
+
 pub struct Engine {
     scratch: Scratch,
     config: CylinderConfig,
@@ -90,6 +178,12 @@ pub struct Engine {
     substeps: usize,
     dt: f64,
     bank_gain: f32,
+    bank_gain_target: f32,
+    bank_delay: DelayLine,
+    bank_delay_frames: f64,
+    coupled_gain: f32,
+    coupled_gain_target: f32,
+    observation_slew: f32,
     angle: f64,
     rpm: f64,
     was_imposed: bool,
@@ -100,13 +194,17 @@ pub struct Engine {
     intake_phase: f64,
     afterfire_armed: bool,
     afterfire_remaining_s: f64,
-    /// Summed cylinder pressure at the previous output sample; NaN before any.
-    pressure_previous: f64,
-    combustion_highpass: [StateVariableFilter; 2],
+    contacts: Contacts,
+    combustion: Combustion,
+    /// Net-lift closing angles of the actual harmonic cams, before intake VVT.
+    valve_closures: [f64; 2],
     slap: Slap,
     knock: Knock,
     /// Last block/head excitations (contact, combustion, slap) for calibration.
     excitation: [f32; 3],
+    /// Intake acoustic pulsations and residual airflow/compressor observation,
+    /// before optional Tone processing; diagnostic, not a second rendering path.
+    intake_sources: [f32; 2],
     mechanics: Modes,
     tone: Tone,
     previous_mechanics: Option<Modes>,
@@ -116,6 +214,12 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Offline qualification reference only: keep the nonlinear valve/pipe
+    /// impedance and suppress returning primary waves. Call before rendering.
+    pub fn suppress_primary_reflections_for_reference(&mut self) {
+        self.acoustic.suppress_primary_reflections_for_reference();
+    }
+
     pub fn new(scratch: &Scratch, rate: u32) -> Result<Self, String> {
         scratch.validate()?;
         if !(8000..=384000).contains(&rate) {
@@ -194,7 +298,10 @@ impl Engine {
         .map_err(|e| e.to_string())?;
         let controller = Controller::new(rpm, f64::from(scratch.redline_rpm), scratch.build.fuel)
             .map_err(|e| e.to_string())?;
-        let acoustic = Acoustic::new(rate, &scratch.design, &scratch.build, &scratch.sound);
+        let mut acoustic = Acoustic::new(rate, &scratch.design, &scratch.build, &scratch.sound);
+        if scratch.experimental.primary_1d {
+            acoustic.enable_primary_1d().map_err(str::to_owned)?;
+        }
         let intake_acoustic = IntakeAcoustic::new(
             rate,
             n,
@@ -221,6 +328,10 @@ impl Engine {
         let substeps = (96000. / f64::from(rate)).ceil().max(1.) as usize;
         let (slap, knock) = mechanical_events(&scratch, &config, rate, substeps, seed);
         let bank_gain = 10_f32.powf(scratch.design.bank_gain_db / 20.);
+        let bank_delay_frames = f64::from(scratch.design.bank_delay_ms) * f64::from(rate) * 0.001;
+        let coupled_gain = 10_f32.powf(scratch.experimental.coupled_level_db / 20.);
+        let mut radiation = super::radiation::Radiation::new(rate, seed);
+        radiation.set_air_noise(scratch.sound.intake_air_noise, true);
         Ok(Self {
             scratch,
             config,
@@ -242,21 +353,27 @@ impl Engine {
             substeps,
             dt: 1. / (f64::from(rate) * substeps as f64),
             bank_gain,
+            bank_gain_target: bank_gain,
+            bank_delay: DelayLine::new(rate as f32, 0.006),
+            bank_delay_frames,
+            coupled_gain,
+            coupled_gain_target: coupled_gain,
+            observation_slew: (1. - (-1. / (f64::from(rate) * 0.02)).exp()) as f32,
             was_imposed: true,
             failed: false,
-            radiation: super::radiation::Radiation::new(rate, seed),
+            radiation,
             radiation_seed: seed,
             intake_acoustic,
             intake_phase: 0.,
             afterfire_armed: false,
             afterfire_remaining_s: 0.,
-            pressure_previous: f64::NAN,
-            // Fourth-order Butterworth high-pass at 500 Hz.
-            combustion_highpass: [0.5412, 1.3066]
-                .map(|q| StateVariableFilter::new(rate as f32, 500., q, SvfMode::Highpass)),
+            contacts: Contacts::new(rate, seed),
+            combustion: Combustion::new(rate, seed),
+            valve_closures: valve_closures(&config),
             slap,
             knock,
             excitation: [0.; 3],
+            intake_sources: [0.; 2],
             mechanics,
             tone,
             previous_mechanics: None,
@@ -282,9 +399,28 @@ impl Engine {
     pub fn mechanical_excitation(&self) -> [f32; 3] {
         self.excitation
     }
+    /// Raw pipe pulsations and flow/compressor noise. Their sum reconstructs
+    /// the intake stem at neutral tone settings, within floating-point roundoff.
+    pub fn intake_sources(&self) -> [f32; 2] {
+        self.intake_sources
+    }
     /// Crank friction torque at the current speed and cylinder peak pressure.
     pub fn friction_nm(&self) -> f64 {
         self.crank.friction_nm(self.rpm)
+    }
+
+    /// A source-balance change must not restart unrelated filters or a tone
+    /// crossfade that is already running. Both live and prepared retunes use
+    /// this path; the radiation observer owns the gain's smoothing state.
+    fn apply_air_noise_only(&mut self, sound: &crate::scratch::SoundTuning) -> bool {
+        let mut candidate = self.scratch.sound;
+        candidate.intake_air_noise = sound.intake_air_noise;
+        if candidate != *sound {
+            return false;
+        }
+        self.radiation.set_air_noise(sound.intake_air_noise, false);
+        self.scratch.sound = *sound;
+        true
     }
 
     /// Adopt prepared sound controls without replacing the running engine.
@@ -299,7 +435,15 @@ impl Engine {
             return false;
         }
         let sound = prepared.scratch.sound;
+        self.scratch.design.bank_delay_ms = prepared.scratch.design.bank_delay_ms;
+        self.scratch.design.bank_gain_db = prepared.scratch.design.bank_gain_db;
+        self.scratch.experimental.coupled_level_db = prepared.scratch.experimental.coupled_level_db;
+        self.bank_gain_target = prepared.bank_gain_target;
+        self.coupled_gain_target = prepared.coupled_gain_target;
         if sound == self.scratch.sound {
+            return true;
+        }
+        if self.apply_air_noise_only(&sound) {
             return true;
         }
         // Move the prepared BDSP filters. The neutral placeholder has only
@@ -317,6 +461,7 @@ impl Engine {
         self.sound_fade = 0.;
         self.acoustic.retune(&sound);
         self.intake_acoustic.retune(&sound);
+        self.radiation.set_air_noise(sound.intake_air_noise, false);
         // Cycle inputs read new ignition/variation/duration settings; existing
         // burn, trapped charge and angular phase are not recreated or cleared.
         self.scratch.sound = sound;
@@ -332,6 +477,9 @@ impl Engine {
         if *sound == self.scratch.sound {
             return true;
         }
+        if self.apply_air_noise_only(sound) {
+            return true;
+        }
         self.previous_tone = Some(std::mem::replace(
             &mut self.tone,
             Tone::new(self.rate as u32, sound),
@@ -342,6 +490,7 @@ impl Engine {
         self.sound_fade = 0.;
         self.acoustic.retune(sound);
         self.intake_acoustic.retune(sound);
+        self.radiation.set_air_noise(sound.intake_air_noise, false);
         self.scratch.sound = *sound;
         true
     }
@@ -385,13 +534,15 @@ impl Engine {
             ..Default::default()
         };
         self.radiation = super::radiation::Radiation::new(self.rate as u32, self.radiation_seed);
+        self.radiation
+            .set_air_noise(self.scratch.sound.intake_air_noise, true);
         self.intake_phase = 0.;
         self.afterfire_armed = false;
         self.afterfire_remaining_s = 0.;
-        self.pressure_previous = f64::NAN;
-        self.combustion_highpass
-            .iter_mut()
-            .for_each(StateVariableFilter::reset);
+        self.contacts.reset();
+        self.combustion.reset();
+        self.excitation = [0.; 3];
+        self.intake_sources = [0.; 2];
         (self.slap, self.knock) = mechanical_events(
             &self.scratch,
             &self.config,
@@ -448,7 +599,7 @@ impl Engine {
         let mut correction = 0.;
         let mut torque = 0.;
         let mut impact = 0.;
-        let mut pressure = 0.;
+        let mut combustion_pressure = [0.; 12];
         let mut fuel_cut = false;
         let mut misfires = self.last.misfires;
         let mut afterfire = [0.; 2];
@@ -547,7 +698,6 @@ impl Engine {
             let exhaust = exhaust_ports.map(|port| port.0);
             let mut flows = Flows::default();
             torque = 0.;
-            pressure = 0.;
             let mut peak: f64 = 0.;
             let mut reciprocating = 0.;
             // Retard the inlet at closed-throttle idle to reduce overlap/EGR;
@@ -560,13 +710,20 @@ impl Engine {
             // redline, where runner ram fills the cylinder after BDC; the
             // usual intake-phaser full-load schedule (Heywood §6.8, VANOS/VVT-i).
             let redline = f64::from(self.scratch.redline_rpm);
-            let load_advance = (self.rpm / 2000.).clamp(0., 1.)
+            let mut load_advance = (self.rpm / 2000.).clamp(0., 1.)
                 * ((0.9 * redline - self.rpm) / (0.35 * redline)).clamp(0., 1.);
+            if self.scratch.experimental.vvt_overlap_safe {
+                // Explicit development map: postpone load advance until the
+                // intake column can use the added overlap. Idle authority
+                // and high-rpm retard retain their existing limits.
+                load_advance *= ((self.rpm - 2500.) / 2500.).clamp(0., 1.);
+            }
             let vvt_target = if self.scratch.build.vvt {
                 (20. * idle_vvt - 15. * load_advance * (1. - idle_vvt)).to_radians()
             } else {
                 0.
             };
+            let previous_intake_phase = self.intake_phase;
             self.intake_phase += (vvt_target - self.intake_phase) * (dt / 0.05).min(1.);
             let ignition_retard = f64::from(self.scratch.sound.ignition_retard_deg).to_radians();
             // Fields common to every cylinder of this substep, validated once.
@@ -650,7 +807,16 @@ impl Engine {
                 correction += output.ledger.numerical_correction_j.abs()
                     + output.wall_numerical_correction_j.abs();
                 peak = peak.max(output.pressure_pa);
-                pressure += output.pressure_pa;
+                // Observe only the chemical heat release. Compression, valve
+                // flow and numerical pressure corrections are not combustion
+                // excitation. Sum pressure increments across gas substeps;
+                // conversion to Pa/s happens once at the audio sample boundary.
+                if output.heat_j > 0. {
+                    let gas = self.cylinders[i].gas_state().expect("stepped");
+                    combustion_pressure[i] += (gas.mixture().gamma(output.temperature_k) - 1.)
+                        * output.heat_j
+                        / gas.volume_m3();
+                }
                 misfires += u64::from(output.misfired);
                 let phase = angle - self.phases[i];
                 self.slap.step(i, phase, output.pressure_pa, self.rpm, dt);
@@ -677,9 +843,22 @@ impl Engine {
                     let derivative = radius * (sine + ratio * sine * cosine);
                     reciprocating -= mass * acceleration * derivative;
                 }
-                for closure in [2. * PI - 1.6, 3. * PI + 0.7] {
-                    if crossed(self.angle - self.phases[i], angle - self.phases[i], closure) {
-                        impact += 0.015 * (self.rpm / 3000.).sqrt();
+                for (closure, old_shift, shift, valves) in [
+                    (
+                        self.valve_closures[0],
+                        previous_intake_phase,
+                        self.intake_phase,
+                        self.config.intake_valves,
+                    ),
+                    (self.valve_closures[1], 0., 0., self.config.exhaust_valves),
+                ] {
+                    if crossed(
+                        self.angle - self.phases[i] - old_shift,
+                        phase - shift,
+                        closure,
+                    ) {
+                        // Fixed observation scale, referenced to two valves.
+                        impact += 0.0075 * f64::from(valves) * (self.rpm / 3000.).sqrt();
                     }
                 }
                 if self.scratch.build.fuel == Fuel::DirectInjection && output.injected_fuel_kg > 0.
@@ -834,7 +1013,26 @@ impl Engine {
         };
         // A fixed acoustic calibration, independent of RPM/load/observed RMS.
         const PA_TO_SAMPLE: f32 = 1. / 3000.;
-        let exhaust_audio = (bank_pressure[0] + bank_pressure[1] * self.bank_gain) * PA_TO_SAMPLE;
+        // Observation edits are continuous without rebuilding gas or filters.
+        // Initial gains equal their targets, so fixed settings stay bit exact.
+        self.bank_gain += self.observation_slew * (self.bank_gain_target - self.bank_gain);
+        self.coupled_gain += self.observation_slew * (self.coupled_gain_target - self.coupled_gain);
+        if self.acoustic.failed() {
+            return Err(());
+        }
+        let delay_target = f64::from(self.scratch.design.bank_delay_ms) * self.rate * 0.001;
+        self.bank_delay_frames += (delay_target - self.bank_delay_frames) / (self.rate * 0.02);
+        let delayed = if self.bank_delay_frames <= 0. {
+            bank_pressure[1]
+        } else {
+            let old = self
+                .bank_delay
+                .read_at(self.bank_delay_frames.max(1.) as f32);
+            bank_pressure[1] + (old - bank_pressure[1]) * self.bank_delay_frames.min(1.) as f32
+        };
+        self.bank_delay.write(bank_pressure[1]);
+        let calibration = if coupled { self.coupled_gain } else { 1. };
+        let exhaust_audio = (bank_pressure[0] + delayed * self.bank_gain) * PA_TO_SAMPLE;
         let supply = self
             .induction
             .as_ref()
@@ -857,25 +1055,14 @@ impl Engine {
             f64::from(air.gap_m2 / air.bore_m2),
             f64::from(air.jet_m_s()),
         );
-        let (intake_audio, contact) = self.radiation.next(pulse, impact as f32, air);
-        // Structure-borne combustion noise: summed cylinder dp/dt (Pa/s),
-        // high-passed so only the fast pressure-rise content excites the block.
-        // Fixed calibration; load and spark timing scale it physically.
-        const PA_S_TO_SAMPLE: f64 = 2e-12;
-        // Knock rings the chamber gas only in this observation, never the solver.
-        if knock {
-            pressure += self.knock.pressure();
-        }
-        let dp_dt = if self.pressure_previous.is_nan() {
-            0.
-        } else {
-            (pressure - self.pressure_previous) * self.rate
-        };
-        self.pressure_previous = pressure;
+        // Preserve the intake PRNG sequence, including its reserved contact
+        // draw. Contacts now have their own event source and independent RNG.
+        let (intake_audio, _) = self.radiation.next(pulse, 0., air);
+        self.intake_sources = [pulse, intake_audio - pulse];
+        let contact = self.contacts.next(impact as f32);
         let combustion = self
-            .combustion_highpass
-            .iter_mut()
-            .fold((dp_dt * PA_S_TO_SAMPLE) as f32, |x, f| f.next_sample(x));
+            .combustion
+            .next(combustion_pressure.map(|dp| dp * self.rate));
         // Piston slap is structure-borne: block input, beside combustion.
         let slap = self.slap.next();
         self.excitation = [contact, combustion, slap];
@@ -910,8 +1097,20 @@ impl Engine {
                 self.previous_mechanics = None;
             }
         }
+        if knock {
+            // The chamber ring already has its bore/gas-dependent frequency,
+            // 1.5 ms decay and output-rate alias guard. Observe it separately:
+            // the damped block path must not erase deliberate 5–9 kHz knock.
+            // Fixed observation scale: 1 bar of ring pressure -> 0.005 peak.
+            // This adds neither force nor heat to the gas/crank solution.
+            const KNOCK_PA_TO_SAMPLE: f64 = 5e-8;
+            let ring = self.knock.pressure();
+            if ring != 0. {
+                mechanical += (ring * KNOCK_PA_TO_SAMPLE) as f32;
+            }
+        }
         let sample = Sample {
-            exhaust: shaped_exhaust,
+            exhaust: shaped_exhaust * calibration,
             intake: shaped_intake,
             mechanical,
             bank_pressure,
@@ -949,6 +1148,27 @@ fn add_exchange(exchange: &mut Exchange, mass: f64, enthalpy: f64) {
         exchange.mass_out_kg -= mass;
     }
 }
+fn valve_closures(config: &CylinderConfig) -> [f64; 2] {
+    // Invert the same harmonic profile used by CycleCylinder (exponent 1),
+    // including lash: closure is earlier than the nominal zero-lift seat.
+    [
+        (
+            config.intake_center_deg,
+            config.seat_duration_deg,
+            config.lift_m,
+        ),
+        (
+            config.exhaust_center_deg,
+            config.exhaust_seat_duration_deg,
+            config.exhaust_lift_m,
+        ),
+    ]
+    .map(|(center, duration, lift)| {
+        center.to_radians()
+            + duration.to_radians() / TAU * (2. * config.lash_m / lift - 1.).clamp(-1., 1.).acos()
+    })
+}
+
 fn mechanical_events(
     scratch: &Scratch,
     config: &CylinderConfig,
@@ -979,6 +1199,166 @@ fn mechanical_events(
 fn crossed(from: f64, to: f64, event: f64) -> bool {
     use super::gas::floor_fast;
     floor_fast((from - event) / (2. * TAU)) < floor_fast((to - event) / (2. * TAU))
+}
+
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+
+    fn assert_other_sources_equal(actual: Sample, expected: Sample) {
+        assert_eq!(actual.exhaust.to_bits(), expected.exhaust.to_bits());
+        assert_eq!(actual.mechanical.to_bits(), expected.mechanical.to_bits());
+        assert_eq!(
+            actual.bank_pressure.map(f32::to_bits),
+            expected.bank_pressure.map(f32::to_bits)
+        );
+        assert_eq!(actual.rpm.to_bits(), expected.rpm.to_bits());
+        assert_eq!(actual.torque_nm.to_bits(), expected.torque_nm.to_bits());
+        assert_eq!(actual.map_pa.to_bits(), expected.map_pa.to_bits());
+        assert_eq!(actual.heat_j.to_bits(), expected.heat_j.to_bits());
+        assert_eq!(
+            actual.correction_j.to_bits(),
+            expected.correction_j.to_bits()
+        );
+        assert_eq!(actual.fuel_cut, expected.fuel_cut);
+        assert_eq!(actual.misfires, expected.misfires);
+    }
+
+    #[test]
+    fn intake_noise_retunes_keep_non_neutral_tone_and_pending_crossfade_state() {
+        for rate in [48_000, 96_000] {
+            let mut scratch = Scratch::default();
+            scratch.sound = crate::scratch::SoundTuning {
+                intake_air_noise: 1.,
+                bass_db: 3.,
+                presence_db: -2.,
+                brightness_hz: 5000.,
+                flow_texture: 0.3,
+                rpm_brightness_db: 3.,
+                load_brightness_db: -2.,
+                intake_resonance: 1.,
+                exhaust_body_db: 4.,
+                exhaust_body_hz: 350.,
+                exhaust_low_cut_hz: 60.,
+                ..Default::default()
+            };
+            // Unedited reference, direct retune, prepared retune.
+            let mut engines =
+                std::array::from_fn::<_, 3, _>(|_| Engine::new(&scratch, rate).unwrap());
+            let command = Commands {
+                imposed_rpm: Some(3000.),
+                throttle: 0.7,
+                ..Default::default()
+            };
+            for _ in 0..rate / 5 {
+                let samples = engines.each_mut().map(|e| e.next(command));
+                for sample in &samples[1..] {
+                    assert_other_sources_equal(*sample, samples[0]);
+                    assert_eq!(sample.intake.to_bits(), samples[0].intake.to_bits());
+                }
+            }
+            for (phase, gain) in [0.02, 0.7].into_iter().enumerate() {
+                if phase == 1 {
+                    // Start the same non-neutral tone change on every engine,
+                    // then edit only the air source while this fade is active.
+                    for engine in &mut engines {
+                        let mut sound = engine.scratch.sound;
+                        sound.presence_db = 4.;
+                        assert!(engine.set_sound_tuning(&sound));
+                    }
+                    for _ in 0..rate / 125 {
+                        let samples = engines.each_mut().map(|e| e.next(command));
+                        for sample in &samples[1..] {
+                            assert_other_sources_equal(*sample, samples[0]);
+                        }
+                    }
+                    assert!(engines.iter().all(|e| e.previous_tone.is_some()));
+                }
+                let fade_before = engines[1].sound_fade;
+                let mut sound = engines[1].scratch.sound;
+                sound.intake_air_noise = gain;
+                assert!(engines[1].set_sound_tuning(&sound));
+                let mut prepared_scratch = engines[2].scratch.clone();
+                prepared_scratch.sound.intake_air_noise = gain;
+                let mut prepared = Engine::new(&prepared_scratch, rate).unwrap();
+                assert!(engines[2].apply_sound_tuning(&mut prepared));
+                assert_eq!(engines[1].sound_fade.to_bits(), fade_before.to_bits());
+                assert_eq!(engines[2].sound_fade.to_bits(), fade_before.to_bits());
+                let mut intake_difference = 0_f64;
+                for _ in 0..rate / 12 {
+                    let samples = engines.each_mut().map(|e| e.next(command));
+                    for (engine, sample) in engines.iter().zip(samples) {
+                        assert!(!engine.failed());
+                        assert_other_sources_equal(sample, samples[0]);
+                        assert_eq!(engine.sound_fade.to_bits(), engines[0].sound_fade.to_bits());
+                        assert_eq!(
+                            engine.previous_tone.is_some(),
+                            engines[0].previous_tone.is_some()
+                        );
+                        assert_eq!(
+                            engine.intake_sources()[0].to_bits(),
+                            engines[0].intake_sources()[0].to_bits()
+                        );
+                    }
+                    assert_eq!(samples[1].intake.to_bits(), samples[2].intake.to_bits());
+                    intake_difference += f64::from(samples[1].intake - samples[0].intake).powi(2);
+                }
+                assert!(intake_difference > 0.);
+            }
+        }
+    }
+
+    #[test]
+    fn intake_noise_control_preserves_pipe_pulses_and_other_physical_stems() {
+        for rate in [48_000, 96_000] {
+            let mut scratch = Scratch::default();
+            let mut engines = [0., 0.2, 1.].map(|gain| {
+                scratch.sound.intake_air_noise = gain;
+                Engine::new(&scratch, rate).unwrap()
+            });
+            let command = Commands {
+                imposed_rpm: Some(3000.),
+                throttle: 0.7,
+                ..Default::default()
+            };
+            let mut noise_energy = [0_f64; 3];
+            let mut pulse_energy = 0.;
+            for frame in 0..rate {
+                let samples = engines.each_mut().map(|e| e.next(command));
+                for e in &engines {
+                    assert!(!e.failed());
+                }
+                for sample in &samples[1..] {
+                    assert_eq!(sample.mechanical.to_bits(), samples[0].mechanical.to_bits());
+                    assert_eq!(sample.exhaust.to_bits(), samples[0].exhaust.to_bits());
+                    assert_eq!(sample.torque_nm.to_bits(), samples[0].torque_nm.to_bits());
+                    assert_eq!(sample.heat_j.to_bits(), samples[0].heat_j.to_bits());
+                    assert_eq!(sample.map_pa.to_bits(), samples[0].map_pa.to_bits());
+                }
+                let reference = engines[0].intake_sources();
+                // This naturally aspirated reference has no compressor whine.
+                assert_eq!(reference[1], 0.);
+                assert_eq!(samples[0].intake.to_bits(), reference[0].to_bits());
+                for (i, e) in engines.iter().enumerate() {
+                    let sources = e.intake_sources();
+                    assert_eq!(sources[0].to_bits(), reference[0].to_bits());
+                    let reconstruction = f64::from(sources[0]) + f64::from(sources[1]);
+                    assert!(
+                        (reconstruction - f64::from(samples[i].intake)).abs()
+                            < 1e-10 + f64::from(samples[i].intake.abs()) * 2e-6
+                    );
+                    if frame >= rate / 2 {
+                        noise_energy[i] += f64::from(sources[1]).powi(2);
+                    }
+                }
+                if frame >= rate / 2 {
+                    pulse_energy += f64::from(reference[0]).powi(2);
+                }
+            }
+            assert!(pulse_energy > 0. && noise_energy[2] > 0.);
+            assert!((noise_energy[1] / noise_energy[2] - 0.04).abs() < 1e-5);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1107,6 +1487,149 @@ mod retune_tests {
 #[cfg(test)]
 mod mechanical_tests {
     use super::*;
+    use bdsp::svf::{StateVariableFilter, SvfMode};
+
+    #[test]
+    fn mechanical_contacts_follow_net_cam_closure_including_lash_and_vvt() {
+        for cam in [0., 0.5, 1.] {
+            let config = CylinderConfig::from_build(&crate::engine_build::EngineBuild {
+                cam,
+                ..Default::default()
+            })
+            .unwrap();
+            let closures = valve_closures(&config);
+            for (i, (center, duration, lift)) in [
+                (
+                    config.intake_center_deg,
+                    config.seat_duration_deg,
+                    config.lift_m,
+                ),
+                (
+                    config.exhaust_center_deg,
+                    config.exhaust_seat_duration_deg,
+                    config.exhaust_lift_m,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for shift in [-0.25, 0., 0.3] {
+                    let cam = super::super::gas::HarmonicCam {
+                        center_rad: center.to_radians() + shift,
+                        duration_rad: duration.to_radians(),
+                        peak_lift_m: lift,
+                        shape_exponent: 1.,
+                        lash_m: config.lash_m,
+                    };
+                    let at = closures[i] + shift;
+                    assert!(cam.lift_m(at - 1e-5) > 0.);
+                    assert_eq!(cam.lift_m(at + 1e-5), 0.);
+                    assert!(crossed(at - 1e-5 - shift, at + 1e-5 - shift, closures[i]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mechanical_combustion_is_silent_when_motored_and_decays_after_spark_cut() {
+        for rate in [48_000, 96_000] {
+            let mut engine = Engine::new(&Scratch::default(), rate).unwrap();
+            engine.spark_enabled = [false; 12];
+            let command = Commands {
+                imposed_rpm: Some(3000.),
+                throttle: 0.7,
+                ..Default::default()
+            };
+            let mut contacts = 0.;
+            for _ in 0..rate / 4 {
+                let sample = engine.next(command);
+                assert!(!engine.failed());
+                assert_eq!(sample.heat_j, 0.);
+                assert_eq!(engine.mechanical_excitation()[1], 0.);
+                contacts += engine.mechanical_excitation()[0].abs();
+            }
+            assert!(contacts > 0.);
+            engine.spark_enabled[..engine.cylinders.len()].fill(true);
+            let mut burning = 0.;
+            for _ in 0..rate / 2 {
+                engine.next(command);
+                burning += engine.mechanical_excitation()[1].abs();
+            }
+            assert!(burning > 0.);
+            engine.spark_enabled = [false; 12];
+            for _ in 0..rate / 4 {
+                engine.next(command);
+            }
+            for _ in 0..rate / 20 {
+                let sample = engine.next(command);
+                assert!(!engine.failed());
+                assert_eq!(sample.heat_j, 0.);
+                assert!(engine.mechanical_excitation()[1].abs() < 1e-15);
+            }
+        }
+    }
+
+    #[test]
+    fn mechanical_texture_has_no_feedback_into_gas_intake_or_exhaust() {
+        for rate in [48_000, 96_000] {
+            let mut a = Engine::new(&Scratch::default(), rate).unwrap();
+            let mut b = Engine::new(&Scratch::default(), rate).unwrap();
+            b.contacts = Contacts::new(rate, 991);
+            b.combustion = Combustion::new(rate, 991);
+            let mut difference = 0.;
+            for i in 0..rate / 2 {
+                let command = Commands {
+                    imposed_rpm: Some(3000.),
+                    throttle: if i < rate / 4 { 0.2 } else { 0.8 },
+                    ..Default::default()
+                };
+                let (x, y) = (a.next(command), b.next(command));
+                assert!(!a.failed() && !b.failed());
+                assert_eq!(x.exhaust.to_bits(), y.exhaust.to_bits());
+                assert_eq!(x.intake.to_bits(), y.intake.to_bits());
+                assert_eq!(x.torque_nm.to_bits(), y.torque_nm.to_bits());
+                assert_eq!(x.heat_j.to_bits(), y.heat_j.to_bits());
+                assert_eq!(x.map_pa.to_bits(), y.map_pa.to_bits());
+                difference += (x.mechanical - y.mechanical).abs();
+            }
+            assert!(difference > 0.01);
+            for (x, y) in a.cylinders.iter().zip(&b.cylinders) {
+                let (x, y) = (x.gas_state().unwrap(), y.gas_state().unwrap());
+                assert_eq!(
+                    x.internal_energy_j().to_bits(),
+                    y.internal_energy_j().to_bits()
+                );
+                assert_eq!(x.mass_kg().to_bits(), y.mass_kg().to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_mechanical_sources_reconstruct_the_running_observation() {
+        for rate in [48000, 96000] {
+            let scratch = Scratch::default();
+            let mut engine = Engine::new(&scratch, rate).unwrap();
+            let mut probe = MechanicalProbe::new(&engine);
+            let command = Commands {
+                imposed_rpm: Some(3000.),
+                throttle: 0.7,
+                ..Default::default()
+            };
+            let mut energy = 0.;
+            let mut error = 0.;
+            for i in 0..rate {
+                let sample = engine.next(command);
+                let paths = probe.next(engine.mechanical_excitation());
+                assert!(!engine.failed());
+                if i >= rate / 2 {
+                    let reconstructed: f64 = paths.into_iter().map(f64::from).sum();
+                    error += (reconstructed - f64::from(sample.mechanical)).powi(2);
+                    energy += f64::from(sample.mechanical).powi(2);
+                }
+            }
+            assert!(energy > 0. && error / energy < 1e-10);
+        }
+    }
 
     fn run(scratch: &Scratch, rpm: f64, throttle: f64, mut each: impl FnMut(&Engine, Sample)) {
         let mut engine = Engine::new(scratch, 96_000).unwrap();

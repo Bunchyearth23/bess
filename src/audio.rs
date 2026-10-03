@@ -223,12 +223,12 @@ pub struct Audio {
     pub device_name: String,
     pub bluetooth: bool,
     pub rate: u32,
-    /// Rate used to prepare replacement scratch voices (twice device rate).
+    /// Rate used to prepare replacement physical voices (twice device rate).
     pub synth_rate: u32,
     pub pipe_stats: Arc<PipeStats>,
     pub buffer_ms: f32,
     pub block_ms: f32,
-    /// Rebuilt scratch voices, prepared off the callback at `synth_rate`.
+    /// Rebuilt physical voices for either origin, prepared at `synth_rate`.
     pub swap: Sender<ScratchModel>,
     /// Voices displaced by a swap; drain and drop them on the UI thread.
     pub trash: Receiver<ScratchVoice>,
@@ -243,14 +243,32 @@ impl Audio {
         bank: Option<Arc<Bank>>,
         driving: Controls,
     ) -> Result<Self, String> {
+        if settings
+            .engine
+            .is_some_and(|engine| engine.experimental.primary_1d)
+        {
+            return Err("Finite-volume primary pipes currently require offline WAV rendering; disable Primary 1D for live listening".into());
+        }
         Self::open(|rate| {
-            let bench = Bench::new(rate, params, settings, driving, bank);
+            let mut bench = Bench::new(rate, params, settings, driving, bank);
             if settings.enhanced
                 && let Some(error) = bench.initialization_error()
             {
                 return Err(error.to_owned());
             }
-            Ok(RenderEngine::native(bench, rate))
+            bench.enable_room();
+            let mut render = RenderEngine::native(bench, rate);
+            // Imported voices own their per-stem decimators internally; model
+            // preparation must use the same chosen rate as their initial voice.
+            render.synth_rate = if settings
+                .engine
+                .is_some_and(|e| e.experimental.native_rate_acoustics)
+            {
+                rate
+            } else {
+                rate * 2
+            };
+            Ok(render)
         })
     }
     pub fn with_scratch(
@@ -259,6 +277,14 @@ impl Audio {
         scratch: &Scratch,
         driving: Controls,
     ) -> Result<Self, String> {
+        if settings
+            .engine
+            .map_or(scratch.experimental.primary_1d, |engine| {
+                engine.experimental.primary_1d
+            })
+        {
+            return Err("Finite-volume primary pipes currently require offline WAV rendering; disable Primary 1D for live listening".into());
+        }
         Self::open(|rate| {
             let mut engine = RenderEngine::scratch(rate, params, settings, driving, scratch)?;
             engine.bench.enable_room();
@@ -307,7 +333,11 @@ impl Audio {
         let (swap, swap_rx) = bounded::<ScratchModel>(1);
         let (trash_tx, trash) = bounded::<ScratchVoice>(8);
         let producer_meter = meter.clone();
+        let mut pending_trash = None;
         let render = move |block: &mut [f32]| {
+            if let Some(old) = pending_trash.take() {
+                pending_trash = trash_tx.try_send(old).err().map(|error| error.into_inner());
+            }
             if let Ok(command) = rx.pop() {
                 let command: Command = command;
                 engine.bench.set_audition_mix(command.audition_mix);
@@ -321,11 +351,14 @@ impl Audio {
                 );
                 playing = command.playing;
             }
-            if let Ok(model) = swap_rx.try_recv()
+            // Backpressure keeps displaced heap owners on the producer until
+            // the UI can dispose of them; full trash never drops a voice here.
+            if pending_trash.is_none()
+                && !trash_tx.is_full()
+                && let Ok(model) = swap_rx.try_recv()
                 && let Some(old) = engine.bench.swap_scratch(model)
             {
-                // A full UI trash slot drops on this producer, never CPAL.
-                let _ = trash_tx.try_send(old);
+                pending_trash = trash_tx.try_send(old).err().map(|error| error.into_inner());
             }
             for sample in block {
                 *sample = engine.next_sample(playing);
@@ -336,8 +369,11 @@ impl Audio {
                     .physical_failed
                     .store(true, Ordering::Relaxed);
             }
-            while let Some(old) = engine.bench.take_retired() {
-                let _ = trash_tx.try_send(old);
+            while pending_trash.is_none() {
+                let Some(old) = engine.bench.take_retired() else {
+                    break;
+                };
+                pending_trash = trash_tx.try_send(old).err().map(|error| error.into_inner());
             }
             let state = engine.bench.state();
             producer_meter
@@ -476,6 +512,31 @@ impl Audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_volume_live_guard_runs_before_opening_an_audio_device() {
+        let mut scratch = Scratch::default();
+        scratch.experimental.primary_1d = true;
+        let error = Audio::with_scratch(
+            Default::default(),
+            Default::default(),
+            &scratch,
+            Default::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("offline WAV"));
+        let settings = Settings {
+            engine: Some(bess::engine_definition::EngineDefinition::from_scratch(
+                &scratch,
+            )),
+            ..Default::default()
+        };
+        let error = Audio::with_bank(Default::default(), settings, None, Default::default())
+            .err()
+            .unwrap();
+        assert!(error.contains("offline WAV"));
+    }
 
     #[test]
     fn callback_percentile_is_upper_bound_and_exposes_overflow() {

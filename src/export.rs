@@ -242,7 +242,42 @@ pub(crate) fn physical_settings(h: Settings) -> Settings {
     let mut h = h.for_beamng_export();
     h.physical = true;
     h.procedural = false;
+    // The source blend's off-load row is a steady running engine. DFCO and
+    // starter engagement are driving events, not repeatable loop states.
+    h.fuel_cut = 0.;
+    h.starter = false;
     h
+}
+
+/// Freeze the complete resolved engine for both emitted stems and reports.
+/// Legacy projects acquire their import defaults here; edited projects retain
+/// every builder, tuning and acoustic value instead of reimporting a baseline.
+pub(crate) fn resolved_settings(
+    bank: &Bank,
+    h: Settings,
+) -> Result<(Settings, crate::automation_model::AutomationModel), String> {
+    let mut h = physical_settings(h);
+    h.validate()?;
+    let model = crate::automation_model::AutomationModel::from_settings(bank, &h)?;
+    h.engine = Some(crate::engine_definition::EngineDefinition::from_scratch(
+        &model.scratch,
+    ));
+    h.engine_baseline = Some(model.baseline);
+    h.physical_sound = model.scratch.sound;
+    Ok((h, model))
+}
+
+pub(crate) fn loop_policy() -> serde_json::Value {
+    json!({
+        "mode": "stationary_rpm_load_loops",
+        "rpm": "imposed at every original Automation blend knot",
+        "off_load": "steady running combustion, fuel cut disabled",
+        "starter": "disengaged",
+        "accessories": "saved accessory loads are included",
+        "supported": "settled combustion, admission, exhaust, mechanics and boost at fixed RPM/load",
+        "runtime_events": "BESS starter sequences, shutdown, DFCO, triggered afterfire and turbo spool transients are not encoded by these loops; original BeamNG event references remain in place",
+        "vehicle_physics": "original Automation vehicle physics retained; BESS mechanical edits affect generated sound only"
+    })
 }
 
 /// Old projects without a motor hash migrate once; recorded motor identities
@@ -280,7 +315,6 @@ fn render_stems(
     load: f32,
     engine_seconds: f32,
 ) -> Result<LoopStems, String> {
-    h = physical_settings(h);
     if !rpm.is_finite() || !(200.0..=12_000.0).contains(&rpm) {
         return Err(format!(
             "Unsupported export RPM {rpm}: physical synthesis supports 200–12000 rpm"
@@ -289,6 +323,8 @@ fn render_stems(
     p.rpm = rpm;
     p.load = load;
     p.volume = 0.8;
+    p.validate()?;
+    (h, _) = resolved_settings(&bank, h)?;
     h.enhanced = true;
     h.level_match = false;
     let mut engine = Hybrid::new(48000, p, h, Some(bank.clone()));
@@ -372,9 +408,7 @@ fn package_inner(
     exhaust_only: bool,
 ) -> Result<String, String> {
     p.validate()?;
-    let h = physical_settings(h);
-    h.validate()?;
-    let physical_model = crate::automation_model::AutomationModel::from_bank(&bank)?;
+    let (h, physical_model) = resolved_settings(&bank, h)?;
     // Verify the file has not been swapped since import before copying the vehicle.
     let fresh = Bank::load(Path::new(&bank.source.archive), Some(&bank.source.blend))?;
     verify_source_identity(&bank.source, &fresh.source)?;
@@ -540,7 +574,29 @@ fn package_inner(
                 scratch: None,
             },
         )?;
-        let report = json!({"version":env!("CARGO_PKG_VERSION"),"zip_file":zip_name,"display_name":display_name,"display_name_path":info_path,"source":bank.source,"settings":h,"parameters":p,"gain":gain,"loops":measurements,"render_channel":if exhaust_only {"exhaust"} else {"mixed"},"render_model":"physical_automation","physical_assumptions":physical_model.assumptions,"physical_sound":h.physical_sound,"physical_warmup":"at least 2 seconds, whole 720-degree cycles","exhaust_level_reference":if exhaust_only {"estimated post-80-Hz low-cut RMS; absolute PCM peak still bounds gain"} else {"unfiltered AC RMS"},"runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.","validation":"BESS reimported the generated archive; testing in BeamNG is still required"});
+        let report = json!({
+            "version":env!("CARGO_PKG_VERSION"),
+            "zip_file":zip_name,
+            "display_name":display_name,
+            "display_name_path":info_path,
+            "source":bank.source,
+            "settings":h,
+            "parameters":p,
+            "gain":gain,
+            "loops":measurements,
+            "render_channel":if exhaust_only {"exhaust"} else {"mixed"},
+            "render_model":"physical_automation",
+            "engine_definition":h.engine,
+            "engine_baseline":physical_model.baseline,
+            "engine_provenance":physical_model.provenance,
+            "loop_policy":loop_policy(),
+            "physical_assumptions":physical_model.assumptions,
+            "physical_sound":h.physical_sound,
+            "physical_warmup":"at least 2 seconds, whole 720-degree cycles",
+            "exhaust_level_reference":if exhaust_only {"estimated post-80-Hz low-cut RMS; absolute PCM peak still bounds gain"} else {"unfiltered AC RMS"},
+            "runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.",
+            "validation":"BESS reimported the generated archive; testing in BeamNG is still required"
+        });
         fs::write(
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
@@ -605,6 +661,56 @@ mod source_identity_tests {
         assert!(verify_source_identity(&legacy, &saved).is_ok());
         fresh.fingerprint = "different-wav-hash".into();
         assert!(verify_source_identity(&legacy, &fresh).is_err());
+    }
+}
+
+#[cfg(test)]
+mod unified_engine_tests {
+    use super::*;
+    use crate::{automation_model::AutomationModel, engine_definition::EngineDefinition};
+
+    #[test]
+    fn stationary_loops_preserve_legacy_defaults_and_use_saved_mechanics() {
+        let path = crate::test_support::automation_fixture();
+        let bank = Arc::new(Bank::load(&path, None).unwrap());
+        let settings = Settings::default();
+        let imported = AutomationModel::from_settings(&bank, &settings).unwrap();
+        let definition = EngineDefinition::from_scratch(&imported.scratch);
+        let explicit = Settings {
+            engine: Some(definition),
+            // Momentary bench controls cannot contaminate repeatable loops.
+            starter: true,
+            fuel_cut: 1.,
+            ..settings
+        };
+        let original =
+            loop_stems(bank.clone(), Parameters::default(), settings, 4000., 0.).unwrap();
+        let saved = loop_stems(bank.clone(), Parameters::default(), explicit, 4000., 0.).unwrap();
+        assert_eq!(original, saved);
+        let mut edited = definition;
+        edited.build.compression = 12.;
+        edited.tuning.cam.lift_mm = Some(12.);
+        let changed = loop_stems(
+            bank,
+            Parameters::default(),
+            Settings {
+                engine: Some(edited),
+                ..settings
+            },
+            4000.,
+            0.,
+        )
+        .unwrap();
+        assert!(
+            original
+                .0
+                .iter()
+                .zip(&changed.0)
+                .any(|(a, b)| (a - b).abs() > 1e-5),
+            "saved builder/tuning edits must reach the exported exhaust"
+        );
+        assert!(changed.0.iter().chain(&changed.1).all(|v| v.is_finite()));
+        std::fs::remove_file(path).unwrap();
     }
 }
 

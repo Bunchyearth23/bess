@@ -1,0 +1,1646 @@
+{
+  "amplitude_pa": 10.0,
+  "calibration": {
+    "generated_path": "output\\quality-calibration-20261003-r2\\synthetic-generated.wav",
+    "generated_sha256": "1d3fab174137750b43ee0b0303b2f178dfc5190136ca9d8d2f8f54be34f84fb5",
+    "held_out": {
+      "active_bins": 1021,
+      "after_rmse_db": 0.07119174601010489,
+      "before_rmse_db": 1.3301685998386101,
+      "calibrated_rms": 0.02479190104542284,
+      "reference_rms": 0.021213037447397408,
+      "source_rms": 0.02315433698970723
+    },
+    "note": "Linear magnitude matching at the supplied operating point only; final third held out. No phase identification, combustion identification or authenticity claim. Fixed PCM headroom attenuation is reported separately.",
+    "profile": {
+      "coefficients": [
+        -0.0,
+        -6.14238259563398e-8,
+        -2.4187620232593895e-7,
+        -5.157988810390514e-7,
+        -9.370867705162158e-7,
+        -1.5582268995392263e-6,
+        -2.1994816338115105e-6,
+        -2.7992441723154024e-6,
+        -3.7477176603283344e-6,
+        -5.088494943064383e-6,
+        -6.1394386115491455e-6,
+        -6.909329604456574e-6,
+        -8.435579661123427e-6,
+        -0.000010619427340132127,
+        -0.000012036555784697617,
+        -0.000012906032642830028,
+        -0.000015017675792083091,
+        -0.000018009862343105553,
+        -0.000019807737179356775,
+        -0.000020911064255970973,
+        -0.00002351622535359014,
+        -0.000027011704101237468,
+        -0.00002932287553290164,
+        -0.00003110936044792299,
+        -0.00003399172220367274,
+        -0.000037360894504520335,
+        -0.000040458337417270005,
+        -0.00004369230071229129,
+        -0.00004646237760629085,
+        -0.00004872326992017511,
+        -0.00005295334652286558,
+        -0.000058621353805950446,
+        -0.000060824172439659535,
+        -0.00006090313131312938,
+        -0.0000667073298001489,
+        -0.00007582395599592235,
+        -0.00007697397917984275,
+        -0.00007387480132526462,
+        -0.00008159828544715838,
+        -0.00009492093344406986,
+        -0.00009479599652036166,
+        -0.0000881225471020822,
+        -0.00009787681192456097,
+        -0.00011532372849930231,
+        -0.00011376933050385608,
+        -0.00010377142328690107,
+        -0.00011521090585041278,
+        -0.00013587843681553207,
+        -0.00013360867035562893,
+        -0.0001219411350472149,
+        -0.00013402552043610482,
+        -0.0001554238354198487,
+        -0.0001536051812874425,
+        -0.00014324429991836496,
+        -0.00015428880944971506,
+        -0.00017270602946649775,
+        -0.00017343339185193785,
+        -0.00016876771160888464,
+        -0.00017628183787493293,
+        -0.00018668950623411084,
+        -0.00019273271221061891,
+        -0.00019925743083072282,
+        -0.00020023447670373655,
+        -0.00019671426434490023,
+        -0.00021084808004618718,
+        -0.00023406670520176016,
+        -0.00022539891974066888,
+        -0.00020261914429004854,
+        -0.00022797210250754993,
+        -0.00027285815479664475,
+        -0.0002516725839251245,
+        -0.000205135158753318,
+        -0.00024357231348819447,
+        -0.00031322356278747933,
+        -0.0002786628841032657,
+        -0.00020721867596357112,
+        -0.00025867983495084614,
+        -0.0003521740852461625,
+        -0.0003055790411469743,
+        -0.0002124908605402522,
+        -0.0002736457111317451,
+        -0.0003842294499410901,
+        -0.00033024798962396956,
+        -0.00022524672543745153,
+        -0.00028937405609388487,
+        -0.0004042817649290456,
+        -0.00035299950975622876,
+        -0.0002530833676741561,
+        -0.0003060773118587193,
+        -0.0004021014910266437,
+        -0.0003702987221056278,
+        -0.00030485053420680196,
+        -0.0003276691712433552,
+        -0.00036944297571956866,
+        -0.00037840149040772755,
+        -0.0003883280622327065,
+        -0.0003564165461856532,
+        -0.00029700737750133554,
+        -0.00037620672763342137,
+        -0.0005173522990709001,
+        -0.00039706614281182347,
+        -0.0001692638006645582,
+        -0.00035408759888732585,
+        -0.0007047070229540161,
+        -0.00045791513646624513,
+        0.000030308291279664693,
+        -0.0003020096707656122,
+        -0.0009742624240582816,
+        -0.000557391797609422,
+        0.0003306754379728771,
+        -0.00019201341205211532,
+        -0.001363596867613561,
+        -0.0007374880179138584,
+        0.0007872652316402154,
+        0.000048618672709702566,
+        -0.0019514942877396457,
+        -0.0011221763193272098,
+        0.0015264567462911682,
+        0.0006563093137112572,
+        -0.0029544843571409044,
+        -0.0022245302417415844,
+        0.0029309476603256238,
+        0.002915635635252377,
+        -0.005105526543593805,
+        -0.008293373229410084,
+        0.006139587431762744,
+        0.03371149973334944,
+        0.0582256122088442,
+        1.0675469844029384,
+        0.0582256122088442,
+        0.03371149973334944,
+        0.006139587431762744,
+        -0.008293373229410086,
+        -0.005105526543593805,
+        0.002915635635252376,
+        0.002930947660325622,
+        -0.0022245302417415844,
+        -0.002954484357140907,
+        0.0006563093137112556,
+        0.001526456746291168,
+        -0.0011221763193272095,
+        -0.0019514942877396464,
+        0.00004861867270970192,
+        0.0007872652316402144,
+        -0.0007374880179138586,
+        -0.0013635968676135625,
+        -0.0001920134120521159,
+        0.00033067543797287704,
+        -0.0005573917976094217,
+        -0.0009742624240582821,
+        -0.00030200967076561276,
+        0.000030308291279664117,
+        -0.00045791513646624513,
+        -0.0007047070229540168,
+        -0.00035408759888732634,
+        -0.00016926380066455824,
+        -0.0003970661428118232,
+        -0.0005173522990708999,
+        -0.0003762067276334219,
+        -0.00029700737750133646,
+        -0.00035641654618565326,
+        -0.0003883280622327051,
+        -0.00037840149040772696,
+        -0.00036944297571956855,
+        -0.0003276691712433554,
+        -0.0003048505342068022,
+        -0.00037029872210562787,
+        -0.0004021014910266439,
+        -0.0003060773118587193,
+        -0.0002530833676741567,
+        -0.0003529995097562291,
+        -0.00040428176492904566,
+        -0.0002893740560938848,
+        -0.00022524672543745156,
+        -0.00033024798962396967,
+        -0.00038422944994109077,
+        -0.00027364571113174516,
+        -0.000212490860540252,
+        -0.00030557904114697466,
+        -0.0003521740852461624,
+        -0.00025867983495084614,
+        -0.0002072186759635711,
+        -0.0002786628841032656,
+        -0.0003132235627874796,
+        -0.0002435723134881945,
+        -0.00020513515875331817,
+        -0.0002516725839251247,
+        -0.0002728581547966447,
+        -0.00022797210250754987,
+        -0.00020261914429004862,
+        -0.0002253989197406689,
+        -0.00023406670520176103,
+        -0.0002108480800461872,
+        -0.00019671426434490007,
+        -0.0002002344767037369,
+        -0.00019925743083072295,
+        -0.00019273271221061897,
+        -0.00018668950623411092,
+        -0.00017628183787493293,
+        -0.00016876771160888478,
+        -0.00017343339185193785,
+        -0.00017270602946649794,
+        -0.00015428880944971517,
+        -0.000143244299918365,
+        -0.0001536051812874425,
+        -0.00015542383541984877,
+        -0.000134025520436105,
+        -0.00012194113504721505,
+        -0.00013360867035562887,
+        -0.00013587843681553215,
+        -0.00011521090585041284,
+        -0.00010377142328690106,
+        -0.00011376933050385611,
+        -0.00011532372849930238,
+        -0.00009787681192456108,
+        -0.00008812254710208235,
+        -0.00009479599652036174,
+        -0.00009492093344406998,
+        -0.00008159828544715853,
+        -0.00007387480132526458,
+        -0.00007697397917984273,
+        -0.00007582395599592235,
+        -0.0000667073298001489,
+        -0.00006090313131312926,
+        -0.00006082417243965958,
+        -0.0000586213538059506,
+        -0.00005295334652286562,
+        -0.00004872326992017517,
+        -0.00004646237760629093,
+        -0.00004369230071229136,
+        -0.00004045833741726998,
+        -0.00003736089450452036,
+        -0.00003399172220367274,
+        -0.000031109360447923045,
+        -0.000029322875532901666,
+        -0.000027011704101237485,
+        -0.000023516225353590182,
+        -0.000020911064255971017,
+        -0.00001980773717935684,
+        -0.000018009862343105597,
+        -0.000015017675792083135,
+        -0.00001290603264283003,
+        -0.000012036555784697617,
+        -0.000010619427340132127,
+        -8.435579661123424e-6,
+        -6.909329604456574e-6,
+        -6.1394386115491455e-6,
+        -5.088494943064408e-6,
+        -3.747717660328355e-6,
+        -2.7992441723154257e-6,
+        -2.1994816338115355e-6,
+        -1.558226899539226e-6,
+        -9.370867705162146e-7,
+        -5.157988810390516e-7,
+        -2.418762023259408e-7,
+        -6.142382595634007e-8,
+        -0.0
+      ],
+      "config": {
+        "fft_size": 4096,
+        "high_hz": 12000.0,
+        "low_hz": 40.0,
+        "max_gain_db": 12.0,
+        "regularization": 1e-6,
+        "taps": 257
+      },
+      "delay_samples": 128,
+      "output_safety_gain": 1.0,
+      "sample_rate": 48000,
+      "version": 1
+    },
+    "reference_path": "output\\quality-calibration-20261003-r2\\synthetic-reference.wav",
+    "reference_sha256": "b089ae79669659014a3c168a1195fa868c69fe3a3a6ead0b9750850df824f23a",
+    "training": {
+      "active_bins": 1021,
+      "after_rmse_db": 0.07118561679616606,
+      "before_rmse_db": 1.330178269565388,
+      "calibrated_rms": 0.024725292458143453,
+      "reference_rms": 0.021132462060785798,
+      "source_rms": 0.023070648568522235
+    }
+  },
+  "gamma": 1.33,
+  "gas_constant": 287.0,
+  "integrated_engine_cases": [
+    {
+      "duration_seconds": 0.2,
+      "elapsed_seconds": 3.1035418,
+      "failure_frames_waveguide_fv": [
+        null,
+        null
+      ],
+      "measurement_seconds": 0.1,
+      "peak_raw_exhaust_waveguide_fv": [
+        0.0380396731197834,
+        0.03782564401626587
+      ],
+      "quality_vs_waveguide_rms_db": -0.21863403232824813,
+      "rendering_seconds_waveguide_fv": [
+        0.0465252,
+        3.0565984
+      ],
+      "requested_frames": 9600,
+      "rpm": 900.0,
+      "settled_claim": false,
+      "throttle": 0.1,
+      "wall_seconds_per_simulated_second_waveguide_fv": [
+        0.232626,
+        15.282991999999998
+      ]
+    },
+    {
+      "duration_seconds": 0.2,
+      "elapsed_seconds": 3.5052982,
+      "failure_frames_waveguide_fv": [
+        null,
+        null
+      ],
+      "measurement_seconds": 0.1,
+      "peak_raw_exhaust_waveguide_fv": [
+        0.10762001574039459,
+        0.10607971251010895
+      ],
+      "quality_vs_waveguide_rms_db": 0.7071054215317425,
+      "rendering_seconds_waveguide_fv": [
+        0.0478069,
+        3.457277
+      ],
+      "requested_frames": 9600,
+      "rpm": 3000.0,
+      "settled_claim": false,
+      "throttle": 0.8,
+      "wall_seconds_per_simulated_second_waveguide_fv": [
+        0.23903449999999998,
+        17.286385
+      ]
+    }
+  ],
+  "kind": "offline_numerical_and_synthetic_validation",
+  "limits": "Small-signal single constant-area primary compared to a lossless fractional-delay waveguide. Identical downstream losses are omitted. Does not validate the complete collector/muffler network, combustion, large-amplitude coupling, wall losses or real vehicle sound. Calibration reference is an explicitly synthetic linear FIR transform, never an authentic engine recording.",
+  "low_order_band_hz": [
+    80,
+    1000
+  ],
+  "pressure_pa": 101325.0,
+  "primary_all_within_2_db": false,
+  "primary_area_m2": 0.001,
+  "primary_comparison": [
+    {
+      "actual_cell_m": 0.01916666666666667,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          6.077973740621774e-9,
+          3.0806839161804194e-6,
+          0.004731530848701855
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000064101123967,
+        "min_density": 0.5245506463857594,
+        "min_pressure": 101315.00110411896,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0328532,
+      "frequency_hz": 80.0,
+      "fv_vs_waveguide_db": -0.001308922101460735,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.0651710902842535,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.01916666666666667,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          1.6593120229517343e-9,
+          8.410421449434424e-7,
+          0.0012917358110585845
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.400000993865862,
+        "min_density": 0.5245506498361178,
+        "min_pressure": 101315.00207054854,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0326483,
+      "frequency_hz": 125.0,
+      "fv_vs_waveguide_db": -0.0032034463168262115,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.10079277278057207,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.01916666666666667,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -3.2055668666464676e-9,
+          -1.6246077725616653e-6,
+          -0.0024952673537477583
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000191024796616,
+        "min_density": 0.524550667249697,
+        "min_pressure": 101315.00696211544,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0326823,
+      "frequency_hz": 250.0,
+      "fv_vs_waveguide_db": -0.01302030717161574,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.19228966780635298,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.01916666666666667,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -5.580299368381222e-9,
+          -2.827922118574368e-6,
+          -0.004343523975515528
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000033716687694,
+        "min_density": 0.5245507368497428,
+        "min_pressure": 101315.02650385057,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.032904,
+      "frequency_hz": 500.0,
+      "fv_vs_waveguide_db": -0.055004863238410334,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.31942231521684594,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.01916666666666667,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -6.109901725657438e-9,
+          -3.0925405187961816e-6,
+          -0.004754229991760967
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000050352293534,
+        "min_density": 0.5245510312972705,
+        "min_pressure": 101315.10877953075,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0330441,
+      "frequency_hz": 1000.0,
+      "fv_vs_waveguide_db": -0.27285191699278144,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.23645353855735032,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.01916666666666667,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -5.135023598496836e-10,
+          -2.5138061695304354e-7,
+          -0.00038777420203352345
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000844118458956,
+        "min_density": 0.524552345878583,
+        "min_pressure": 101315.4732915587,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0328931,
+      "frequency_hz": 2000.0,
+      "fv_vs_waveguide_db": -2.0056877985833856,
+      "length_m": 0.23,
+      "phase_error_degrees": 2.3216628623079165,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": false
+    },
+    {
+      "actual_cell_m": 0.01916666666666667,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -8.014689585445051e-10,
+          -3.844639250899286e-7,
+          -0.0005924428815176514
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000160562727541,
+        "min_density": 0.5245556242426092,
+        "min_pressure": 101316.4309114757,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0326293,
+      "frequency_hz": 4000.0,
+      "fv_vs_waveguide_db": -15.932884268261795,
+      "length_m": 0.23,
+      "phase_error_degrees": 30.796826471482117,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": false
+    },
+    {
+      "actual_cell_m": 0.019642857142857146,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          1.664810436419394e-8,
+          8.4383029766832e-6,
+          0.012960095826593064
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000006389046548,
+        "min_density": 0.5245506465043692,
+        "min_pressure": 101315.00113608666,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.070363,
+      "frequency_hz": 80.0,
+      "fv_vs_waveguide_db": -0.0014407152133472756,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.06443245371497552,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.019642857142857146,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          8.74411350816803e-9,
+          4.43208419723539e-6,
+          0.006807031215249361
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000096040655425,
+        "min_density": 0.5245506501253355,
+        "min_pressure": 101315.00214854152,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0701599,
+      "frequency_hz": 125.0,
+      "fv_vs_waveguide_db": -0.003532722285010243,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.09809996275697054,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.019642857142857146,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -1.4422564521448758e-8,
+          -7.3096423140938684e-6,
+          -0.01122701486310091
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000159377509265,
+        "min_density": 0.5245506661251581,
+        "min_pressure": 101315.00668827667,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0702743,
+      "frequency_hz": 250.0,
+      "fv_vs_waveguide_db": -0.014636803748341809,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.1726462468038111,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.019642857142857146,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -1.2243696702050544e-8,
+          -6.205091945878523e-6,
+          -0.009530509923489585
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000293731789854,
+        "min_density": 0.5245507316727813,
+        "min_pressure": 101315.02523371519,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0706767,
+      "frequency_hz": 500.0,
+      "fv_vs_waveguide_db": -0.06781118011990643,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.1848876805495951,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.019642857142857146,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -6.19171181355607e-10,
+          -3.1124352921901616e-7,
+          -0.00047876693972763673
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000394751639634,
+        "min_density": 0.5245509984546043,
+        "min_pressure": 101315.10050496121,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.070744,
+      "frequency_hz": 1000.0,
+      "fv_vs_waveguide_db": -0.45131070161421893,
+      "length_m": 0.55,
+      "phase_error_degrees": 0.5507383749379734,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.019642857142857146,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -1.14880100875726e-9,
+          -5.668712464309166e-7,
+          -0.0008722825926854518
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000086603026221,
+        "min_density": 0.5245521534031616,
+        "min_pressure": 101315.42470083889,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.070663,
+      "frequency_hz": 2000.0,
+      "fv_vs_waveguide_db": -4.933727989150693,
+      "length_m": 0.55,
+      "phase_error_degrees": 8.81378162411716,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": false
+    },
+    {
+      "actual_cell_m": 0.019642857142857146,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -8.041047962749046e-10,
+          -3.8434162483488377e-7,
+          -0.0005936840009434307
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40001654048339075,
+        "min_density": 0.524555831439873,
+        "min_pressure": 101316.48712056756,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0704475,
+      "frequency_hz": 4000.0,
+      "fv_vs_waveguide_db": -38.31136796575874,
+      "length_m": 0.55,
+      "phase_error_degrees": 79.45730919565023,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": false
+    },
+    {
+      "actual_cell_m": 0.02,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          2.2189302082021266e-8,
+          0.000011246927287860986,
+          0.017273781067350686
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000006366887148,
+        "min_density": 0.5245506465996455,
+        "min_pressure": 101315.00116170546,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0862953,
+      "frequency_hz": 80.0,
+      "fv_vs_waveguide_db": -0.0014471101215762696,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.06401645664988591,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.02,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          1.356905952403959e-8,
+          6.877608102387978e-6,
+          0.010563121912015848
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000009331147185,
+        "min_density": 0.5245506503577432,
+        "min_pressure": 101315.00221106067,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0866207,
+      "frequency_hz": 125.0,
+      "fv_vs_waveguide_db": -0.0035501993093088814,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.09665403179552923,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.02,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -1.9784732632543617e-8,
+          -0.000010027312033515002,
+          -0.01540113210388353
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000014452583506,
+        "min_density": 0.5245506693551157,
+        "min_pressure": 101315.00752960946,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0867141,
+      "frequency_hz": 250.0,
+      "fv_vs_waveguide_db": -0.014893667143850394,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.1623020879738202,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.02,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -8.355678838675489e-9,
+          -4.235120925721973e-6,
+          -0.006503750786202869
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000029802008353,
+        "min_density": 0.5245507449782393,
+        "min_pressure": 101315.02869801075,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.086902,
+      "frequency_hz": 500.0,
+      "fv_vs_waveguide_db": -0.07269082437150297,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.11584025984528086,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.02,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -5.308974998551409e-9,
+          -2.688154000076877e-6,
+          -0.004128813413189118
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000040904109051,
+        "min_density": 0.5245510609076034,
+        "min_pressure": 101315.11680548232,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0871098,
+      "frequency_hz": 1000.0,
+      "fv_vs_waveguide_db": -0.5556255745163934,
+      "length_m": 0.7,
+      "phase_error_degrees": 1.0300169174127534,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.02,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -1.6139569858978311e-9,
+          -8.014920303894094e-7,
+          -0.0012312263835093228
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000882804824905,
+        "min_density": 0.524552235822578,
+        "min_pressure": 101315.44664912065,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0868084,
+      "frequency_hz": 2000.0,
+      "fv_vs_waveguide_db": -6.4373257339328935,
+      "length_m": 0.7,
+      "phase_error_degrees": 12.431850013456332,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": false
+    },
+    {
+      "actual_cell_m": 0.02,
+      "diagnostics": {
+        "accepted_substeps": 17280,
+        "boundary_exchange": [
+          -8.098285167925643e-10,
+          -3.8672898319038536e-7,
+          -0.0005981356257584529
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000169083029437,
+        "min_density": 0.5245559845364349,
+        "min_pressure": 101316.52866379544,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.0864628,
+      "frequency_hz": 4000.0,
+      "fv_vs_waveguide_db": -49.730788934498584,
+      "length_m": 0.7,
+      "phase_error_degrees": -252.96809216286383,
+      "requested_max_cell_m": 0.02,
+      "simulated_seconds": 0.18,
+      "within_2_db": false
+    },
+    {
+      "actual_cell_m": 0.003965517241379311,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          6.074408613697195e-9,
+          3.0788457045241243e-6,
+          0.004728745770642847
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000003676019088,
+        "min_density": 0.5245506437864718,
+        "min_pressure": 101315.00040839282,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.48422,
+      "frequency_hz": 80.0,
+      "fv_vs_waveguide_db": -0.00003029396834794689,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.16084861113761562,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003965517241379311,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          1.6509902048716297e-9,
+          8.368491746449735e-7,
+          0.001285233838903006
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000005702651248,
+        "min_density": 0.5245506441477112,
+        "min_pressure": 101315.0005286657,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.4840115,
+      "frequency_hz": 125.0,
+      "fv_vs_waveguide_db": -0.00007450599535282152,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.2512636523524968,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003965517241379311,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -3.1933076465307293e-9,
+          -1.6185624070901725e-6,
+          -0.0024858197922789436
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000109920760746,
+        "min_density": 0.5245506420335599,
+        "min_pressure": 101315.0001988535,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.4849783,
+      "frequency_hz": 250.0,
+      "fv_vs_waveguide_db": -0.00030089560408801266,
+      "length_m": 0.23,
+      "phase_error_degrees": -0.5021716147947417,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003965517241379311,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -5.5731644509344874e-9,
+          -2.824793241997316e-6,
+          -0.004338367325871671
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000187784485713,
+        "min_density": 0.5245506361841783,
+        "min_pressure": 101314.9995004912,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.484715,
+      "frequency_hz": 500.0,
+      "fv_vs_waveguide_db": -0.0011945601161188542,
+      "length_m": 0.23,
+      "phase_error_degrees": -1.001127324818999,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003965517241379311,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -6.19224500820687e-9,
+          -3.13798920095306e-6,
+          -0.004820215077098897
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000030500607188,
+        "min_density": 0.5245506538881618,
+        "min_pressure": 101315.00660269341,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.4856851,
+      "frequency_hz": 1000.0,
+      "fv_vs_waveguide_db": -0.004766001607076452,
+      "length_m": 0.23,
+      "phase_error_degrees": -1.9781633348259908,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003965517241379311,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.5956681987704984e-10,
+          -8.021041325183276e-8,
+          -0.00012371788329971668
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000015156317876,
+        "min_density": 0.5245506808598407,
+        "min_pressure": 101315.02526385347,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.4892519,
+      "frequency_hz": 2000.0,
+      "fv_vs_waveguide_db": -0.02440826109460503,
+      "length_m": 0.23,
+      "phase_error_degrees": -3.7995183047571124,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003965517241379311,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -3.4000240683871344e-10,
+          -1.695406289012595e-7,
+          -0.00026189500699186146
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.400003693818983,
+        "min_density": 0.5245502118800333,
+        "min_pressure": 101314.95405329259,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 0.487944,
+      "frequency_hz": 4000.0,
+      "fv_vs_waveguide_db": -0.26317124613998566,
+      "length_m": 0.23,
+      "phase_error_degrees": -6.71034194691721,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003985507246376812,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          1.66464779806637e-8,
+          8.437432088158145e-6,
+          0.01295881940181513
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000035935020384,
+        "min_density": 0.5245506437859981,
+        "min_pressure": 101315.00040829116,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.1314946,
+      "frequency_hz": 80.0,
+      "fv_vs_waveguide_db": -0.00007381543877117548,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.1602603907229053,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003985507246376812,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          8.739190285282755e-9,
+          4.42955409070507e-6,
+          0.0068031733535878535
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000053876019054,
+        "min_density": 0.5245506441528999,
+        "min_pressure": 101315.00053074103,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.1315104,
+      "frequency_hz": 125.0,
+      "fv_vs_waveguide_db": -0.00017581550863841644,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.2502863736473359,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003985507246376812,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.4437381406550655e-8,
+          -7.317146337002569e-6,
+          -0.011238652488672613
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000088092878744,
+        "min_density": 0.5245506446412218,
+        "min_pressure": 101315.00082701274,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.1321592,
+      "frequency_hz": 250.0,
+      "fv_vs_waveguide_db": -0.000722137490232121,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.4995926101019218,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003985507246376812,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.2275339522087477e-8,
+          -6.221264613316678e-6,
+          -0.00955561403123632
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.400001580449015,
+        "min_density": 0.5245506466001505,
+        "min_pressure": 101315.00201272946,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.1352653,
+      "frequency_hz": 500.0,
+      "fv_vs_waveguide_db": -0.002878575956452439,
+      "length_m": 0.55,
+      "phase_error_degrees": -0.9914074517141369,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003985507246376812,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -5.451136102986212e-10,
+          -2.756513961928964e-7,
+          -0.00042406137758469435
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000015271426395,
+        "min_density": 0.524550654314901,
+        "min_pressure": 101315.00677292963,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.1404785,
+      "frequency_hz": 1000.0,
+      "fv_vs_waveguide_db": -0.011928300162562003,
+      "length_m": 0.55,
+      "phase_error_degrees": -1.9281731611046966,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003985507246376812,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.0014998829813847e-9,
+          -5.067464736077501e-7,
+          -0.0007788878388100042
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.400001517009236,
+        "min_density": 0.5245506824430023,
+        "min_pressure": 101315.02580475749,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.1462184,
+      "frequency_hz": 2000.0,
+      "fv_vs_waveguide_db": -0.06633867095621035,
+      "length_m": 0.55,
+      "phase_error_degrees": -3.5388595023865768,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.003985507246376812,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.2513004330678866e-9,
+          -6.295468531502129e-7,
+          -0.0009685254212182948
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000037081849825,
+        "min_density": 0.524550210372813,
+        "min_pressure": 101314.95297388814,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.1347009,
+      "frequency_hz": 4000.0,
+      "fv_vs_waveguide_db": -0.7830288618228181,
+      "length_m": 0.55,
+      "phase_error_degrees": -5.797337155173894,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.004,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          2.218876135110664e-8,
+          0.000011246619928984368,
+          0.017273349325139936
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000003533191767,
+        "min_density": 0.5245506437856683,
+        "min_pressure": 101315.0004082205,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.433147,
+      "frequency_hz": 80.0,
+      "fv_vs_waveguide_db": -0.000013471643451716653,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.15983775947732512,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.004,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          1.3566545608018441e-8,
+          6.876358619769525e-6,
+          0.010561138427213469
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000005201209747,
+        "min_density": 0.5245506441565695,
+        "min_pressure": 101315.00053226625,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.4338994999999999,
+      "frequency_hz": 125.0,
+      "fv_vs_waveguide_db": -0.000023766144154049404,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.249606045130841,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.004,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.9804767190100527e-8,
+          -0.000010037463338455738,
+          -0.01541683749051289
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000008084340046,
+        "min_density": 0.5245506446528938,
+        "min_pressure": 101315.00083236086,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.4365790999999999,
+      "frequency_hz": 250.0,
+      "fv_vs_waveguide_db": -0.00013573519516165648,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.4979043103552197,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.004,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -8.37821584878919e-9,
+          -4.246338469088523e-6,
+          -0.00652181678461562
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000015808769665,
+        "min_density": 0.5245506361558084,
+        "min_pressure": 101314.99949504678,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.4366257,
+      "frequency_hz": 500.0,
+      "fv_vs_waveguide_db": -0.0005653138128407046,
+      "length_m": 0.7,
+      "phase_error_degrees": -0.98579610404076,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.004,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -5.565893874092174e-9,
+          -2.8203015192415615e-6,
+          -0.0043324356874544665
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000015272791234,
+        "min_density": 0.5245506544027397,
+        "min_pressure": 101315.00683023731,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.4393732,
+      "frequency_hz": 1000.0,
+      "fv_vs_waveguide_db": -0.003248528234884619,
+      "length_m": 0.7,
+      "phase_error_degrees": -1.9020992162585724,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.004,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.2649181153929703e-9,
+          -6.401424854659692e-7,
+          -0.0009838124465035715
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.40000151856787186,
+        "min_density": 0.5245506830244001,
+        "min_pressure": 101315.02610276875,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.4444396,
+      "frequency_hz": 2000.0,
+      "fv_vs_waveguide_db": -0.0436932428564362,
+      "length_m": 0.7,
+      "phase_error_degrees": -3.3997905397594304,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    },
+    {
+      "actual_cell_m": 0.004,
+      "diagnostics": {
+        "accepted_substeps": 60480,
+        "boundary_exchange": [
+          -1.4546919688567685e-9,
+          -7.316694164384869e-7,
+          -0.0011254163095746723
+        ],
+        "first_order_steps": 0,
+        "geometry_exchange": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "hlle_faces": 0,
+        "max_cfl": 0.4000037359593191,
+        "min_density": 0.5245502114241148,
+        "min_pressure": 101314.95300727292,
+        "rejected_trials": 0
+      },
+      "elapsed_seconds": 1.438777,
+      "frequency_hz": 4000.0,
+      "fv_vs_waveguide_db": -0.8615392768822855,
+      "length_m": 0.7,
+      "phase_error_degrees": -5.106389905596087,
+      "requested_max_cell_m": 0.004,
+      "simulated_seconds": 0.18,
+      "within_2_db": true
+    }
+  ],
+  "primary_mesh_summaries": [
+    {
+      "all_tested_worst_error_db": 49.730788934498584,
+      "elapsed_seconds": 1.3298958,
+      "low_order_worst_error_db": 0.5556255745163934,
+      "requested_max_cell_m": 0.02,
+      "wall_seconds_per_simulated_second": 0.35182428571428576
+    },
+    {
+      "all_tested_worst_error_db": 0.8615392768822855,
+      "elapsed_seconds": 21.4154742,
+      "low_order_worst_error_db": 0.011928300162562003,
+      "requested_max_cell_m": 0.004,
+      "wall_seconds_per_simulated_second": 5.665469365079365
+    }
+  ],
+  "propagation_elapsed_seconds": 22.7467124,
+  "sample_rate": 48000,
+  "temperature_k": 673.0,
+  "worst_primary_error_db": 49.730788934498584
+}

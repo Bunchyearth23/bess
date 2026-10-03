@@ -19,6 +19,8 @@ const PCM24_DECODE_SCALE: f32 = 8_388_608.;
 
 #[derive(Clone, Debug)]
 pub struct Report {
+    /// The exact complete physical engine used to render the measured files.
+    pub engine: crate::engine_definition::EngineDefinition,
     /// Common linear gain applied to every exported exhaust WAV.
     pub safety_gain: f32,
     /// The primary exhaust difference uses an 80 Hz high-pass proxy for the
@@ -111,7 +113,7 @@ impl Stats {
     }
 
     fn from_pcm24(samples: &[f32], gain: f32) -> Result<Self, String> {
-        if !gain.is_finite() || gain <= 0. {
+        if !gain.is_finite() || gain < 0. {
             return Err("Invalid BeamNG export gain".into());
         }
         // Match hound's PCM24 write followed by Bank::decode_wav. The exhaust
@@ -199,8 +201,7 @@ fn dbfs_allow_silence(value: f32) -> Result<f32, String> {
 /// Render every original blend point using the variant export's audio path.
 /// This is CPU-intensive and should be called from a worker thread.
 pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, String> {
-    let h = export::physical_settings(h);
-    crate::automation_model::AutomationModel::from_bank(&bank)?;
+    let (h, _) = export::resolved_settings(&bank, h)?;
     p.validate()?;
     h.validate()?;
     let archive = Path::new(&bank.source.archive);
@@ -330,6 +331,7 @@ pub fn analyze(bank: Arc<Bank>, p: Parameters, h: Settings) -> Result<Report, St
         });
     }
     Ok(Report {
+        engine: h.engine.expect("resolved export engine"),
         safety_gain,
         post_low_cut_estimate: true,
         points,
@@ -380,12 +382,165 @@ mod tests {
     }
 
     #[test]
+    fn muted_engine_pcm24_has_valid_silent_metrics() {
+        let samples = [0.1, -0.2, 0.3];
+        let muted = Stats::from_pcm24(&samples, 0.).unwrap();
+        assert_eq!((muted.rms, muted.raw_rms, muted.peak), (0., 0., 0.));
+        assert_eq!(dbfs_allow_silence(muted.rms).unwrap(), f32::NEG_INFINITY);
+        assert!(Stats::from_pcm24(&samples, -0.1).is_err());
+        assert!(Stats::from_pcm24(&samples, f32::NAN).is_err());
+    }
+
+    #[test]
     fn db_differences_match_linear_ratios() {
         let source = dbfs(0.1).unwrap();
         let exhaust = dbfs(0.2).unwrap();
         let engine = dbfs(0.05).unwrap();
         assert!(((exhaust - source) - 6.0206).abs() < 0.001);
         assert!(((engine - exhaust) + 12.0412).abs() < 0.001);
+    }
+
+    #[test]
+    fn edited_engine_report_matches_actual_variant_wavs_and_preserves_source() {
+        const UID: &str = "694E80154252F6189DE80988120C7F13";
+        let fixture = crate::test_support::automation_fixture();
+        let work = fixture.with_extension("unified-export");
+        std::fs::create_dir(&work).unwrap();
+        let source = work.join("source.zip");
+        let mut original = zip::ZipArchive::new(File::open(&fixture).unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(File::create(&source).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for index in 0..original.len() {
+            let mut entry = original.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            let mut name = entry.name().to_owned();
+            if name.ends_with(".wav") {
+                name = name.replace("art/sound/", &format!("art/sound/engine/{UID}/"));
+            } else if name.ends_with(".sfxBlend2D.json") {
+                bytes = String::from_utf8(bytes)
+                    .unwrap()
+                    .replace("art/sound/", &format!("art/sound/engine/{UID}/"))
+                    .into_bytes();
+            } else if name.ends_with(".jbeam") {
+                bytes = format!(
+                    r#"{{"Camso_Engine_694e8":{{
+                        "slotType": "Camso_Engine",
+                        "soundConfigExhaust":{{"sampleName":"{UID}"}},
+                        "mainEngine":{{"soundConfigExhaust":"soundConfigExhaust",
+                            "maxRPM":6000,"inertia":0.2,"afterFireAudioCoef":1.7,
+                            "torque":[["rpm","torque"],[800,90],[4000,170]]}}
+                    }}}}"#
+                )
+                .into_bytes();
+            }
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer
+            .start_file("vehicles/test/info_test.json", options)
+            .unwrap();
+        writer
+            .write_all(br#"{"Configuration":"Original"}"#)
+            .unwrap();
+        writer.finish().unwrap();
+        drop(original);
+        std::fs::remove_file(fixture).unwrap();
+
+        let before = std::fs::read(&source).unwrap();
+        let bank = Arc::new(Bank::load(&source, None).unwrap());
+        let mut engine = crate::automation_model::AutomationModel::from_bank(&bank)
+            .unwrap()
+            .baseline;
+        // A prior importer may have used different estimates. Its original
+        // reference must survive export and reload instead of being replaced.
+        let mut saved_baseline = engine;
+        saved_baseline.build.compression = 8.5;
+        engine.build.compression = 11.;
+        engine.tuning.cam.lift_mm = Some(11.5);
+        let settings = Settings {
+            engine: Some(engine),
+            engine_baseline: Some(saved_baseline),
+            fuel_cut: 1.,
+            starter: true,
+            ..Settings::default()
+        };
+        let output = work.join("variant");
+        variant::package(&output, Parameters::default(), settings, bank.clone()).unwrap();
+        let report = analyze(bank.clone(), Parameters::default(), settings).unwrap();
+        assert_eq!(report.engine, engine);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["engine_definition"],
+            serde_json::to_value(engine).unwrap()
+        );
+        assert_eq!(
+            manifest["engine_baseline"],
+            serde_json::to_value(saved_baseline).unwrap()
+        );
+        assert_eq!(manifest["settings"]["fuel_cut"], 0.);
+        assert_eq!(
+            manifest["source_engine_fingerprint"],
+            serde_json::json!(bank.source.engine_fingerprint)
+        );
+        assert_eq!(manifest["loop_policy"]["mode"], "stationary_rpm_load_loops");
+        let saved = crate::project::load_project(&output.join("settings.bess.json")).unwrap();
+        assert_eq!(saved.hybrid.engine, Some(engine));
+        assert_eq!(saved.hybrid.engine_baseline, Some(saved_baseline));
+
+        let mut produced = zip::ZipArchive::new(
+            File::open(output.join(manifest["zip_file"].as_str().unwrap())).unwrap(),
+        )
+        .unwrap();
+        for (field, engine_stem) in [("wav_paths", false), ("engine_wav_paths", true)] {
+            let paths = manifest[field].as_array().unwrap();
+            assert_eq!(paths.len(), report.points.len());
+            for (path, point) in paths.iter().zip(&report.points) {
+                let wav =
+                    read_limited(&mut produced, path.as_str().unwrap(), MAX_WAV_BYTES).unwrap();
+                let (rate, pcm) = bank::decode_wav(&wav).unwrap();
+                assert_eq!(rate, 48_000);
+                let stats = Stats::from_samples(&pcm).unwrap();
+                assert!(stats.peak <= 0.951);
+                let (rms, peak) = if engine_stem {
+                    (point.engine_rms_dbfs, point.engine_peak_dbfs)
+                } else {
+                    (point.exhaust_rms_dbfs, point.exhaust_peak_dbfs)
+                };
+                assert!((dbfs(stats.rms).unwrap() - rms).abs() < 0.001);
+                assert!((dbfs(stats.peak).unwrap() - peak).abs() < 0.001);
+            }
+        }
+        let engine_bytes = read_limited(
+            &mut produced,
+            manifest["engine_path"].as_str().unwrap(),
+            MAX_BLEND_BYTES,
+        )
+        .unwrap();
+        let jbeam: serde_json::Value = serde_json::from_slice(&engine_bytes).unwrap();
+        let physical = &jbeam[manifest["engine_part"].as_str().unwrap()]["mainEngine"];
+        assert_eq!(physical["maxRPM"], 6000);
+        assert_eq!(physical["inertia"], 0.2);
+        assert_eq!(physical["torque"][2][1], 170);
+        assert_eq!(physical["afterFireAudioCoef"], 1.7);
+        let muted = analyze(
+            bank,
+            Parameters::default(),
+            Settings {
+                engine_gain: 0.,
+                ..settings
+            },
+        )
+        .unwrap();
+        for point in muted.points {
+            assert_eq!(point.engine_rms_dbfs, f32::NEG_INFINITY);
+            assert_eq!(point.engine_peak_dbfs, f32::NEG_INFINITY);
+            assert_eq!(point.engine_vs_exhaust_db, f32::NEG_INFINITY);
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        drop(produced);
+        std::fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

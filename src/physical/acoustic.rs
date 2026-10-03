@@ -1,5 +1,7 @@
 //! Cylinder mass-flow boundaries and separate primaries joined to two exhausts.
-//! Linear acoustic perturbations ride on the 0D mean state. This is not 1D CFD.
+//! Default: linear acoustic perturbations ride on the 0D mean state.
+//! Optional quality mode replaces only primary propagation with conservative
+//! finite volumes; the collector/tail network remains a waveguide model.
 //! Coupled (`begin`/`port`/`finish`, X-017/X-028): the valve port superposes
 //! waves as pressure-amplitude ratios (`wave_junction`) and the pipes use the
 //! collector gas's own γ and R.
@@ -17,7 +19,7 @@ struct Primary {
     length_m: f64,
     target_length_m: f64,
     base_length_m: f64,
-    bank_extension_m: f64,
+    quality: Option<super::finite_volume::Primary1d>,
     area_m2: f64,
     bank: usize,
     previous_flow: f64,
@@ -26,6 +28,7 @@ struct Primary {
     backward_state: f64,
     mean_flow: f64,
     loss: f64,
+    target_loss: f64,
 }
 
 pub struct Acoustic {
@@ -37,6 +40,8 @@ pub struct Acoustic {
     temperatures: [f64; 2],
     geometry: Geometry,
     muffler_volume_scale: f32,
+    exhaust_decay_ms: f32,
+    loss_fade_remaining: u32,
     tick: u32,
     filter: f64,
     pole: f64,
@@ -54,6 +59,8 @@ pub struct Acoustic {
     /// (γ, R) of each bank's gas, coupled path only; the legacy path keeps
     /// its air constants 1.33 / 287.
     gas: [(f64, f64); 2],
+    failed: bool,
+    primary_reflections: bool,
 }
 
 impl Acoustic {
@@ -73,22 +80,24 @@ impl Acoustic {
                     Headers::Tubular => 0.55 + 0.04 * (i % 3) as f64,
                     Headers::EqualLength => 0.7,
                 };
-                // Scale the primary itself; the separate bank timing control
-                // retains its requested extra propagation time.
-                let bank_extension = if bank == 1 {
-                    f64::from(design.bank_delay_ms) * 0.001 * 550.
+                // Bank delay is an observation control, downstream of every
+                // gas/wave feedback path (X-030); geometry is physical only.
+                let length = primary_length * f64::from(tuning.primary_length_scale);
+                // Preserve the historical first control interval exactly at
+                // 120 ms; other initial settings take effect immediately.
+                let loss = if tuning.exhaust_decay_ms == 120. {
+                    0.96
                 } else {
-                    0.
+                    let speed = (1.33_f64 * 287. * 673.).sqrt();
+                    0.001_f64.powf((length / speed) / (f64::from(tuning.exhaust_decay_ms) / 1000.))
                 };
-                let length =
-                    primary_length * f64::from(tuning.primary_length_scale) + bank_extension;
                 Primary {
                     forward: DelayLine::new(rate as f32, 0.03),
                     backward: DelayLine::new(rate as f32, 0.03),
                     length_m: length,
                     target_length_m: length,
                     base_length_m: primary_length,
-                    bank_extension_m: bank_extension,
+                    quality: None,
                     area_m2: primary_area,
                     bank,
                     previous_flow: 0.,
@@ -96,7 +105,8 @@ impl Acoustic {
                     forward_state: 0.,
                     backward_state: 0.,
                     mean_flow: 0.,
-                    loss: 0.96,
+                    loss,
+                    target_loss: loss,
                 }
             })
             .collect();
@@ -128,6 +138,7 @@ impl Acoustic {
             tails: std::array::from_fn(|_| {
                 let mut tail = ExhaustNetwork::new(rate as f32, geometry, layout);
                 tail.set_chamber_length_scale(tuning.muffler_volume_scale);
+                tail.set_decay_ms(tuning.exhaust_decay_ms);
                 tail.tune(geometry, true);
                 tail
             }),
@@ -137,6 +148,8 @@ impl Acoustic {
             temperatures: [673.; 2],
             geometry,
             muffler_volume_scale: tuning.muffler_volume_scale,
+            exhaust_decay_ms: tuning.exhaust_decay_ms,
+            loss_fade_remaining: 0,
             tick: 0,
             filter: 1. - (-std::f64::consts::TAU * 7000. / f64::from(rate)).exp(),
             pole: (-std::f64::consts::TAU * 12. / f64::from(rate)).exp(),
@@ -168,7 +181,41 @@ impl Acoustic {
             coupled: false,
             bank_mean_pa: [f64::NAN; 2],
             gas: [(1.33, 287.); 2],
+            failed: false,
+            primary_reflections: true,
         }
+    }
+
+    /// Allocate the optional quality solver during offline preparation only.
+    /// Its fixed reference gas is explicit; changing it requires a rebuild.
+    pub fn enable_primary_1d(&mut self) -> Result<(), &'static str> {
+        for primary in &mut self.primaries {
+            // Decay tuning belongs to the waveguide approximation. Keep the
+            // quality solver and its existing observation losses unchanged;
+            // the downstream collector/tail network still uses the control.
+            primary.loss = 0.96;
+            primary.target_loss = 0.96;
+            primary.quality = Some(super::finite_volume::Primary1d::new(
+                primary.length_m,
+                primary.area_m2,
+                self.rate as u32,
+                101325.,
+                673.,
+                1.33,
+                287.,
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Offline diagnostic: retain the coupled local port impedance but absorb
+    /// every wave returning to a valve. Not a playable exhaust configuration.
+    pub fn suppress_primary_reflections_for_reference(&mut self) {
+        self.primary_reflections = false;
     }
 
     /// Retarget acoustic dimensions without clearing delayed waves, filters,
@@ -176,21 +223,44 @@ impl Acoustic {
     /// downstream tubes retain their existing internal delay smoothing.
     pub fn retune(&mut self, tuning: &SoundTuning) {
         for primary in &mut self.primaries {
-            primary.target_length_m = primary.base_length_m
-                * f64::from(tuning.primary_length_scale)
-                + primary.bank_extension_m;
+            primary.target_length_m =
+                primary.base_length_m * f64::from(tuning.primary_length_scale);
+            if let Some(quality) = &mut primary.quality {
+                // The optional finite-volume model reports this geometry
+                // exchange explicitly; it never silently clips a bad state.
+                self.failed |= quality.retune(primary.target_length_m).is_err();
+            }
         }
         if self.geometry.tail == tuning.tail_length_m
             && self.geometry.absorption == tuning.muffler_absorption
             && self.muffler_volume_scale == tuning.muffler_volume_scale
+            && self.exhaust_decay_ms == tuning.exhaust_decay_ms
         {
             return;
         }
         self.geometry.tail = tuning.tail_length_m;
         self.geometry.absorption = tuning.muffler_absorption;
         self.muffler_volume_scale = tuning.muffler_volume_scale;
+        if self.exhaust_decay_ms != tuning.exhaust_decay_ms {
+            self.exhaust_decay_ms = tuning.exhaust_decay_ms;
+            self.loss_fade_remaining = (self.rate * 0.03).ceil().max(1.) as u32;
+            for primary in &mut self.primaries {
+                if primary.quality.is_none() {
+                    let (gamma, r) = if self.coupled {
+                        self.gas[primary.bank]
+                    } else {
+                        (1.33, 287.)
+                    };
+                    let speed = (gamma * r * self.temperatures[primary.bank]).sqrt();
+                    primary.target_loss = 0.001_f64.powf(
+                        (primary.length_m / speed) / (f64::from(self.exhaust_decay_ms) / 1000.),
+                    );
+                }
+            }
+        }
         for (bank, tail) in self.tails.iter_mut().enumerate() {
             tail.set_chamber_length_scale(tuning.muffler_volume_scale);
+            tail.set_decay_ms(tuning.exhaust_decay_ms);
             tail.tune(
                 Geometry {
                     temperature_c: (self.temperatures[bank] - 273.15) as f32,
@@ -267,8 +337,25 @@ impl Acoustic {
             for primary in &mut self.primaries {
                 let (gamma, r) = gas[primary.bank];
                 let speed = (gamma * r * self.temperatures[primary.bank]).sqrt();
-                primary.loss = 0.001_f64.powf((primary.length_m / speed) / 0.12);
+                let decay = if primary.quality.is_some() {
+                    0.12
+                } else {
+                    f64::from(self.exhaust_decay_ms) / 1000.
+                };
+                primary.target_loss = 0.001_f64.powf((primary.length_m / speed) / decay);
+                if self.loss_fade_remaining == 0 || primary.quality.is_some() {
+                    primary.loss = primary.target_loss;
+                }
             }
+        }
+        if self.loss_fade_remaining > 0 {
+            for primary in &mut self.primaries {
+                if primary.quality.is_none() {
+                    primary.loss +=
+                        (primary.target_loss - primary.loss) / f64::from(self.loss_fade_remaining);
+                }
+            }
+            self.loss_fade_remaining -= 1;
         }
         self.speeds = std::array::from_fn(|b| (gas[b].0 * gas[b].1 * self.temperatures[b]).sqrt());
         self.densities = std::array::from_fn::<_, 2, _>(|b| {
@@ -286,18 +373,29 @@ impl Acoustic {
             let flow = mean_flow.map_or(p.previous_flow, |f| f[i]);
             p.mean_flow += self.mean_slew * (flow - p.mean_flow);
             let velocity = (p.mean_flow / (rho * p.area_m2)).clamp(-0.3 * c, 0.3 * c);
-            let f = f64::from(
-                p.forward
-                    .read_at((p.length_m * self.rate / (c + velocity)).max(1.) as f32),
-            );
-            let r = f64::from(
-                p.backward
-                    .read_at((p.length_m * self.rate / (c - velocity)).max(1.) as f32),
-            );
+            let (f, r) = if let Some(quality) = &p.quality {
+                let [forward, backward] = quality.arrivals();
+                (forward, backward)
+            } else {
+                (
+                    f64::from(
+                        p.forward
+                            .read_at((p.length_m * self.rate / (c + velocity)).max(1.) as f32),
+                    ),
+                    f64::from(
+                        p.backward
+                            .read_at((p.length_m * self.rate / (c - velocity)).max(1.) as f32),
+                    ),
+                )
+            };
             p.forward_state += self.filter * (f - p.forward_state);
             p.backward_state += self.filter * (r - p.backward_state);
             self.arrivals[i] = p.forward_state * p.loss;
-            self.returns[i] = p.backward_state * p.loss;
+            self.returns[i] = if self.primary_reflections {
+                p.backward_state * p.loss
+            } else {
+                0.
+            };
             self.feedback[i] = self.returns[i];
         }
     }
@@ -390,9 +488,13 @@ impl Acoustic {
             } else {
                 excitation + returns[i]
             };
-            p.forward.write(outgoing.clamp(-200000., 200000.) as f32);
-            p.backward
-                .write((junction[p.bank] - arrivals[i]).clamp(-200000., 200000.) as f32);
+            let returning = junction[p.bank] - arrivals[i];
+            if let Some(quality) = &mut p.quality {
+                self.failed |= quality.step(outgoing, returning).is_err();
+            } else {
+                p.forward.write(outgoing.clamp(-200000., 200000.) as f32);
+                p.backward.write(returning.clamp(-200000., 200000.) as f32);
+            }
         }
         std::array::from_fn(|b| {
             let incoming = f64::from(tail_incoming[b]);
@@ -405,6 +507,81 @@ impl Acoustic {
 mod tests {
     use super::*;
     use crate::{physical::wave_junction::orifice_slope, scratch::PRESETS};
+
+    #[test]
+    fn exhaust_decay_reaches_primary_losses_without_resetting_propagation() {
+        let design = PRESETS.iter().find(|p| p.0 == "V8 cross-plane").unwrap().1;
+        for rate in [48000, 96000] {
+            let mut network = Acoustic::new(
+                rate,
+                &design,
+                &EngineBuild::default(),
+                &SoundTuning::default(),
+            );
+            for i in 0..rate / 10 {
+                let mut flow = [0.; 12];
+                flow[0] = (f64::from(i) * 0.11).sin() * 1e-5;
+                network.next(&flow, [673.; 2], [101325.; 2], [0.; 2]);
+            }
+            let wave = network.primaries[0].forward.read_at(10.);
+            let clock = network.tick;
+            let loss = network.primaries[0].loss;
+            let tuning = SoundTuning {
+                exhaust_decay_ms: 10.,
+                ..Default::default()
+            };
+            network.retune(&tuning);
+            assert_eq!(network.tick, clock);
+            assert_eq!(
+                network.primaries[0].forward.read_at(10.).to_bits(),
+                wave.to_bits()
+            );
+            assert_eq!(network.primaries[0].loss.to_bits(), loss.to_bits());
+            let target = network.primaries[0].target_loss;
+            assert!(target < loss);
+            let steps = network.loss_fade_remaining;
+            network.next(&[0.; 12], [673.; 2], [101325.; 2], [0.; 2]);
+            assert!((loss - network.primaries[0].loss) < (loss - target) * 0.002);
+            for _ in 1..steps {
+                assert!(
+                    network
+                        .next(&[0.; 12], [673.; 2], [101325.; 2], [0.; 2])
+                        .iter()
+                        .all(|v| v.is_finite())
+                );
+            }
+            assert_eq!(
+                network.primaries[0].loss.to_bits(),
+                network.primaries[0].target_loss.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn exhaust_decay_physical_impulse_tails_follow_the_selected_duration() {
+        for rate in [48000, 96000] {
+            let fractions: Vec<_> = [10., 40., 120., 250.]
+                .into_iter()
+                .map(|decay| {
+                    let samples = response(
+                        rate,
+                        &SoundTuning {
+                            exhaust_decay_ms: decay,
+                            ..Default::default()
+                        },
+                    );
+                    let total: f64 = samples.iter().map(|x| x * x).sum();
+                    let late: f64 = samples[rate as usize / 20..].iter().map(|x| x * x).sum();
+                    assert!(total > 0.);
+                    late / total
+                })
+                .collect();
+            assert!(
+                fractions.windows(2).all(|w| w[0] < w[1]),
+                "{rate}: {fractions:?}"
+            );
+        }
+    }
 
     #[test]
     fn retune_preserves_running_state_and_slews_primary_lengths() {
@@ -478,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn tuning_defaults_preserve_existing_acoustic_dimensions() {
+    fn tuning_defaults_preserve_physical_dimensions_without_bank_observation_delay() {
         let design = PRESETS.iter().find(|p| p.0 == "V8 cross-plane").unwrap().1;
         let build = EngineBuild::default();
         let network = Acoustic::new(48000, &design, &build, &SoundTuning::default());
@@ -496,10 +673,6 @@ mod tests {
                 Headers::CastManifold => 0.23 + 0.06 * (i % 4) as f64,
                 Headers::Tubular => 0.55 + 0.04 * (i % 3) as f64,
                 Headers::EqualLength => 0.7,
-            } + if primary.bank == 1 {
-                f64::from(design.bank_delay_ms) * 0.001 * 550.
-            } else {
-                0.
             };
             assert_eq!(primary.length_m.to_bits(), length.to_bits());
         }

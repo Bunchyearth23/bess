@@ -2,19 +2,32 @@
 use std::{
     io::{Cursor, Write},
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub fn automation_fixture() -> PathBuf {
     const UID: &str = "694E80154252F6189DE80988120C7F13";
-    let path = std::env::temp_dir().join(format!(
-        "bess-physical-fixture-{}-{}.zip",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    // Windows wall-clock timestamps can coincide across concurrent tests.
+    // Reserve ownership atomically: another fixture must never truncate or
+    // remove this test's archive, including after a process ID is reused.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (path, file) = loop {
+        let path = std::env::temp_dir().join(format!(
+            "bess-physical-fixture-{}-{}.zip",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("Cannot reserve Automation fixture: {error}"),
+        }
+    };
+    let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default();
     let mut layers = [Vec::new(), Vec::new()];
     for (load, layer) in layers.iter_mut().enumerate() {
@@ -67,4 +80,33 @@ pub fn automation_fixture() -> PathBuf {
         .unwrap();
     zip.finish().unwrap();
     path
+}
+
+#[test]
+fn concurrent_fixtures_have_independent_lifetimes() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+    let workers: Vec<_> = (0..16)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                automation_fixture()
+            })
+        })
+        .collect();
+    let paths: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(
+        paths.iter().collect::<std::collections::HashSet<_>>().len(),
+        paths.len()
+    );
+    for path in paths {
+        // Deleting any completed fixture leaves every other one readable.
+        let archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 9);
+        drop(archive);
+        std::fs::remove_file(path).unwrap();
+    }
 }

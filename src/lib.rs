@@ -5,10 +5,12 @@ pub mod bank;
 pub mod beamng;
 pub mod beamng_level;
 pub mod bench;
+pub mod calibration;
 pub mod combustion;
 pub mod drive;
 pub mod dyno;
 pub mod engine_build;
+pub mod engine_definition;
 pub mod engine_meta;
 pub mod export;
 pub mod hybrid;
@@ -25,3 +27,4 @@ pub mod standalone;
 #[cfg(test)]
 mod test_support;
 pub mod variant;
+pub mod vehicle_setup;

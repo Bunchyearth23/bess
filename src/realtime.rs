@@ -104,16 +104,22 @@ impl RenderEngine {
         params.validate()?;
         settings.validate()?;
         driving.validate()?;
-        let synth_rate = output_rate * 2;
+        // A saved canonical definition is authoritative; Scratch is only the
+        // compatibility input for projects that do not carry one yet.
+        let canonical = settings.engine.as_ref().map(|engine| engine.to_scratch());
+        let scratch = canonical.as_ref().unwrap_or(scratch);
+        let synth_rate = scratch.synthesis_rate(output_rate);
         let model = ScratchModel::build(scratch, synth_rate)?;
         Ok(Self {
             bench: Bench::from_scratch(synth_rate, params, settings, driving, model),
             // 95-tap Blackman-Harris low-pass: unity DC, transition before the
             // output Nyquist frequency. Construction allocates only here.
-            decimator: Some(PolyphaseDecimator::new(
-                generate_lowpass_taps(synth_rate as f32, output_rate as f32 * 0.45, 95),
-                2,
-            )),
+            decimator: (synth_rate != output_rate).then(|| {
+                PolyphaseDecimator::new(
+                    generate_lowpass_taps(synth_rate as f32, output_rate as f32 * 0.45, 95),
+                    2,
+                )
+            }),
             synth_rate,
         })
     }
@@ -321,6 +327,39 @@ impl Drop for AudioWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_definition_takes_priority_over_legacy_scratch_for_live_and_wav() {
+        use crate::engine_definition::EngineDefinition;
+        let legacy = Scratch::default();
+        let mut canonical = legacy.clone();
+        canonical.build.compression = 12.;
+        canonical.sound.presence_db = 8.;
+        let settings = Settings {
+            engine: Some(EngineDefinition::from_scratch(&canonical)),
+            ..Default::default()
+        };
+        let p = Parameters::default();
+        let c = Controls::default();
+        let mut from_settings = RenderEngine::scratch(48000, p, settings, c, &legacy).unwrap();
+        let mut from_canonical =
+            RenderEngine::scratch(48000, p, Settings::default(), c, &canonical).unwrap();
+        let mut old = RenderEngine::scratch(48000, p, Settings::default(), c, &legacy).unwrap();
+        let mut difference = 0.;
+        for _ in 0..6000 {
+            let generated = from_settings.next_sample(true);
+            assert_eq!(
+                generated.to_bits(),
+                from_canonical.next_sample(true).to_bits()
+            );
+            difference += (generated - old.next_sample(true)).abs();
+        }
+        assert!(difference > 0.001);
+        let actual = crate::render::scratch_samples(p, settings, &legacy, 1., c).unwrap();
+        let expected =
+            crate::render::scratch_samples(p, Settings::default(), &canonical, 1., c).unwrap();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn starvation_fades_to_silence_and_recovers_without_replaying_buffer() {

@@ -12,7 +12,7 @@ use super::{
     config::CylinderConfig,
     gas::{DischargeCurve, HarmonicCam, Valve, floor_fast, rem_euclid_near},
     thermo::{self, EnergyInput, EnergyLedger, GasState, Mixture, SliderCrank, ThermoError, Wiebe},
-    wave_junction::{WavePort, orifice_slope},
+    wave_junction::{ValveFlow, WavePort},
 };
 use std::f64::consts::{PI, TAU};
 
@@ -89,7 +89,12 @@ impl CycleInput {
             && self.intake_fresh_air_fraction + self.intake_fuel_fraction <= 1. + 1e-12
             && self.exhaust_fresh_air_fraction + self.exhaust_fuel_fraction <= 1. + 1e-12
             && [self.intake, self.exhaust].iter().all(|r| {
-                (100.0..=1e7).contains(&r.pressure_pa)
+                // A runner can be nearly evacuated during high-speed overrun.
+                // The conservative gas solver supplies positive mass/pressure
+                // and an explicit donor budget; a 100 Pa floor rejected those
+                // valid states instead of letting their valve flow recover.
+                r.pressure_pa > 0.
+                    && r.pressure_pa <= 1e7
                     && (200.0..=3500.0).contains(&r.temperature_k)
             })
     }
@@ -211,8 +216,10 @@ impl CycleCylinder {
             || !(0.001..=0.5).contains(&config.intake_diameter_m)
             || !(0.001..=0.5).contains(&config.exhaust_diameter_m)
             || !(0.0..=0.1).contains(&config.lift_m)
+            || !(0.0..=0.1).contains(&config.exhaust_lift_m)
             || !(0.0..=0.1).contains(&config.lash_m)
             || !(0.0..=720.0).contains(&config.seat_duration_deg)
+            || !(0.0..=720.0).contains(&config.exhaust_seat_duration_deg)
             || !config.intake_center_deg.is_finite()
             || !config.exhaust_center_deg.is_finite()
             || !(200.0..=1200.0).contains(&config.wall_temperature_k)
@@ -232,8 +239,8 @@ impl CycleCylinder {
             },
             exhaust_cam: HarmonicCam {
                 center_rad: config.exhaust_center_deg.to_radians(),
-                duration_rad: config.seat_duration_deg.to_radians(),
-                peak_lift_m: config.lift_m,
+                duration_rad: config.exhaust_seat_duration_deg.to_radians(),
+                peak_lift_m: config.exhaust_lift_m,
                 shape_exponent: 1.,
                 lash_m: config.lash_m,
             },
@@ -444,19 +451,15 @@ impl CycleCylinder {
                 let reservoir_k = input.exhaust.temperature_k;
                 let backflow = exhaust_mixture().properties(reservoir_k);
                 let outflow = gas.mixture().properties(cylinder_k);
-                let inflow = port
-                    .solve(cylinder_pa, |p| {
-                        let upstream = if p > cylinder_pa { backflow } else { outflow };
-                        let flow = orifice.mass_flow_from_states(
-                            p,
-                            reservoir_k,
-                            cylinder_pa,
-                            cylinder_k,
-                            upstream,
-                        );
-                        (flow, orifice_slope(flow, p, cylinder_pa, upstream.gamma))
-                    })
-                    .0;
+                let valve = ValveFlow::new(
+                    orifice,
+                    reservoir_k,
+                    cylinder_pa,
+                    cylinder_k,
+                    backflow,
+                    outflow,
+                );
+                let inflow = port.solve(cylinder_pa, |p| valve.evaluate(p)).0;
                 self.port_inflow = inflow;
                 inflow
             }
@@ -550,7 +553,7 @@ impl CycleCylinder {
                 // End combustion at exhaust opening of this compression cycle.
                 let firing_tdc = (spark_angle - mechanical_spark) / CYCLE;
                 let exhaust_open = self.config.exhaust_center_deg.to_radians()
-                    - self.config.seat_duration_deg.to_radians() * 0.5;
+                    - self.config.exhaust_seat_duration_deg.to_radians() * 0.5;
                 let curve = Wiebe::from_ca50(ca50, duration, 2., 1. - (-5_f64).exp())?;
                 self.burn = Some(Burn {
                     curve,
@@ -700,9 +703,81 @@ pub fn hohenberg_w_m2_k(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evacuated_runner_boundary_remains_finite_and_invalid_pressures_still_fail() {
+        for pressure_pa in [1., 84.110_613_026_652_36, 99.9] {
+            let mut cylinder = CycleCylinder::new(config(), 0., 123).unwrap();
+            let dt = 1. / 96000.;
+            for frame in 1..=6400 {
+                let output = cylinder
+                    .step(CycleInput {
+                        angle_rad: frame as f64 * 7200. * TAU / 60. * dt,
+                        rpm: 7200.,
+                        dt_s: dt,
+                        intake: Reservoir {
+                            pressure_pa,
+                            temperature_k: 275.,
+                        },
+                        fuel_multiplier: 0.,
+                        spark_enabled: false,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                assert!(output.pressure_pa.is_finite() && output.pressure_pa > 0.);
+                assert!(output.temperature_k.is_finite());
+                assert!(output.ledger.residual_j().abs() < 1e-8);
+            }
+        }
+        for pressure_pa in [0., -1., f64::NAN, f64::INFINITY, 1e7 + 1.] {
+            let mut input = CycleInput::default();
+            input.intake.pressure_pa = pressure_pa;
+            assert!(!input.cylinder_valid());
+            let mut cylinder = CycleCylinder::new(config(), 0., 123).unwrap();
+            assert!(matches!(
+                cylinder.step(input),
+                Err(ThermoError::InvalidInput)
+            ));
+        }
+    }
     use crate::engine_build::EngineBuild;
     fn config() -> CylinderConfig {
         CylinderConfig::from_build(&EngineBuild::default()).unwrap()
+    }
+
+    #[test]
+    fn independent_exhaust_cam_changes_only_its_geometric_lift_schedule() {
+        let original = config();
+        let edited = CylinderConfig {
+            exhaust_lift_m: 0.014,
+            exhaust_seat_duration_deg: original.exhaust_seat_duration_deg + 30.,
+            exhaust_center_deg: original.exhaust_center_deg - 5.,
+            ..original
+        };
+        let a = CycleCylinder::new(original, 0., 123).unwrap();
+        let b = CycleCylinder::new(edited, 0., 123).unwrap();
+        let mut different = 0;
+        for degree in 0..720 {
+            let angle = (degree as f64).to_radians();
+            assert_eq!(
+                a.valve_lift(angle, true, 0.).to_bits(),
+                b.valve_lift(angle, true, 0.).to_bits()
+            );
+            different +=
+                usize::from(a.valve_lift(angle, false, 0.) != b.valve_lift(angle, false, 0.));
+        }
+        assert!(different > 200);
+        assert!(
+            (b.valve_lift(edited.exhaust_center_deg.to_radians(), false, 0.)
+                - (edited.exhaust_lift_m - edited.lash_m))
+                .abs()
+                < 1e-12
+        );
+        let invalid = CylinderConfig {
+            exhaust_lift_m: f64::NAN,
+            ..original
+        };
+        assert!(CycleCylinder::new(invalid, 0., 123).is_err());
     }
     fn run(spark: bool, shift: f64, cut_after: f64, phase: f64) -> (f64, f64, f64, f64, u64) {
         let mut cylinder = CycleCylinder::new(config(), phase, 123).unwrap();
@@ -801,6 +876,7 @@ mod tests {
             setup.intake_valves = 0;
             setup.exhaust_valves = 0;
             setup.seat_duration_deg = 0.;
+            setup.exhaust_seat_duration_deg = 0.;
             let mut cylinder = CycleCylinder::new(setup, 0., 123).unwrap();
             cylinder.set_heat_transfer_scale(0.).unwrap();
             let mut total = 0.;

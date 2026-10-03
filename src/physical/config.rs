@@ -15,12 +15,15 @@ pub struct CylinderConfig {
     pub intake_diameter_m: f64,
     pub exhaust_diameter_m: f64,
     pub lift_m: f64,
+    pub exhaust_lift_m: f64,
     pub lash_m: f64,
     pub seat_duration_deg: f64,
+    pub exhaust_seat_duration_deg: f64,
     /// Four-stroke crank degrees, firing TDC = 0, overlap TDC = 360.
     pub intake_center_deg: f64,
     pub exhaust_center_deg: f64,
     pub nominal_duration_at_050_deg: f64,
+    pub exhaust_nominal_duration_at_050_deg: f64,
     pub wall_temperature_k: f64,
 }
 
@@ -39,6 +42,11 @@ impl CylinderConfig {
         // duration at 0.050 inches net lift to a duration at the cam seat.
         let half_width = (2. * (0.00127 + lash_m) / lift_m - 1.).acos();
         let seat_duration_deg = nominal_duration_at_050_deg * std::f64::consts::PI / half_width;
+        let exhaust_lift_m = tuning.exhaust_lift_m;
+        let exhaust_nominal_duration_at_050_deg = tuning.exhaust_duration_at_050_deg;
+        let exhaust_half_width = (2. * (0.00127 + lash_m) / exhaust_lift_m - 1.).acos();
+        let exhaust_seat_duration_deg =
+            exhaust_nominal_duration_at_050_deg * std::f64::consts::PI / exhaust_half_width;
         let setup = Self {
             bore_m: f64::from(build.bore_mm) * 0.001,
             stroke_m: f64::from(build.stroke_mm) * 0.001,
@@ -49,11 +57,14 @@ impl CylinderConfig {
             intake_diameter_m: tuning.intake_diameter_m,
             exhaust_diameter_m: tuning.exhaust_diameter_m,
             lift_m,
+            exhaust_lift_m,
             lash_m,
             seat_duration_deg,
+            exhaust_seat_duration_deg,
             intake_center_deg: tuning.intake_center_deg,
             exhaust_center_deg: tuning.exhaust_center_deg,
             nominal_duration_at_050_deg,
+            exhaust_nominal_duration_at_050_deg,
             wall_temperature_k: 450.,
         };
         if !setup.displacement_m3().is_finite() || setup.displacement_m3() <= 0. {

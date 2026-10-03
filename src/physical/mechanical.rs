@@ -85,10 +85,11 @@ impl Slap {
             // Side-load rate across the reversal, N/rad: gas load dominates at
             // firing TDC, so the hit grows with load. Same sqrt(rpm) law as the
             // valve contacts. ±15 % amplitude and small timing scatter.
-            // Fixed gain: −7 dB vs contacts at 3000 rpm / 0.7, −12.6 dB at idle
+            // Fixed gain through the damped block transfer: about −7 dB vs
+            // contacts at 3000 rpm / 0.7, −13 dB at idle
             // (`slap_sits_below_valve_contacts_and_drops_at_idle`).
             let rate = (side - self.previous[i]).abs() / turned;
-            let amplitude = 7.5e-7
+            let amplitude = 1.5e-6
                 * rate
                 * self.clearance
                 * (rpm / 3000.).sqrt()

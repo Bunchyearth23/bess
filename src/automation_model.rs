@@ -4,16 +4,243 @@ use crate::{
     bank::Bank,
     drive::Controls,
     engine_build::{Aspiration, BlockMaterial, Catalyst, Crankshaft, Fuel, Head, Headers, Muffler},
+    engine_definition::EngineDefinition,
     engine_meta::{EngineMeta, Layout as SourceLayout},
     hybrid::Settings,
     project::Parameters,
-    scratch::{EngineDesign, Layout, PRESETS, Scratch},
+    scratch::{EngineDesign, Layout, PRESETS, Scratch, SoundTuning},
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct AutomationModel {
     pub scratch: Scratch,
+    /// Neutral reconstruction of the verified source, before user edits.
+    pub baseline: EngineDefinition,
+    pub provenance: Vec<ParameterProvenance>,
     pub assumptions: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueOrigin {
+    Read,
+    Converted,
+    Estimated,
+    Modified,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParameterProvenance {
+    pub field: String,
+    pub origin: ValueOrigin,
+    pub baseline_origin: ValueOrigin,
+    pub source: Option<String>,
+    pub baseline: Value,
+    pub value: Value,
+    pub detail: String,
+}
+
+fn values(definition: &EngineDefinition) -> Result<BTreeMap<String, Value>, String> {
+    fn flatten(path: &str, value: Value, fields: &mut BTreeMap<String, Value>) {
+        if let Value::Object(object) = value {
+            for (name, value) in object {
+                let child = if path.is_empty() {
+                    name
+                } else {
+                    format!("{path}.{name}")
+                };
+                flatten(&child, value, fields);
+            }
+        } else {
+            // Arrays are a single editable value: cylinder order/banks/pins
+            // must be interpreted together, not as independent measurements.
+            fields.insert(path.into(), value);
+        }
+    }
+    let mut fields = BTreeMap::new();
+    let mut value = serde_json::to_value(definition).map_err(|e| e.to_string())?;
+    // Project files omit untouched tuning, but provenance needs a stable field
+    // universe so a first override (and its reset) is always represented.
+    value["tuning"] = serde_json::to_value(definition.tuning).map_err(|e| e.to_string())?;
+    flatten("", value, &mut fields);
+    Ok(fields)
+}
+
+fn provenance(
+    meta: &EngineMeta,
+    definition: &EngineDefinition,
+    assumptions: &[String],
+) -> Result<Vec<ParameterProvenance>, String> {
+    use ValueOrigin::{Converted, Estimated, Read};
+    let p = &meta.physical;
+    let mut imported: BTreeMap<&str, (ValueOrigin, String, String)> = BTreeMap::new();
+    let mut record = |field, origin, source: String, detail: &str| {
+        imported.insert(field, (origin, source, detail.into()));
+    };
+    record(
+        "design.cylinders",
+        Read,
+        format!("Family.BlockConfig: {} cylinders", meta.cylinders),
+        "Verified engine architecture",
+    );
+    record(
+        "design.layout",
+        Converted,
+        format!("Family.BlockType: {:?}", meta.layout),
+        "Source architecture mapped to the physical layout",
+    );
+    record(
+        "design.bank_angle",
+        Converted,
+        format!("Family.BlockType: {:?}", meta.layout),
+        "Bank angle decoded from the source architecture",
+    );
+    if let (Some(bore), Some(stroke)) = (p.bore_m, p.stroke_m) {
+        record(
+            "build.bore_mm",
+            Converted,
+            format!("Variant.Bore: {bore} m"),
+            "Metres converted to millimetres; capacity checked",
+        );
+        record(
+            "build.stroke_mm",
+            Converted,
+            format!("Variant.Stroke: {stroke} m"),
+            "Metres converted to millimetres; capacity checked",
+        );
+    }
+    for (field, source, input, output) in [
+        (
+            "build.compression",
+            "Variant.Compression",
+            p.compression,
+            definition.build.compression,
+        ),
+        (
+            "build.cam",
+            "Variant.CamProfileSetting",
+            p.cam_profile,
+            definition.build.cam,
+        ),
+        (
+            "idle_rpm",
+            ".pc $idleRPM / engine JBeam idleRPM",
+            p.idle_rpm,
+            definition.idle_rpm,
+        ),
+        (
+            "redline_rpm",
+            "Variant.RPMLimit",
+            p.rpm_limit,
+            definition.redline_rpm,
+        ),
+    ] {
+        if let Some(value) = input.filter(|v| v.is_finite()) {
+            let exact = value == output;
+            record(
+                field,
+                if exact { Read } else { Converted },
+                format!("{source}: {value}"),
+                if exact {
+                    "Verified source value"
+                } else {
+                    "Source value limited to the supported physical range"
+                },
+            );
+        }
+    }
+    if let Some(valves) = p.valves {
+        record(
+            "build.valves",
+            Read,
+            format!("Family.Valves: {valves}"),
+            "Valves per cylinder decoded from the source tag",
+        );
+    }
+    for (field, name, key, tag) in [
+        (
+            "build.block",
+            "Block material",
+            "Family.BlockMaterial",
+            &p.block_material,
+        ),
+        ("build.head", "Cylinder head", "Family.Head", &p.head),
+        ("build.crank", "Crank material", "Variant.Crank", &p.crank),
+        (
+            "build.fuel",
+            "Fuel system",
+            "Variant.FuelSystem",
+            &p.fuel_system,
+        ),
+        ("build.vvt", "VVT", "Variant.VVT", &p.vvt),
+        ("build.headers", "Headers", "Variant.Headers", &p.headers),
+        ("build.catalyst", "Catalyst", "Variant.Cat", &p.catalyst),
+    ] {
+        if let Some(tag) = tag {
+            let fallback = assumptions
+                .iter()
+                .any(|note| note.starts_with(&format!("{name}: absent or unsupported")));
+            record(
+                field,
+                if fallback { Estimated } else { Converted },
+                format!("{key}: {tag}"),
+                if fallback {
+                    "Unsupported source category; physical default used"
+                } else {
+                    "Source category mapped to its physical equivalent"
+                },
+            );
+        }
+    }
+    let turbo = meta.turbocharged == Some(true);
+    let known_layout = !turbo
+        || matches!(
+            p.aspiration_setup.as_deref(),
+            Some("Turbo_Single_Name" | "Turbo_Twin_Name")
+        );
+    record(
+        "build.aspiration",
+        if known_layout { Converted } else { Estimated },
+        format!(
+            "Variant.AspirationType turbo={turbo}; AspirationSetup={:?}",
+            p.aspiration_setup
+        ),
+        if known_layout {
+            "Verified aspiration mapped to physical induction"
+        } else {
+            "Turbo confirmed; single-turbo layout estimated"
+        },
+    );
+    if turbo && let Some(boost) = p.boost_setting {
+        record(
+            "build.boost_bar",
+            Estimated,
+            format!("Variant.ChargerMaxBoost_1: {boost}"),
+            "Source scalar interpreted as nominal gauge bar; not a measured boost map",
+        );
+    }
+    record(
+        "build.exhaust_mm",
+        Estimated,
+        format!("Variant.ExhaustDiameter: {:?}", p.exhaust_diameter),
+        "Raw source unit remains unverified; diameter estimated from capacity",
+    );
+    record(
+        "build.muffler",
+        Estimated,
+        format!(
+            "Variant.Muffler1={:?}; Muffler2={:?}",
+            p.muffler_1, p.muffler_2
+        ),
+        "Two silencers reduced to one restrictive class; dimensions and packing estimated",
+    );
+    values(definition).map(|fields| fields.into_iter().map(|(field, value)| {
+        let (origin, source, detail) = imported.remove(field.as_str()).map(|(origin, source, detail)| (origin, Some(source), detail)).unwrap_or((Estimated, None, "Physical-model estimate or neutral control default; not an exported source measurement".into()));
+        ParameterProvenance { field, origin, baseline_origin: origin, source, baseline: value.clone(), value, detail }
+    }).collect())
 }
 
 fn bounded(
@@ -50,6 +277,88 @@ fn component<T: Copy>(value: Option<T>, fallback: T, name: &str, notes: &mut Vec
 }
 
 impl AutomationModel {
+    /// The public project/settings resolver: both the active edits and the
+    /// original imported reference survive future changes to the mapper.
+    pub fn from_settings(bank: &Bank, settings: &Settings) -> Result<Self, String> {
+        let mut model = Self::resolve(
+            bank,
+            settings
+                .engine
+                .as_ref()
+                .or(settings.engine_baseline.as_ref()),
+            &settings.physical_sound,
+        )?;
+        if settings.engine.is_none() && settings.engine_baseline.is_some() {
+            let mut definition = EngineDefinition::from_scratch(&model.scratch);
+            definition.sound = settings.physical_sound;
+            model = model.with_definition(&definition)?;
+        }
+        if let Some(baseline) = &settings.engine_baseline {
+            model = model.with_baseline(baseline)?;
+        }
+        Ok(model)
+    }
+
+    /// Keep the saved reference independent of the current importer. Older
+    /// projects did not save per-field provenance, so changed historical
+    /// estimates must never be relabelled as current measured source values.
+    pub fn with_baseline(&self, baseline: &EngineDefinition) -> Result<Self, String> {
+        baseline.validate()?;
+        let saved = values(baseline)?;
+        let mut model = self.clone();
+        model.baseline = *baseline;
+        for item in &mut model.provenance {
+            if let Some(value) = saved.get(&item.field) {
+                if item.baseline != *value {
+                    item.baseline_origin = ValueOrigin::Estimated;
+                    item.detail = "Saved import reference differs from the current mapper; preserved historical model value".into();
+                }
+                item.baseline = value.clone();
+                item.origin = if item.value == item.baseline {
+                    item.baseline_origin
+                } else {
+                    ValueOrigin::Modified
+                };
+            }
+        }
+        Ok(model)
+    }
+
+    /// Resolve every rendering path from one definition. Source verification
+    /// still runs when an override exists; edits never replace source identity.
+    pub fn resolve(
+        bank: &Bank,
+        definition: Option<&EngineDefinition>,
+        fallback_sound: &SoundTuning,
+    ) -> Result<Self, String> {
+        let model = Self::from_bank(bank)?;
+        let mut effective = definition.copied().unwrap_or(model.baseline);
+        if definition.is_none() {
+            effective.sound = *fallback_sound;
+        }
+        model.with_definition(&effective)
+    }
+
+    /// Refresh active values and provenance after an edit without inspecting
+    /// the archive or rebuilding the imported reference.
+    pub fn with_definition(&self, definition: &EngineDefinition) -> Result<Self, String> {
+        definition.validate()?;
+        let active = values(definition)?;
+        let mut model = self.clone();
+        model.scratch = definition.to_scratch();
+        for item in &mut model.provenance {
+            if let Some(value) = active.get(&item.field) {
+                item.value = value.clone();
+                item.origin = if item.value == item.baseline {
+                    item.baseline_origin
+                } else {
+                    ValueOrigin::Modified
+                };
+            }
+        }
+        Ok(model)
+    }
+
     /// Offline construction only. The bank has already checked blend UID,
     /// Family/Variant linkage, active .pc part and engine JBeam identity.
     pub fn from_bank(bank: &Bank) -> Result<Self, String> {
@@ -316,7 +625,10 @@ impl AutomationModel {
             &mut notes,
         );
         scratch.validate()?;
+        let baseline = EngineDefinition::from_scratch(&scratch);
         Ok(Self {
+            baseline,
+            provenance: provenance(meta, &baseline, &notes)?,
             scratch,
             assumptions: notes,
         })
@@ -365,6 +677,113 @@ mod tests {
         meta.physical.bore_m = Some(0.05);
         meta.physical.stroke_m = Some(0.05);
         assert!(AutomationModel::from_meta(&meta, 850., 6000.).is_err());
+    }
+
+    #[test]
+    fn unified_import_tracks_estimates_edits_and_section_reset_without_reimport() {
+        let meta = EngineMeta {
+            uid: "0123456789ABCDEF0123456789ABCDEF".into(),
+            cylinders: 4,
+            layout: SourceLayout::Inline,
+            displacement_l: Some(2.),
+            exhaust_count: Some(1),
+            turbocharged: Some(false),
+            physical: crate::engine_meta::PhysicalMeta {
+                compression: Some(9.5),
+                exhaust_diameter: Some(2.5),
+                ..Default::default()
+            },
+        };
+        let model = AutomationModel::from_meta(&meta, 850., 6500.).unwrap();
+        let status = |model: &AutomationModel, field: &str| {
+            model
+                .provenance
+                .iter()
+                .find(|item| item.field == field)
+                .unwrap()
+                .origin
+        };
+        assert_eq!(status(&model, "build.compression"), ValueOrigin::Read);
+        assert_eq!(status(&model, "build.exhaust_mm"), ValueOrigin::Estimated);
+        assert_eq!(status(&model, "tuning.cam.lift_mm"), ValueOrigin::Estimated);
+        let mut edited = model.baseline;
+        edited.build.compression = 11.;
+        edited.sound.bass_db = 3.;
+        edited.tuning.cam.lift_mm = Some(11.);
+        let active = model.with_definition(&edited).unwrap();
+        assert_eq!(active.baseline, model.baseline);
+        assert_eq!(status(&active, "build.compression"), ValueOrigin::Modified);
+        assert_eq!(status(&active, "tuning.cam.lift_mm"), ValueOrigin::Modified);
+        edited.reset_section(
+            &model.baseline,
+            crate::engine_definition::EngineSection::Parts,
+        );
+        let reset = active.with_definition(&edited).unwrap();
+        assert_eq!(status(&reset, "build.compression"), ValueOrigin::Read);
+        assert_eq!(status(&reset, "sound.bass_db"), ValueOrigin::Modified);
+        assert_eq!(reset.scratch.sound.bass_db, 3.);
+        edited.reset_section(
+            &model.baseline,
+            crate::engine_definition::EngineSection::Tuning,
+        );
+        let reset_tuning = reset.with_definition(&edited).unwrap();
+        assert_eq!(
+            status(&reset_tuning, "tuning.cam.lift_mm"),
+            ValueOrigin::Estimated
+        );
+        let json = serde_json::to_value(edited).unwrap();
+        assert!(json.get("tuning").is_none());
+        let reloaded: EngineDefinition = serde_json::from_value(json).unwrap();
+        assert_eq!(reloaded, edited);
+        let reloaded_model = reset_tuning.with_definition(&reloaded).unwrap();
+        assert_eq!(
+            status(&reloaded_model, "tuning.cam.lift_mm"),
+            ValueOrigin::Estimated
+        );
+    }
+
+    #[test]
+    fn unified_resolve_preserves_legacy_sound_and_never_bypasses_source_identity() {
+        let path = crate::test_support::automation_fixture();
+        let mut bank = Bank::load(&path, None).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let sound = SoundTuning {
+            presence_db: -2.,
+            ..Default::default()
+        };
+        let migrated = AutomationModel::resolve(&bank, None, &sound).unwrap();
+        assert_eq!(migrated.scratch.sound, sound);
+        assert_eq!(migrated.baseline.sound, SoundTuning::default());
+        let mut active = EngineDefinition::from_scratch(&migrated.scratch);
+        active.tuning.cam.lift_mm = Some(11.);
+        active.sound.presence_db = 4.;
+        let resolved = AutomationModel::resolve(&bank, Some(&active), &sound).unwrap();
+        assert_eq!(EngineDefinition::from_scratch(&resolved.scratch), active);
+        let mut saved_baseline = migrated.baseline;
+        saved_baseline.build.exhaust_mm = 40.;
+        let settings = Settings {
+            engine: Some(active),
+            engine_baseline: Some(saved_baseline),
+            physical_sound: sound,
+            ..Default::default()
+        };
+        let historical = AutomationModel::from_settings(&bank, &settings).unwrap();
+        assert_eq!(historical.baseline, saved_baseline);
+        assert_eq!(EngineDefinition::from_scratch(&historical.scratch), active);
+        let restored = historical.with_definition(&saved_baseline).unwrap();
+        assert!(
+            restored
+                .provenance
+                .iter()
+                .all(|item| item.origin != ValueOrigin::Modified)
+        );
+        bank.engine_meta.as_mut().unwrap().uid = "wrong-source".into();
+        assert!(
+            AutomationModel::resolve(&bank, Some(&active), &sound)
+                .unwrap_err()
+                .contains("UID")
+        );
+        assert!(AutomationModel::from_settings(&bank, &settings).is_err());
     }
 
     #[test]

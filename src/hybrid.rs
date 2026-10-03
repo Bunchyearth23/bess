@@ -11,6 +11,10 @@ pub struct Settings {
     /// Physical engine used for imported Automation resynthesis.
     #[serde(skip_serializing)]
     pub physical: bool,
+    /// Complete, editable physical engine. None migrates the source metadata.
+    pub engine: Option<crate::engine_definition::EngineDefinition>,
+    /// Immutable imported reference, retained even when the mapper evolves.
+    pub engine_baseline: Option<crate::engine_definition::EngineDefinition>,
     pub physical_sound: crate::scratch::SoundTuning,
     // Legacy project migration fields below are never used for synthesis.
     #[serde(skip_serializing)]
@@ -94,6 +98,8 @@ impl Default for Settings {
         Self {
             enhanced: true,
             physical: true,
+            engine: None,
+            engine_baseline: None,
             physical_sound: Default::default(),
             procedural: false,
             generated_body: 1.,
@@ -146,6 +152,12 @@ impl Settings {
         Self::default()
     }
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(engine) = &self.engine {
+            engine.validate()?;
+        }
+        if let Some(baseline) = &self.engine_baseline {
+            baseline.validate()?;
+        }
         self.physical_sound.validate()?;
         for (name, value, max) in [
             ("Response", self.response, 1.),
@@ -238,14 +250,12 @@ impl Hybrid {
             p.rpm = p.rpm.clamp(bank.min_rpm, bank.max_rpm);
         }
         let (physical_voice, physical_error) = match bank.as_deref() {
-            Some(bank) => match crate::automation_voice::AutomationVoice::from_bank(
-                rate,
-                bank,
-                &h.physical_sound,
-            ) {
-                Ok(voice) => (Some(voice), None),
-                Err(error) => (None, Some(error)),
-            },
+            Some(bank) => {
+                match crate::automation_voice::AutomationVoice::from_settings(rate, bank, h) {
+                    Ok(voice) => (Some(voice), None),
+                    Err(error) => (None, Some(error)),
+                }
+            }
             None => (None, None),
         };
         Self {
@@ -277,25 +287,40 @@ impl Hybrid {
         if let Some(bank) = &self.bank {
             p.rpm = p.rpm.clamp(bank.min_rpm, bank.max_rpm);
         }
-        if h.physical_sound != self.h.physical_sound
+        let sound = h.engine.map_or(h.physical_sound, |engine| engine.sound);
+        let previous_sound = self
+            .h
+            .engine
+            .map_or(self.h.physical_sound, |engine| engine.sound);
+        if sound != previous_sound
             && let Some(voice) = &mut self.physical_voice
         {
-            voice.set_sound_tuning(&h.physical_sound);
+            voice.set_sound_tuning(&sound);
         }
         self.target = p;
         self.h = h;
     }
     fn rpm_range(&self) -> (f32, f32) {
-        self.bank
-            .as_ref()
-            .map_or((300., 8000.), |b| (b.min_rpm, b.max_rpm))
+        self.physical_range().unwrap_or_else(|| {
+            self.bank
+                .as_ref()
+                .map_or((300., 8000.), |b| (b.min_rpm, b.max_rpm))
+        })
     }
     pub fn inferred_layer_weight(&self) -> f32 {
         1.
     }
     pub fn next_stems(&mut self, playing: bool) -> HybridStems {
+        self.next_command_stems(playing, None)
+    }
+    /// The listening bench supplies the same complete commands for both origins.
+    pub fn next_command_stems(
+        &mut self,
+        playing: bool,
+        commands: Option<crate::physical::engine::Commands>,
+    ) -> HybridStems {
         if self.bank.is_some() {
-            self.next_bank(playing)
+            self.next_bank(playing, commands)
         } else {
             HybridStems {
                 exhaust: 0.,
@@ -323,6 +348,36 @@ impl Hybrid {
     pub fn initialization_error(&self) -> Option<&str> {
         self.physical_error.as_deref()
     }
+    pub(crate) fn physical_state(&self) -> Option<(crate::physical::engine::Sample, f64)> {
+        self.physical_voice
+            .as_ref()
+            .map(|voice| (voice.state(), voice.inertia()))
+    }
+    pub(crate) fn physical_range(&self) -> Option<(f32, f32)> {
+        self.physical_voice.as_ref().map(|voice| voice.rpm_range())
+    }
+    pub(crate) fn reset_physical(&mut self) {
+        if let Some(voice) = &mut self.physical_voice {
+            voice.reset();
+        }
+    }
+    pub(crate) fn swap_model(
+        &mut self,
+        model: crate::scratch::ScratchModel,
+    ) -> Option<crate::scratch::ScratchVoice> {
+        if let Some(voice) = &mut self.physical_voice {
+            voice.swap_model(model)
+        } else {
+            Some(crate::scratch::ScratchVoice::Prepared {
+                physical: model.physical,
+            })
+        }
+    }
+    pub(crate) fn take_retired(&mut self) -> Option<crate::scratch::ScratchVoice> {
+        self.physical_voice
+            .as_mut()
+            .and_then(|voice| voice.take_retired())
+    }
     pub fn failed(&self) -> bool {
         self.bank.is_some()
             && self.h.enhanced
@@ -331,7 +386,11 @@ impl Hybrid {
                 .as_ref()
                 .is_none_or(|voice| voice.failed())
     }
-    fn next_bank(&mut self, playing: bool) -> HybridStems {
+    fn next_bank(
+        &mut self,
+        playing: bool,
+        commands: Option<crate::physical::engine::Commands>,
+    ) -> HybridStems {
         let smooth = 1. / (self.rate * 0.025);
         self.gain += (if playing { self.target.volume } else { 0. } - self.gain) * smooth;
         self.blend += (if self.h.enhanced { 1. } else { 0. } - self.blend) * smooth;
@@ -343,6 +402,14 @@ impl Hybrid {
             0.025 + self.h.response * 0.2
         };
         self.fast_load += (self.target.load - self.fast_load) / (self.rate * response);
+        if let Some(commands) = commands {
+            self.p.rpm = commands.imposed_rpm.unwrap_or_else(|| {
+                self.physical_voice
+                    .as_ref()
+                    .map_or(f64::from(self.p.rpm), |voice| voice.state().rpm)
+            }) as f32;
+            self.fast_load = commands.throttle as f32;
+        }
         self.cycle += self.p.rpm as f64 / (120. * self.rate as f64);
         if self.tick.is_multiple_of(64) {
             let s = 64. / (self.rate * 0.05);
@@ -365,12 +432,24 @@ impl Hybrid {
         // Same fixed pressure-to-listening calibration as physical scratch.
         // This is not an RMS normalizer; only the output limiter attenuates peaks.
         let bank_gain = bank.gain * 16.;
-        let generated = self
-            .physical_voice
-            .as_mut()
-            .map_or_else(crate::automation_voice::Stems::default, |voice| {
-                voice.next(self.p.rpm, self.fast_load)
-            });
+        let generated = if playing || self.gain > 1e-6 {
+            self.physical_voice.as_mut().map_or_else(
+                crate::automation_voice::Stems::default,
+                |voice| {
+                    voice.next_commands(commands.unwrap_or(crate::physical::engine::Commands {
+                        imposed_rpm: Some(f64::from(self.p.rpm)),
+                        throttle: f64::from(self.fast_load),
+                        overrun: f64::from(self.h.fuel_cut),
+                        starter: self.h.starter,
+                        ac: self.h.accessory_ac,
+                        steering: self.h.accessory_steering,
+                        ..Default::default()
+                    }))
+                },
+            )
+        } else {
+            crate::automation_voice::Stems::default()
+        };
         let exhaust = generated.exhaust * self.p.exhaust * bank_gain;
         let engine = (generated.intake * self.p.intake + generated.mechanical * self.p.mechanical)
             * self.current.engine_gain

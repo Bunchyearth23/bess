@@ -7,6 +7,8 @@ pub mod crank;
 pub mod cycle;
 pub mod cylinder;
 pub mod engine;
+mod excitation;
+pub mod finite_volume;
 pub mod gas;
 pub mod induction;
 pub mod intake_acoustic;

@@ -33,6 +33,26 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+fn render_identity(
+    processed_hash: &str,
+    settings: &Value,
+    parameters: &Parameters,
+) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    hash.update(processed_hash.as_bytes());
+    // An engine-only edit can leave the exhaust ZIP byte-identical. Include
+    // the saved renderer settings so its companion stem gets distinct paths.
+    hash.update(serde_json::to_vec(settings).map_err(|e| e.to_string())?);
+    // These are the physical renderer's layer controls. RPM and load come
+    // from the source knots; listening volume and legacy DSP controls are
+    // not baked into these files and must not split otherwise equal variants.
+    hash.update(
+        serde_json::to_vec(&(parameters.exhaust, parameters.intake, parameters.mechanical))
+            .map_err(|e| e.to_string())?,
+    );
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 fn names(zip: &mut ZipArchive<File>) -> Result<HashSet<String>, String> {
     let mut names = HashSet::new();
     let mut total = 0u64;
@@ -339,12 +359,6 @@ fn build(
 ) -> Result<String, String> {
     let source_hash = sha256_file(source)?;
     let processed_hash = sha256_file(processed)?;
-    let short = &processed_hash[..10];
-    let suffix = if let Some(name) = profile {
-        format!("{short}_{}", profile_identity(name)?)
-    } else {
-        short.to_owned()
-    };
     let processed_manifest = processed
         .parent()
         .unwrap_or(Path::new("."))
@@ -364,6 +378,15 @@ fn build(
     if previous["render_channel"] != "exhaust" {
         return Err("Variant requires a BESS exhaust-stem render, not a mixed replacement".into());
     }
+    let p: Parameters = serde_json::from_value(previous["parameters"].clone())
+        .map_err(|e| format!("Invalid processed parameters: {e}"))?;
+    let render_identity = render_identity(&processed_hash, &previous["settings"], &p)?;
+    let short = &render_identity[..10];
+    let suffix = if let Some(name) = profile {
+        format!("{short}_{}", profile_identity(name)?)
+    } else {
+        short.to_owned()
+    };
     let mut original = ZipArchive::new(File::open(source).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let mut rendered = ZipArchive::new(File::open(processed).map_err(|e| e.to_string())?)
@@ -430,8 +453,6 @@ fn build(
     let saved_source: bank::SourceRef = serde_json::from_value(previous["source"].clone())
         .map_err(|e| format!("Invalid processed source identity: {e}"))?;
     export::verify_source_identity(&saved_source, &bank.source)?;
-    let p: Parameters = serde_json::from_value(previous["parameters"].clone())
-        .map_err(|e| format!("Invalid processed parameters: {e}"))?;
     let h: Settings = serde_json::from_value(previous["settings"].clone())
         .map_err(|e| format!("Invalid processed settings: {e}"))?;
     if previous["render_model"] != "physical_automation" {
@@ -439,7 +460,7 @@ fn build(
             "Regenerate this archive with physical synthesis before creating an add-on".into(),
         );
     }
-    let h = export::physical_settings(h);
+    let (h, physical_model) = export::resolved_settings(&bank, h)?;
     p.validate()?;
     h.validate()?;
 
@@ -471,7 +492,7 @@ fn build(
         old_sample,
         &new_sample,
         &engine_sample,
-        bank.engine_meta.as_ref().map(|meta| meta.cylinders),
+        Some(physical_model.scratch.design.cylinders),
     )?;
     let blend: Value = serde_json::from_slice(&read(&mut original, &source_blend, MAX_META)?)
         .map_err(|e| e.to_string())?;
@@ -663,7 +684,11 @@ fn build(
     let report = json!({
         "kind":"configuration_addon",
         "render_model":"physical_automation",
-        "physical_assumptions":previous["physical_assumptions"],
+        "engine_definition":h.engine,
+        "engine_baseline":physical_model.baseline,
+        "engine_provenance":physical_model.provenance,
+        "loop_policy":export::loop_policy(),
+        "physical_assumptions":physical_model.assumptions,
         "physical_sound":h.physical_sound,
         "version":env!("CARGO_PKG_VERSION"),
         "zip_file":zip_file,
@@ -690,7 +715,8 @@ fn build(
         "processed_archive":processed,
         "source_sha256":source_hash,
         "processed_sha256":processed_hash,
-        "settings":previous["settings"],
+        "render_identity_sha256":render_identity,
+        "settings":h,
         "parameters":previous["parameters"],
         "gain":previous["gain"],
         "exhaust_level_reference":previous["exhaust_level_reference"],
@@ -705,21 +731,29 @@ fn build(
         .parent()
         .unwrap_or(Path::new("."))
         .join("settings.bess.json");
-    if source_settings.is_file() {
-        let settings_path = dir.join("settings.bess.json");
-        fs::copy(source_settings, &settings_path).map_err(|e| e.to_string())?;
-        if let Some(name) = profile {
-            let mut project: Value =
-                serde_json::from_slice(&fs::read(&settings_path).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            project["profile_name"] = json!(name.trim());
-            fs::write(
-                settings_path,
-                serde_json::to_vec_pretty(&project).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+    let mut project = if source_settings.is_file() {
+        crate::project::load_project(&source_settings)?
+    } else {
+        crate::project::Project {
+            version: 4,
+            parameters: p,
+            hybrid: h,
+            source: Some(bank.source.clone()),
+            driving: Default::default(),
+            profile_name: crate::project::default_profile_name(),
+            scratch: None,
         }
+    };
+    // The rendered manifest is authoritative even when converting an older
+    // intermediate archive whose sidecar still contains import-only defaults.
+    project.parameters = p;
+    project.hybrid = h;
+    project.source = Some(bank.source.clone());
+    project.scratch = None;
+    if let Some(name) = profile {
+        project.profile_name = name.trim().to_owned();
     }
+    crate::project::save_project(&dir.join("settings.bess.json"), &project)?;
     fs::write(
         dir.join("INSTALLATION.txt"),
         format!("BESS configuration add-on for {vehicle}\n\n1. Keep the original Automation vehicle ZIP enabled.\n2. Disable any earlier full-replacement BESS ZIP for this vehicle.\n3. Place {zip_file} in your active BeamNG mods folder.\n4. In the vehicle selector, open the original vehicle and choose the {display_name} configuration.\n5. Compare the stock and BESS configurations from the hood, cockpit, and tailpipe cameras.\n\nThe add-on adds a configuration, an alternate engine part, and separate engine/intake and exhaust audio banks. It does not replace the original model or sound files. BESS driving transients are not exported as a BeamNG controller. Structural validation is not an in-game listening test.\n"),
@@ -801,6 +835,40 @@ fn package_with_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_only_edits_have_distinct_variant_paths() {
+        let original = serde_json::to_value(Settings::default()).unwrap();
+        let mut modified = original.clone();
+        modified["engine_gain"] = json!(0.4);
+        let mix = Parameters::default();
+        assert_ne!(
+            render_identity("same-exhaust-zip", &original, &mix).unwrap(),
+            render_identity("same-exhaust-zip", &modified, &mix).unwrap()
+        );
+        for changed_mix in [
+            Parameters { intake: 0.7, ..mix },
+            Parameters {
+                mechanical: 0.4,
+                ..mix
+            },
+        ] {
+            assert_ne!(
+                render_identity("same-exhaust-zip", &original, &mix).unwrap(),
+                render_identity("same-exhaust-zip", &original, &changed_mix).unwrap()
+            );
+        }
+        let audition = Parameters {
+            rpm: 4000.,
+            load: 1.,
+            volume: 0.9,
+            ..mix
+        };
+        assert_eq!(
+            render_identity("same-exhaust-zip", &original, &mix).unwrap(),
+            render_identity("same-exhaust-zip", &original, &audition).unwrap()
+        );
+    }
 
     #[test]
     fn named_profiles_are_distinct_and_path_safe() {

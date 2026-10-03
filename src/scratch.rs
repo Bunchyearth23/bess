@@ -59,6 +59,18 @@ pub struct ExperimentalSpec {
     /// X-017 prototype: exhaust valves solved jointly with their primary
     /// waves (passive junction), so waves feed back on torque. Off = legacy.
     pub wave_coupling: bool,
+    /// Run acoustics at the output rate; the gas solver still takes enough
+    /// substeps to reach at least 96 kHz. Changes the sound; off by default.
+    pub native_rate_acoustics: bool,
+    /// Conservative finite-volume primary pipes. Offline quality option;
+    /// computational cost is not qualified for a realtime device callback.
+    pub primary_1d: bool,
+    /// Fixed observation gain for the coupled exhaust, never fed to gas or
+    /// wave propagation. No automatic gain or runtime RMS normalization.
+    pub coupled_level_db: f32,
+    /// Reduce low-speed WOT intake advance to avoid excessive overlap.
+    /// An explicit alternative schedule, not a measured engine map.
+    pub vvt_overlap_safe: bool,
 }
 
 impl Default for ExperimentalSpec {
@@ -83,12 +95,19 @@ impl Default for ExperimentalSpec {
             afterfire: 0.,
             knock: 0.,
             wave_coupling: false,
+            native_rate_acoustics: false,
+            primary_1d: false,
+            coupled_level_db: 0.,
+            vvt_overlap_safe: false,
         }
     }
 }
 
 impl ExperimentalSpec {
     pub fn validate(&self) -> Result<(), String> {
+        if self.primary_1d && self.wave_coupling {
+            return Err("Primary 1D currently supports prescribed flow only: disable wave coupling; the finite-volume and valve ports do not yet share a thermodynamic reference".into());
+        }
         for (name, value, lo, hi) in [
             ("level", self.level, 0.01, 0.3),
             ("RPM rise", self.rpm_rise_db, -6., 12.),
@@ -105,6 +124,12 @@ impl ExperimentalSpec {
             ("idle combustion COV", self.idle_cov, 0.01, 0.2),
             ("afterfire", self.afterfire, 0., 1.),
             ("knock", self.knock, 0., 1.),
+            (
+                "coupled exhaust calibration",
+                self.coupled_level_db,
+                -24.,
+                24.,
+            ),
         ] {
             if !value.is_finite() || value < lo || value > hi {
                 return Err(format!("Scratch {name} out of range"));
@@ -399,7 +424,7 @@ impl EngineDesign {
 }
 
 /// Independent sound adjustments. Part changes preserve these user choices;
-/// missing fields in older projects use neutral settings.
+/// missing fields in older projects use default settings.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoundTuning {
@@ -422,6 +447,8 @@ pub struct SoundTuning {
     pub load_brightness_db: f32,
     pub intake_length_m: f32,
     pub intake_resonance: f32,
+    /// Airflow hiss only; preserves intake pulses and turbo whine.
+    pub intake_air_noise: f32,
     pub mechanical_pitch_hz: f32,
     pub mechanical_resonance: f32,
     pub cycle_variation: f32,
@@ -429,6 +456,8 @@ pub struct SoundTuning {
     pub ignition_retard_deg: f32,
     pub primary_length_scale: f32,
     pub tail_length_m: f32,
+    /// Propagation-loss decay time; lower values damp exhaust reflections faster.
+    pub exhaust_decay_ms: f32,
     pub muffler_volume_scale: f32,
     pub muffler_absorption: f32,
 }
@@ -455,6 +484,9 @@ impl Default for SoundTuning {
             load_brightness_db: 0.,
             intake_length_m: 0.38,
             intake_resonance: 0.,
+            // Keep the physical intake pulses audible under the airflow layer.
+            // Reference (1.0) remains available; listening calibration is open.
+            intake_air_noise: 0.008,
             mechanical_pitch_hz: 2400.,
             mechanical_resonance: 2.,
             cycle_variation: 1.,
@@ -462,6 +494,7 @@ impl Default for SoundTuning {
             ignition_retard_deg: 0.,
             primary_length_scale: 1.,
             tail_length_m: 1.4,
+            exhaust_decay_ms: 120.,
             muffler_volume_scale: 1.,
             muffler_absorption: 0.4,
         }
@@ -507,6 +540,7 @@ impl SoundTuning {
             ("Load brightness", self.load_brightness_db, -12., 12.),
             ("Intake length", self.intake_length_m, 0.15, 1.5),
             ("Intake resonance", self.intake_resonance, 0., 3.),
+            ("Intake air noise", self.intake_air_noise, 0., 1.),
             ("Mechanical pitch", self.mechanical_pitch_hz, 600., 6000.),
             ("Mechanical resonance", self.mechanical_resonance, 0.5, 8.),
             ("Cycle variation", self.cycle_variation, 0., 2.),
@@ -514,6 +548,7 @@ impl SoundTuning {
             ("Ignition retard", self.ignition_retard_deg, -20., 20.),
             ("Primary length", self.primary_length_scale, 0.5, 2.),
             ("Tailpipe length", self.tail_length_m, 0.2, 5.),
+            ("Exhaust decay", self.exhaust_decay_ms, 10., 250.),
             ("Muffler volume", self.muffler_volume_scale, 0.25, 3.),
             ("Muffler absorption", self.muffler_absorption, 0., 1.),
         ] {
@@ -597,18 +632,27 @@ impl Default for Scratch {
 }
 
 impl Scratch {
+    /// Physical/acoustic rate used by both origins and prepared replacements.
+    /// Callers validate the output device rate before constructing the engine.
+    pub fn synthesis_rate(&self, output_rate: u32) -> u32 {
+        if self.experimental.native_rate_acoustics {
+            output_rate
+        } else {
+            output_rate * 2
+        }
+    }
+
     /// Whether a prepared model can update only sound controls without restarting
     /// the running cylinders, crank or thermal state. Does not allocate.
     pub fn same_engine_except_sound(&self, other: &Self) -> bool {
-        self.engine == other.engine
-            && self.design == other.design
-            && self.build == other.build
-            && self.idle_rpm == other.idle_rpm
-            && self.redline_rpm == other.redline_rpm
-            && self.experimental == other.experimental
-            && self.standalone == other.standalone
-            && self.inertia == other.inertia
-            && self.tuning == other.tuning
+        // The legacy event container is inactive and may differ after project
+        // migration. Only the canonical physical fields can require a restart.
+        let mut current = crate::engine_definition::EngineDefinition::from_scratch(self);
+        current.sound = other.sound;
+        current.design.bank_delay_ms = other.design.bank_delay_ms;
+        current.design.bank_gain_db = other.design.bank_gain_db;
+        current.experimental.coupled_level_db = other.experimental.coupled_level_db;
+        current == crate::engine_definition::EngineDefinition::from_scratch(other)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -751,26 +795,8 @@ impl Scratch {
             0.25
         };
         params.intake = (intake - if turbo { 0.1 } else { 0. }).clamp(0., 1.);
-        let valvetrain: f32 = match b.head {
-            Head::Pushrod => 0.2,
-            Head::Sohc => 0.14,
-            Head::Dohc => 0.1,
-        };
-        // Direct injectors tick audibly at idle. A cast-iron block is heavier
-        // and better damped: its structure-borne mechanical noise is lower.
-        let block = if b.block == BlockMaterial::CastIron {
-            0.85
-        } else {
-            1.
-        };
-        params.mechanical = ((valvetrain
-            + if b.fuel == Fuel::DirectInjection {
-                0.08
-            } else {
-                0.
-            })
-            * block)
-            .clamp(0., 1.);
+        // Mechanical observation starts muted in Parameters::default. Part
+        // changes keep that state or an explicitly chosen listening level.
         params.brightness = 10000.;
         params.pipe_length = if open_exhaust { 1.2 } else { 1.8 };
 
@@ -800,7 +826,12 @@ impl Scratch {
         // FNV-1a over the engine's construction: same parts, same imbalance.
         // `tuning` is left out on purpose: an override must not redraw the
         // dispersions (honest A/B), and old projects keep their seed.
-        let key = serde_json::to_string(&(self.design, self.build)).unwrap_or_default();
+        // Observation-only bank controls must not redraw cylinder dispersion
+        // or change brake torque when comparing delayed/undelayed sound.
+        let mut physical_design = self.design;
+        physical_design.bank_delay_ms = 0.;
+        physical_design.bank_gain_db = 0.;
+        let key = serde_json::to_string(&(physical_design, self.build)).unwrap_or_default();
         let seed = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
         });

@@ -13,6 +13,7 @@ pub mod range {
     pub const LIFT_MM: RangeInclusive<f32> = 7.0..=16.0;
     pub const LSA_DEG: RangeInclusive<f32> = 102.0..=120.0;
     pub const ADVANCE_DEG: RangeInclusive<f32> = -4.0..=10.0;
+    pub const EXHAUST_ADVANCE_DEG: RangeInclusive<f32> = -10.0..=10.0;
     pub const INTAKE_TO_BORE: RangeInclusive<f32> = 0.25..=0.55;
     pub const EXHAUST_TO_BORE: RangeInclusive<f32> = 0.17..=0.53;
     pub const ROD_TO_STROKE: RangeInclusive<f32> = 1.4..=2.2;
@@ -137,21 +138,32 @@ pub fn reset_button<T: Default + PartialEq>(
     }
 }
 
-/// Tag for controls that shape the sound only: the torque curve does not
-/// change (wave action does not feed back on the valves, X-021).
+/// Acoustic controls can also affect torque when pressure feedback is enabled.
 pub fn sound_only_tag(ui: &mut egui::Ui) {
     ui.label(
-        RichText::new("sound only")
+        RichText::new("acoustic path")
             .small()
             .italics()
             .color(Color32::from_rgb(140, 170, 200)),
     )
-    .on_hover_text("Changes what you hear, not the torque curve: pressure waves do not feed back on the valves in this model.");
+    .on_hover_text("Changes the acoustic path. Exhaust dimensions and damping can also affect the torque curve when pressure-wave coupling is enabled.");
 }
 
-/// Valve overlap at 0.050″ in degrees, for the same duration on both cams.
-pub fn overlap_deg(duration: f32, lsa: f32, advance: f32) -> f32 {
-    duration - (2. * lsa - advance)
+/// Valve overlap at 0.050″, including independently advanced valve profiles.
+pub fn overlap_deg(
+    intake_duration: f32,
+    exhaust_duration: f32,
+    lsa: f32,
+    intake_advance: f32,
+    exhaust_advance: f32,
+) -> f32 {
+    (intake_duration + exhaust_duration) * 0.5 - (2. * lsa - intake_advance + exhaust_advance)
+}
+
+/// Area-equivalent diameter of each individual throttle. The saved override
+/// remains a single total-area diameter for compatibility with old projects.
+pub fn individual_throttle_mm(equivalent_mm: f32, cylinders: u32) -> f32 {
+    equivalent_mm / (cylinders.max(1) as f32).sqrt()
 }
 
 /// `"Bass (dB)"` becomes `("Bass", " dB")`, so units read as slider suffixes
@@ -244,18 +256,26 @@ mod tests {
         assert!((a.throttle_area_m2 / b.throttle_area_m2 - 1.).abs() < 1e-4);
         assert!((a.plenum_volume_m3 / b.plenum_volume_m3 - 1.).abs() < 1e-4);
         assert!((a.lift_m / b.lift_m - 1.).abs() < 1e-4);
-        assert!((overlap_deg(218., 111.6, 0.) - (218. - 223.2)).abs() < 1e-3);
+        assert!((overlap_deg(218., 218., 111.6, 0., 0.) - (218. - 223.2)).abs() < 1e-3);
+        assert!((overlap_deg(240., 260., 110., 5., 3.) - 32.).abs() < 1e-3);
     }
 
     #[test]
     fn slider_ranges_are_the_validated_ranges() {
         use range::*;
         type Set = fn(&mut EngineTuning, f32);
-        let fields: [(&RangeInclusive<f32>, Set); 10] = [
+        let fields: [(&RangeInclusive<f32>, Set); 15] = [
             (&DURATION_DEG, |t, v| t.cam.duration_deg = Some(v)),
             (&LIFT_MM, |t, v| t.cam.lift_mm = Some(v)),
+            (&DURATION_DEG, |t, v| t.cam.intake_duration_deg = Some(v)),
+            (&LIFT_MM, |t, v| t.cam.intake_lift_mm = Some(v)),
+            (&DURATION_DEG, |t, v| t.cam.exhaust_duration_deg = Some(v)),
+            (&LIFT_MM, |t, v| t.cam.exhaust_lift_mm = Some(v)),
             (&LSA_DEG, |t, v| t.cam.lsa_deg = Some(v)),
             (&ADVANCE_DEG, |t, v| t.cam.intake_advance_deg = Some(v)),
+            (&EXHAUST_ADVANCE_DEG, |t, v| {
+                t.cam.exhaust_advance_deg = Some(v)
+            }),
             (&INTAKE_TO_BORE, |t, v| t.valves.intake_to_bore = Some(v)),
             (&EXHAUST_TO_BORE, |t, v| t.valves.exhaust_to_bore = Some(v)),
             (&ROD_TO_STROKE, |t, v| t.bottom.rod_to_stroke = Some(v)),
@@ -274,6 +294,14 @@ mod tests {
                 set(&mut t, outside);
                 assert!(t.validate().is_err(), "{outside} accepted");
             }
+        }
+    }
+
+    #[test]
+    fn individual_throttle_display_preserves_total_area() {
+        for cylinders in [1, 4, 6, 8, 12] {
+            let per_body = individual_throttle_mm(72., cylinders);
+            assert!((per_body * per_body * cylinders as f32 - 72. * 72.).abs() < 0.001);
         }
     }
 

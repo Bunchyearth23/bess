@@ -162,15 +162,27 @@ impl CylinderPrototype {
 
     fn reservoir_flow(&self, reservoir: Reservoir, intake: bool) -> f64 {
         let c = self.config;
-        let (diameter, count, center) = if intake {
-            (c.intake_diameter_m, c.intake_valves, c.intake_center_deg)
+        let (diameter, count, center, duration, peak_lift) = if intake {
+            (
+                c.intake_diameter_m,
+                c.intake_valves,
+                c.intake_center_deg,
+                c.seat_duration_deg,
+                c.lift_m,
+            )
         } else {
-            (c.exhaust_diameter_m, c.exhaust_valves, c.exhaust_center_deg)
+            (
+                c.exhaust_diameter_m,
+                c.exhaust_valves,
+                c.exhaust_center_deg,
+                c.exhaust_seat_duration_deg,
+                c.exhaust_lift_m,
+            )
         };
         let lift = HarmonicCam {
             center_rad: center.to_radians(),
-            duration_rad: c.seat_duration_deg.to_radians(),
-            peak_lift_m: c.lift_m,
+            duration_rad: duration.to_radians(),
+            peak_lift_m: peak_lift,
             shape_exponent: 1.0,
             lash_m: c.lash_m,
         }

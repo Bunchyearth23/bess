@@ -1,11 +1,16 @@
-//! Intake stem across load (X-023): fixed constants, no RPM/RMS gain.
+//! Historical full-airflow calibration (X-023), still available at 0 dB.
 use bess::{automation_voice::AutomationVoice, scratch::Scratch};
 use rustfft::{FftPlanner, num_complex::Complex};
 
-// Default NA I4, 48 kHz voice: 1 s settling, then 1 s measured.
+// Default NA I4 with reference airflow, 48 kHz voice: 1 s settling, then 1 s measured.
 fn intake(rpm: f32, load: f32) -> Vec<f32> {
     let _guard = bess::realtime::DenormalGuard::enter();
-    let mut voice = AutomationVoice::new(48000, &Scratch::default()).unwrap();
+    let mut scratch = Scratch::default();
+    // These old spectral/level criteria require the deliberately noise-dominant
+    // balance. Keep guarding that reference without imposing it on the new
+    // pulse-led default; source isolation and matched renders qualify the latter.
+    scratch.sound.intake_air_noise = 1.;
+    let mut voice = AutomationVoice::new(48000, &scratch).unwrap();
     for _ in 0..48000 {
         voice.next(rpm, load);
     }
@@ -27,7 +32,7 @@ fn share(x: &[f32], low: usize, high: usize) -> f32 {
 }
 
 #[test]
-fn intake_rises_with_load_without_a_bright_idle_hiss_or_a_dull_cruise() {
+fn reference_airflow_keeps_its_load_and_bandwidth_calibration() {
     let idle = intake(850., 0.1);
     let cruise = intake(2000., 0.3);
     let loaded = intake(3000., 0.7);

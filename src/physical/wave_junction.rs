@@ -78,6 +78,102 @@ pub struct WavePort {
     pub guess_inflow_kg_s: f64,
 }
 
+/// Open-valve invariants prepared once per cylinder substep, outside Newton.
+/// Flow and analytic derivative share the same pressure-ratio exponentials.
+/// The caller supplies already validated cylinder/reservoir states.
+pub struct ValveFlow {
+    cylinder_pa: f64,
+    backflow: Donor,
+    outflow: Donor,
+    closed: bool,
+}
+
+struct Donor {
+    gamma: f64,
+    coefficient: f64,
+    critical: std::cell::Cell<f64>,
+    choked_factor: std::cell::Cell<f64>,
+}
+
+impl ValveFlow {
+    pub fn new(
+        orifice: crate::physical::gas::Orifice,
+        reservoir_k: f64,
+        cylinder_pa: f64,
+        cylinder_k: f64,
+        backflow: crate::physical::gas::GasProperties,
+        outflow: crate::physical::gas::GasProperties,
+    ) -> Self {
+        let donor = |gas: crate::physical::gas::GasProperties, temperature: f64| {
+            let g = gas.gamma;
+            Donor {
+                gamma: g,
+                coefficient: orifice.discharge_coefficient * orifice.area_m2
+                    / (gas.gas_constant_j_kg_k * temperature).sqrt(),
+                critical: std::cell::Cell::new(f64::NAN),
+                choked_factor: std::cell::Cell::new(f64::NAN),
+            }
+        };
+        Self {
+            cylinder_pa,
+            backflow: donor(backflow, reservoir_k),
+            outflow: donor(outflow, cylinder_k),
+            closed: orifice.area_m2 == 0. || orifice.discharge_coefficient == 0.,
+        }
+    }
+
+    pub fn evaluate(&self, p: f64) -> (f64, f64) {
+        if self.closed {
+            return (0., 0.);
+        }
+        let pc = self.cylinder_pa;
+        if (p - pc).abs() <= 8. * f64::EPSILON * p.max(pc) {
+            return (0., f64::INFINITY);
+        }
+        let (donor, upstream, downstream, sign) = if p > pc {
+            (&self.backflow, p, pc, 1.)
+        } else {
+            (&self.outflow, pc, p, -1.)
+        };
+        let ratio = downstream / upstream;
+        let g = donor.gamma;
+        let choked = if ratio > 0.61 {
+            false
+        } else if ratio < 0.44 {
+            true
+        } else {
+            let mut critical = donor.critical.get();
+            if critical.is_nan() {
+                critical = (2. / (g + 1.)).powf(g / (g - 1.));
+                donor.critical.set(critical);
+            }
+            ratio <= critical
+        };
+        let (factor, phi_slope_ratio) = if choked {
+            let mut factor = donor.choked_factor.get();
+            if factor.is_nan() {
+                factor = g.sqrt() * (2. / (g + 1.)).powf((g + 1.) / (2. * (g - 1.)));
+                donor.choked_factor.set(factor);
+            }
+            (factor, 0.)
+        } else {
+            let log_ratio = ratio.ln();
+            let minus_one = ((g - 1.) / g * log_ratio).exp_m1();
+            let factor = (2. * g / (g - 1.) * (2. / g * log_ratio).exp() * -minus_one).sqrt();
+            // r^(1-1/g) = 1+expm1(...) is already needed by the flow.
+            let slope = (2. - (g + 1.) * (1. + minus_one)) / (-2. * g * ratio * minus_one);
+            (factor, slope)
+        };
+        let flow = sign * donor.coefficient * upstream * factor;
+        let slope = if p > pc {
+            flow * (1. - ratio * phi_slope_ratio) / upstream
+        } else {
+            flow * phi_slope_ratio / upstream
+        };
+        (flow, slope)
+    }
+}
+
 /// dF/dp of an orifice flow F (reservoir p → cylinder at `cylinder_pa`) from
 /// F itself: F = ±K·p_u·φ(r) makes F′/F a function of the pressures and γ
 /// only. Subsonic φ′/φ = (2/r − (γ+1)·r^(−1/γ)) / (2γ·(1 − r^((γ−1)/γ)));
@@ -339,6 +435,34 @@ mod tests {
             guess_inflow_kg_s: 0.,
         };
         port.wave_sum(port.solve(cylinder_pa, sloped(cylinder_pa)).0) - incoming
+    }
+
+    #[test]
+    fn prepared_valve_shares_exponents_without_changing_flow_or_slope() {
+        let orifice = Orifice {
+            area_m2: 6e-4,
+            discharge_coefficient: 0.7,
+        };
+        for gamma in [1.1, 1.33, 1.4, 1.67] {
+            let properties = GasProperties { gamma, ..GAS };
+            for cylinder in [30e3, 105e3, 600e3] {
+                let prepared =
+                    ValveFlow::new(orifice, 700., cylinder, 1100., properties, properties);
+                for n in 0..400 {
+                    let p = 2e3 + f64::from(n) * 2000.;
+                    let expected =
+                        orifice.mass_flow_from_states(p, 700., cylinder, 1100., properties);
+                    let (flow, slope) = prepared.evaluate(p);
+                    assert!((flow - expected).abs() < 1e-13 * expected.abs().max(1e-8));
+                    let derivative = orifice_slope(expected, p, cylinder, gamma);
+                    if derivative.is_infinite() {
+                        assert_eq!(slope, derivative);
+                    } else {
+                        assert!((slope - derivative).abs() < 1e-10 * derivative.abs().max(1e-8));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

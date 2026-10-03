@@ -1,15 +1,15 @@
 //! Observation of intake flow and mechanical contacts. Never feeds the solver.
 //! Airbox damping removes sharp flow corners; turbulence requires real flow.
 //! Finite contact bursts replace identical one-sample mechanical impulses.
-//! A small inharmonic modal bank, not one resonator, rings for every contact.
+//! Block motion and small head contacts use separate, damped structural paths.
 use crate::engine_build::BlockMaterial;
 use bdsp::svf::{StateVariableFilter, SvfMode};
 
-// Shell/plate-like inharmonic ratios around the mechanical pitch control.
-const RATIOS: [f32; 8] = [0.45, 0.68, 1., 1.32, 1.74, 2.21, 2.79, 3.5];
-// Sets the neutral-default level near the former single 2.4 kHz / Q 2 SVF,
-// measured by `neutral_level_matches_the_former_single_resonator`.
-const LEVEL: f32 = 0.21;
+// Four large block modes, then four smaller head/contact modes. The previous
+// common 1–8 kHz bank made both sources sound like a ringing sheet of metal.
+// These are perceptual transfer estimates, not measured modes of a given engine.
+const RATIOS: [f32; 8] = [0.13, 0.23, 0.38, 0.62, 0.45, 0.75, 1.16, 1.8];
+const LEVEL: f32 = 0.62;
 
 /// Inline modal bank. Clone/retune never allocate.
 #[derive(Clone)]
@@ -21,6 +21,8 @@ pub(crate) struct Modes {
     block: [f32; 8],
     gain: [f32; 8],
     limit_hz: f32,
+    head_radiation: StateVariableFilter,
+    block_radiation: StateVariableFilter,
 }
 impl Modes {
     pub fn new(
@@ -51,16 +53,27 @@ impl Modes {
                 StateVariableFilter::new(rate, 1000., 1., SvfMode::Bandpass)
             }),
             ratio: RATIOS.map(|r| r * jitter() * size * stiffness),
-            // Higher modes lose energy faster: Q falls with ratio.
-            q_scale: RATIOS.map(|r| 1.5 * damping * r.powf(-0.35)),
-            // Band-pass skirts already add brightness per mode: on white input
-            // head spans ~3.8 kHz centroid (legacy SVF 3.3 kHz), block ~2.7 kHz.
-            // Valvetrain/injector contacts are small and hard: upper modes.
-            head: RATIOS.map(|r| r.powf(-1.2)),
-            // Structure-borne combustion drives the large low/mid modes.
-            block: RATIOS.map(|r| r.powf(-1.8) * if r < 1.1 { low } else { 1. }),
+            // Broad, lossy responses at the neutral Q control. Pitch/Q remain
+            // editable, but normal contacts no longer sustain narrow whistles.
+            q_scale: [0.60, 0.58, 0.55, 0.50, 0.65, 0.60, 0.55, 0.50].map(|q| q * damping),
+            head: [0., 0., 0., 0., 1., 0.65, 0.32, 0.12],
+            block: [1., 0.85, 0.45, 0.16, 0., 0., 0., 0.].map(|w| w * low),
             gain: [LEVEL; 8],
             limit_hz: rate * 0.4,
+            // Radiation/structural loss is frequency dependent. In particular
+            // the differentiated pressure must not excite bright contact modes.
+            head_radiation: StateVariableFilter::new(
+                rate,
+                (3600. * size * stiffness).min(rate * 0.35),
+                0.707,
+                SvfMode::Lowpass,
+            ),
+            block_radiation: StateVariableFilter::new(
+                rate,
+                (1800. * size * stiffness).min(rate * 0.35),
+                0.707,
+                SvfMode::Lowpass,
+            ),
         };
         modes.retune(pitch_hz, resonance);
         modes
@@ -75,6 +88,8 @@ impl Modes {
         }
     }
     pub fn next(&mut self, head: f32, block: f32) -> f32 {
+        let head = self.head_radiation.next_sample(head);
+        let block = self.block_radiation.next_sample(block);
         let mut out = 0.;
         for i in 0..8 {
             out += self.modes[i].next_sample(head * self.head[i] + block * self.block[i])
@@ -171,6 +186,9 @@ pub(crate) struct Radiation {
     airbox: StateVariableFilter,
     gain: [f32; 4],
     target: [f32; 4],
+    air_noise_gain: f32,
+    air_noise_target: f32,
+    air_noise_step: f32,
     whine_phase: f32,
     whine_hz: f32,
     splitter: f32,
@@ -201,6 +219,11 @@ impl Radiation {
             ),
             gain: [0.; 4],
             target: [0.; 4],
+            // One is the historical source balance. Engine construction applies
+            // its chosen sound setting immediately, before any sample is read.
+            air_noise_gain: 1.,
+            air_noise_target: 1.,
+            air_noise_step: 1. - (-1. / (rate * 0.020)).exp(),
             whine_phase: 0.,
             whine_hz: 0.,
             splitter: 0.,
@@ -214,6 +237,19 @@ impl Radiation {
             contact_decay: (-1. / (rate * 0.0015)).exp(),
             noise_scale: (rate / 48000.).sqrt(),
             seed: seed ^ 0x5e2d_908f_7531_b4a9,
+        }
+    }
+    /// Observation gain for duct, jet and edge turbulence after the airbox.
+    /// Pulsations and compressor blade-pass sound are unaffected. Retuning keeps
+    /// every filter/RNG state and follows a 20 ms time constant; preparation or
+    /// reset can apply a gain immediately without a start-up ramp.
+    pub fn set_air_noise(&mut self, gain: f32, immediate: bool) {
+        if !gain.is_finite() {
+            return;
+        }
+        self.air_noise_target = gain.clamp(0., 1.);
+        if immediate {
+            self.air_noise_gain = self.air_noise_target;
         }
     }
     fn noise(&mut self) -> f32 {
@@ -293,7 +329,28 @@ impl Radiation {
         let angle = self.whine_phase * std::f32::consts::TAU;
         let whine = (angle.sin() + (angle * 2.).sin() * self.splitter) * self.gain[3]
             + self.bands[3].next_sample(blades * self.gain[3]) * 0.05;
-        self.airbox.next_sample(turbulence) + whine
+        let turbulence = self.airbox.next_sample(turbulence);
+        if self.air_noise_gain != self.air_noise_target {
+            let previous = self.air_noise_gain;
+            self.air_noise_gain +=
+                (self.air_noise_target - self.air_noise_gain) * self.air_noise_step;
+            // Also finish if f32 rounding prevents further progress near a
+            // nonzero target; otherwise the gain could stall short of one.
+            if (self.air_noise_target - self.air_noise_gain).abs() < 1e-6
+                || self.air_noise_gain == previous
+            {
+                self.air_noise_gain = self.air_noise_target;
+            }
+        }
+        // Preserve the historical floating-point path at one. Filtering and
+        // random draws continue even at zero, so reopening cannot reset the
+        // source or alter any mechanical/compressor random sequence.
+        let turbulence = if self.air_noise_gain == 1. {
+            turbulence
+        } else {
+            turbulence * self.air_noise_gain
+        };
+        turbulence + whine
     }
     /// `pulse`: radiated intake pressure from `IntakeAcoustic`, as a sample.
     pub fn next(&mut self, pulse: f32, impact: f32, air: Air) -> (f32, f32) {
@@ -334,6 +391,113 @@ mod tests {
     fn intake(air: Air, rate: u32) -> Vec<f32> {
         let mut r = Radiation::new(rate, 21);
         (0..rate).map(|_| r.next(0., 0., air).0).collect()
+    }
+    #[test]
+    fn air_noise_fixed_gain_is_linear_and_one_preserves_the_reference() {
+        for rate in [48000, 96000] {
+            let mut reference = Radiation::new(rate, 21);
+            let mut one = Radiation::new(rate, 21);
+            let mut reduced = Radiation::new(rate, 21);
+            let mut zero = Radiation::new(rate, 21);
+            one.set_air_noise(1., true);
+            reduced.set_air_noise(0.2, true);
+            zero.set_air_noise(0., true);
+            let mut energy = 0.;
+            for frame in 0..rate / 4 {
+                let phase = frame as f32 / rate as f32 * std::f32::consts::TAU;
+                let moving = air(0.04 + 0.02 * (100. * phase).sin(), 55000., 0.3);
+                let impact = if frame % 400 == 0 { 0.015 } else { 0. };
+                let a = reference.next(0., impact, moving);
+                // Idempotent live updates must not start a new fade or reset.
+                one.set_air_noise(1., false);
+                assert_eq!(one.next(0., impact, moving), a);
+                let b = reduced.next(0., impact, moving);
+                let c = zero.next(0., impact, moving);
+                assert_eq!(b.0.to_bits(), (a.0 * 0.2).to_bits());
+                assert_eq!(c.0, 0.);
+                assert_eq!(b.1.to_bits(), a.1.to_bits());
+                assert_eq!(c.1.to_bits(), a.1.to_bits());
+                energy += a.0 * a.0;
+            }
+            assert!(energy > 0.);
+        }
+    }
+
+    #[test]
+    fn air_noise_zero_preserves_pulses_and_compressor_sample_for_sample() {
+        for rate in [48000, 96000] {
+            let mut muted = Radiation::new(rate, 18);
+            let mut no_turbulence = Radiation::new(rate, 18);
+            muted.set_air_noise(0., true);
+            let mut compressor_energy = 0.;
+            for frame in 0..rate / 4 {
+                let pulse =
+                    0.02 * (frame as f32 * 100. * std::f32::consts::TAU / rate as f32).sin();
+                let moving = Air {
+                    shaft_rpm: 90000.,
+                    compressor_kg_s: 0.05,
+                    ..air(0.04, 55000., 0.3)
+                };
+                let expected = no_turbulence.next(pulse, 0., turbo(90000., 0.05));
+                let actual = muted.next(pulse, 0., moving);
+                assert_eq!(actual, expected);
+                compressor_energy += (actual.0 - pulse).powi(2);
+            }
+            assert!(compressor_energy > 0.);
+            let mut pulse_only = Radiation::new(rate, 18);
+            pulse_only.set_air_noise(0., true);
+            for frame in 0..1000 {
+                let pulse = if frame % 100 == 0 { 0.01 } else { 0. };
+                assert_eq!(pulse_only.next(pulse, 0., air(0.04, 55000., 0.3)).0, pulse);
+            }
+        }
+    }
+
+    #[test]
+    fn air_noise_live_retune_slews_without_resetting_source_state() {
+        for rate in [48000, 96000] {
+            let mut reference = Radiation::new(rate, 31);
+            let mut edited = Radiation::new(rate, 31);
+            let moving = air(0.04, 55000., 0.3);
+            for _ in 0..rate / 20 {
+                assert_eq!(edited.next(0., 0., moving), reference.next(0., 0., moving));
+            }
+            edited.set_air_noise(0., false);
+            assert_eq!(edited.air_noise_gain, 1.);
+            let mut previous_gain = 1.;
+            for frame in 0..rate / 2 {
+                let a = reference.next(0., 0.001, moving);
+                let b = edited.next(0., 0.001, moving);
+                assert!(edited.air_noise_gain <= previous_gain);
+                assert!(previous_gain - edited.air_noise_gain < 0.0011);
+                // Exact sample equality; +0 and -0 are the same muted signal.
+                assert_eq!(b.0, a.0 * edited.air_noise_gain);
+                assert_eq!(b.1.to_bits(), a.1.to_bits());
+                if frame + 1 == rate / 50 {
+                    assert!((edited.air_noise_gain - (-1_f32).exp()).abs() < 2e-4);
+                }
+                previous_gain = edited.air_noise_gain;
+            }
+            assert_eq!(edited.air_noise_gain, 0.);
+            // Muting did not stop filtering or random draws. Reopening during
+            // preparation therefore rejoins the uninterrupted reference exactly.
+            edited.set_air_noise(1., true);
+            assert_eq!(edited.next(0., 0., moving), reference.next(0., 0., moving));
+        }
+    }
+
+    #[test]
+    fn air_noise_retuning_cannot_create_a_sound_without_flow() {
+        for rate in [48000, 96000] {
+            let mut r = Radiation::new(rate, 13);
+            r.set_air_noise(0., true);
+            r.set_air_noise(1., false);
+            let still = air(0., 20000., 0.01);
+            for _ in 0..rate / 2 {
+                assert_eq!(r.next(0., 0., still), (0., 0.));
+            }
+            assert_eq!(r.air_noise_gain, 1.);
+        }
     }
     #[test]
     fn no_flow_or_contacts_cannot_generate_sound_and_tails_decay() {
@@ -495,7 +659,7 @@ mod tests {
         assert!(impulse(&mut low, 1., 1.).iter().all(|v| v.is_finite()));
     }
     #[test]
-    fn neutral_level_matches_the_former_single_resonator() {
+    fn neutral_contacts_retain_body_without_upper_band_hiss() {
         let mut r = Radiation::new(48000, 15);
         let mut old = StateVariableFilter::new(48000., 2400., 2., SvfMode::Bandpass);
         let mut new = modes(15);
@@ -507,9 +671,44 @@ mod tests {
             b.push(new.next(contact, 0.));
         }
         let db = 20. * (rms(&b) / rms(&a)).log10();
-        // Measured: -0.1 dB, mean-square frequency x1.6 (RMS frequency x1.27).
-        // The bound guards against a return of the reported upper-band hiss.
+        // A level decrease alone cannot satisfy this normalized spectral test.
+        // Keep useful contact energy while suppressing the harsh upper skirt.
         let bright = brightness(&b) / brightness(&a);
-        assert!(db.abs() < 2. && bright < 2., "{db} dB, x{bright}");
+        assert!(
+            (-9. ..=3.).contains(&db) && bright < 0.55,
+            "{db} dB, x{bright}"
+        );
+    }
+
+    #[test]
+    fn block_and_contacts_have_distinct_damped_transfer() {
+        let mut m = modes(15);
+        let head = impulse(&mut m, 1., 0.);
+        let block = impulse(&mut modes(15), 0., 1.);
+        let power = |x: &[f32], hz| dft_power(x, hz, 48000.);
+        assert!(power(&block, 4000.) < power(&block, 600.) * 0.01);
+        let head_tilt = power(&head, 2000.) / power(&head, 600.);
+        let block_tilt = power(&block, 2000.) / power(&block, 600.);
+        assert!(
+            head_tilt > block_tilt * 4.,
+            "head {head_tilt}, block {block_tilt}"
+        );
+        for signal in [&head, &block] {
+            assert!(rms(&signal[720..]) < rms(&signal[..720]) * 0.001);
+        }
+        // Controls keep working, including at low transport rates and their
+        // extreme settings. No source creates energy once the input stops.
+        for rate in [8000., 48000., 96000., 384000.] {
+            for pitch in [600., 6000.] {
+                let mut m = Modes::new(rate, pitch, 8., BlockMaterial::Aluminium, 86., 15);
+                let mut tail = 0.;
+                for i in 0..rate as usize {
+                    let y = m.next(if i == 0 { 1. } else { 0. }, 0.);
+                    assert!(y.is_finite());
+                    tail = y;
+                }
+                assert!(tail.abs() < 1e-6);
+            }
+        }
     }
 }

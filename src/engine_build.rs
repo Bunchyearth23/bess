@@ -162,16 +162,41 @@ pub struct EngineTuning {
     pub turbo: TurboTuning,
 }
 
-/// One profile drives both cams until the cycle model separates them (S6).
+/// Independent valve profiles over a backwards-compatible shared baseline.
+/// Old projects' duration/lift overrides remain the baseline for both cams;
+/// separate overrides never change the opposite valve's profile.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CamTuning {
-    /// At 0.050″ net lift.
+    /// Legacy shared duration at 0.050″ net lift, or the part-derived baseline.
     pub duration_deg: Option<f32>,
+    /// Legacy shared lift, or the part-derived baseline.
     pub lift_mm: Option<f32>,
+    pub intake_duration_deg: Option<f32>,
+    pub intake_lift_mm: Option<f32>,
+    pub exhaust_duration_deg: Option<f32>,
+    pub exhaust_lift_mm: Option<f32>,
     pub lsa_deg: Option<f32>,
     /// Intake centreline = LSA − advance.
     pub intake_advance_deg: Option<f32>,
+    /// Positive advances exhaust opening/closing (earlier crank angles).
+    pub exhaust_advance_deg: Option<f32>,
+}
+
+impl CamTuning {
+    /// Return intake to the inherited/shared profile without changing exhaust.
+    pub fn reset_intake(&mut self) {
+        self.intake_duration_deg = None;
+        self.intake_lift_mm = None;
+        self.intake_advance_deg = None;
+    }
+
+    /// Return exhaust to the inherited/shared profile without changing intake.
+    pub fn reset_exhaust(&mut self) {
+        self.exhaust_duration_deg = None;
+        self.exhaust_lift_mm = None;
+        self.exhaust_advance_deg = None;
+    }
 }
 
 /// Head diameters as fractions of the bore, so they follow bore changes.
@@ -211,6 +236,8 @@ pub struct ResolvedTuning {
     pub exhaust_valves: u32,
     pub duration_at_050_deg: f64,
     pub lift_m: f64,
+    pub exhaust_duration_at_050_deg: f64,
+    pub exhaust_lift_m: f64,
     /// Four-stroke crank degrees, firing TDC = 0, overlap TDC = 360.
     pub intake_center_deg: f64,
     pub exhaust_center_deg: f64,
@@ -246,6 +273,11 @@ impl EngineTuning {
         let intake_valves = u32::from(build.valves).div_ceil(2);
         let exhaust_valves = u32::from(build.valves) / 2;
         let lsa = or(self.cam.lsa_deg, 114. - 8. * cam);
+        let shared_duration = or(self.cam.duration_deg, 200. + 60. * cam);
+        let shared_lift = self
+            .cam
+            .lift_mm
+            .map_or(0.009 + 0.004 * cam, |mm| f64::from(mm) * 0.001);
         let displacement = PI * bore_m.powi(2) * stroke_m / 4. * f64::from(cylinders);
         let individual = build.throttle == Throttle::Individual;
         let turbo = or(self.turbo.size, 1.);
@@ -257,13 +289,18 @@ impl EngineTuning {
         ResolvedTuning {
             intake_valves,
             exhaust_valves,
-            duration_at_050_deg: or(self.cam.duration_deg, 200. + 60. * cam),
+            duration_at_050_deg: or(self.cam.intake_duration_deg, shared_duration),
             lift_m: self
                 .cam
-                .lift_mm
-                .map_or(0.009 + 0.004 * cam, |mm| f64::from(mm) * 0.001),
+                .intake_lift_mm
+                .map_or(shared_lift, |mm| f64::from(mm) * 0.001),
+            exhaust_duration_at_050_deg: or(self.cam.exhaust_duration_deg, shared_duration),
+            exhaust_lift_m: self
+                .cam
+                .exhaust_lift_mm
+                .map_or(shared_lift, |mm| f64::from(mm) * 0.001),
             intake_center_deg: 360. + lsa - or(self.cam.intake_advance_deg, 0.),
-            exhaust_center_deg: 360. - lsa,
+            exhaust_center_deg: 360. - lsa - or(self.cam.exhaust_advance_deg, 0.),
             intake_diameter_m: bore_m
                 * or(
                     self.valves.intake_to_bore,
@@ -335,8 +372,23 @@ impl EngineTuning {
         for (label, value, min, max) in [
             ("Cam duration", self.cam.duration_deg, 180., 300.),
             ("Cam lift", self.cam.lift_mm, 7., 16.),
+            ("Intake duration", self.cam.intake_duration_deg, 180., 300.),
+            ("Intake lift", self.cam.intake_lift_mm, 7., 16.),
+            (
+                "Exhaust duration",
+                self.cam.exhaust_duration_deg,
+                180.,
+                300.,
+            ),
+            ("Exhaust lift", self.cam.exhaust_lift_mm, 7., 16.),
             ("Lobe separation", self.cam.lsa_deg, 102., 120.),
             ("Intake cam advance", self.cam.intake_advance_deg, -4., 10.),
+            (
+                "Exhaust cam advance",
+                self.cam.exhaust_advance_deg,
+                -10.,
+                10.,
+            ),
             (
                 "Intake valve / bore",
                 self.valves.intake_to_bore,

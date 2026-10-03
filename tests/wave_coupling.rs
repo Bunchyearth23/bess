@@ -203,14 +203,14 @@ fn coupled_extreme_lengths_and_rates_stay_finite_and_bounded() {
 }
 
 #[test]
-#[ignore = "X-028: the Blair port fits 1/L only within 11–13 %; the 10 % requirement stands (Q-006)"]
+#[ignore = "X-028 qualification remains open: strict 10% whole-engine 1/L fails; run advanced_physics lengths for original and anechoic references, see BESS-ADVANCED-PHYSICS-2026-10-03.md"]
 fn primary_length_moves_the_tuned_torque_peak_as_one_over_length() {
     let sweep = |scale: f32, coupled: bool| {
         let mut scratch = Scratch::default();
         scratch.build.headers = Headers::EqualLength;
         scratch.sound.primary_length_scale = scale;
         scratch.experimental.wave_coupling = coupled;
-        dyno::sweep(&scratch, 31).unwrap()
+        dyno::sweep_at_rate(&scratch, 31, 48000).unwrap()
     };
     // Uncoupled, length is sound only (X-021): the dyno ignores it.
     let base = sweep(0.7, false);
