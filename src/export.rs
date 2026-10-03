@@ -1,6 +1,7 @@
 //! Complete vehicle replacement plus a versioned, source-bound BABM audio handoff.
 use crate::{
     bank::{self, Bank},
+    export_job::{ExportJob, ExportStage},
     hybrid::{Hybrid, Settings},
     project::Parameters,
 };
@@ -10,8 +11,11 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{Cursor, Read, Write},
-    path::Path,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 const MAX_SOURCE_WAV_BYTES: u64 = 16_000_000;
@@ -309,11 +313,49 @@ pub(crate) fn loop_stems(
 
 fn render_stems(
     bank: Arc<Bank>,
+    p: Parameters,
+    h: Settings,
+    rpm: f32,
+    load: f32,
+    engine_seconds: f32,
+) -> Result<LoopStems, String> {
+    render_stems_controlled(bank, p, h, rpm, load, engine_seconds, None)
+}
+
+#[derive(Clone, Copy)]
+struct RenderControl<'a> {
+    job: &'a ExportJob,
+    abort: &'a AtomicBool,
+    index: usize,
+}
+
+impl RenderControl<'_> {
+    fn step(
+        self,
+        done: usize,
+        total: usize,
+        rpm: f32,
+        load: f32,
+        detail: &str,
+    ) -> Result<(), String> {
+        self.job.check()?;
+        if self.abort.load(Ordering::Acquire) {
+            return Err("Another export worker failed".into());
+        }
+        self.job
+            .render_step(self.index, done, total, rpm, load, detail);
+        Ok(())
+    }
+}
+
+fn render_stems_controlled(
+    bank: Arc<Bank>,
     mut p: Parameters,
     mut h: Settings,
     rpm: f32,
     load: f32,
     engine_seconds: f32,
+    control: Option<RenderControl<'_>>,
 ) -> Result<LoopStems, String> {
     if !rpm.is_finite() || !(200.0..=12_000.0).contains(&rpm) {
         return Err(format!(
@@ -327,6 +369,9 @@ fn render_stems(
     (h, _) = resolved_settings(&bank, h)?;
     h.enhanced = true;
     h.level_match = false;
+    if let Some(control) = control {
+        control.step(0, 1, rpm, load, "Preparing engine voice")?;
+    }
     let mut engine = Hybrid::new(48000, p, h, Some(bank.clone()));
     if let Some(error) = engine.initialization_error() {
         return Err(format!(
@@ -338,23 +383,53 @@ fn render_stems(
     // BeamNG samples cancel as they crossfade.
     // The physical gas/thermal state gets at least two seconds to settle.
     // Integer-cycle multiplication retains the same phase alignment.
-    for _ in 0..aligned_warmup_frames(rpm) * 2 {
-        engine.next(true);
+    const BLOCK: usize = 4096;
+    let warmup = aligned_warmup_frames(rpm) * 2;
+    let cycle = 48000. * 120. / rpm;
+    let frames = (cycle * (2. * 48000. / cycle).ceil()) as usize;
+    let engine_frames = (cycle * (engine_seconds * 48000. / cycle).ceil()) as usize;
+    let overlap = cycle.round().max(64.) as usize;
+    let work = warmup + engine_frames + overlap + 1;
+    for start in (0..warmup).step_by(BLOCK) {
+        if let Some(control) = control {
+            control.step(
+                start,
+                work,
+                rpm,
+                load,
+                "Settling engine pressure and temperature",
+            )?;
+        }
+        for _ in start..(start + BLOCK).min(warmup) {
+            engine.next(true);
+        }
     }
     if engine.failed() {
         return Err(format!(
             "Export voice failed during warmup at {rpm} rpm / load {load}"
         ));
     }
-    let cycle = 48000. * 120. / rpm;
-    let frames = (cycle * (2. * 48000. / cycle).ceil()) as usize;
     // The engine-side mechanical variation needs longer before it repeats.
     // Its emitter has independent WAVs; keep the exhaust bank compact.
-    let engine_frames = (cycle * (engine_seconds * 48000. / cycle).ceil()) as usize;
-    let overlap = cycle.round().max(64.) as usize;
-    let stems: Vec<_> = (0..engine_frames + overlap)
-        .map(|_| engine.next_stems(true))
-        .collect();
+    let count = engine_frames + overlap;
+    let mut stems = Vec::with_capacity(count);
+    for start in (0..count).step_by(BLOCK) {
+        if let Some(control) = control {
+            control.step(warmup + start, work, rpm, load, "Generating engine sound")?;
+        }
+        for _ in start..(start + BLOCK).min(count) {
+            stems.push(engine.next_stems(true));
+        }
+    }
+    if let Some(control) = control {
+        control.step(
+            work - 1,
+            work,
+            rpm,
+            load,
+            "Joining the seamless engine loop",
+        )?;
+    }
     if engine.failed()
         || stems
             .iter()
@@ -387,7 +462,18 @@ fn render_stems(
 
 /// Keep the previous full-replacement sound as a single mixed exhaust bank.
 pub fn package(dir: &Path, p: Parameters, h: Settings, bank: Arc<Bank>) -> Result<String, String> {
-    package_inner(dir, p, h.for_beamng_export(), bank, false)
+    package_with_job(dir, p, h, bank, &ExportJob::default())
+}
+
+/// Full-vehicle export with cooperative cancellation and observable progress.
+pub fn package_with_job(
+    dir: &Path,
+    p: Parameters,
+    h: Settings,
+    bank: Arc<Bank>,
+    job: &ExportJob,
+) -> Result<String, String> {
+    run_package(dir, p, h.for_beamng_export(), bank, false, job)
 }
 
 /// Produce the exhaust stem used by selectable variants with a second emitter.
@@ -397,7 +483,244 @@ pub fn package_exhaust_stem(
     h: Settings,
     bank: Arc<Bank>,
 ) -> Result<String, String> {
-    package_inner(dir, p, h, bank, true)
+    run_package(dir, p, h, bank, true, &ExportJob::default())
+}
+
+fn run_package(
+    dir: &Path,
+    p: Parameters,
+    h: Settings,
+    bank: Arc<Bank>,
+    exhaust_only: bool,
+    job: &ExportJob,
+) -> Result<String, String> {
+    let result = package_inner(dir, p, h, bank, exhaust_only, job);
+    job.finish(&result);
+    result
+}
+
+struct RenderPlan {
+    name: String,
+    rpm: f32,
+    load: f32,
+}
+struct RenderedLoop {
+    index: usize,
+    samples: Vec<f32>,
+    exhaust_level_gain: Option<f32>,
+}
+
+struct RenderContext<'a> {
+    bank: &'a Arc<Bank>,
+    parameters: Parameters,
+    settings: Settings,
+    exhaust_only: bool,
+    job: &'a ExportJob,
+    abort: &'a AtomicBool,
+}
+
+impl RenderContext<'_> {
+    fn render_plan(
+        &self,
+        plan: &RenderPlan,
+        index: usize,
+        source_zip: &mut Option<zip::ZipArchive<File>>,
+    ) -> Result<RenderedLoop, String> {
+        let job = self.job;
+        let stems = render_stems_controlled(
+            self.bank.clone(),
+            self.parameters,
+            self.settings,
+            plan.rpm,
+            plan.load,
+            2.,
+            Some(RenderControl {
+                job,
+                abort: self.abort,
+                index,
+            }),
+        )?;
+        let mut rendered = if self.exhaust_only { stems.0 } else { stems.2 };
+        job.check()?;
+        let level_gain = if self.exhaust_only {
+            let (source_rate, source) = source_wav(
+                source_zip.as_mut().ok_or("Missing calibration source")?,
+                &plan.name,
+            )?;
+            signal_stats(&source)?;
+            let (_, rendered_peak) = signal_stats(&rendered)?;
+            let level_gain =
+                physical_exhaust_level_gain(&source, source_rate, &rendered, rendered_peak)?;
+            if !level_gain.is_finite() || level_gain <= 0. {
+                return Err(format!("Invalid exhaust level gain: {}", plan.name));
+            }
+            for sample in &mut rendered {
+                *sample *= level_gain;
+            }
+            Some(level_gain)
+        } else {
+            None
+        };
+        job.check()?;
+        job.rendered(index, plan.rpm, plan.load);
+        Ok(RenderedLoop {
+            index,
+            samples: rendered,
+            exhaust_level_gain: level_gain,
+        })
+    }
+}
+
+fn render_parallel(
+    plans: &[RenderPlan],
+    bank: Arc<Bank>,
+    p: Parameters,
+    h: Settings,
+    exhaust_only: bool,
+    job: &ExportJob,
+) -> Result<Vec<RenderedLoop>, String> {
+    let workers = job.worker_count(plans.len());
+    job.begin(
+        ExportStage::Rendering,
+        plans.len(),
+        workers,
+        "Generating replacement engine loops",
+    );
+    let next = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let mut threads = Vec::new();
+        let mut error = None;
+        for worker in 0..workers {
+            let bank = bank.clone();
+            let next = &next;
+            let abort = &abort;
+            let thread = std::thread::Builder::new()
+                .name(format!("bess-export-{worker}"))
+                .spawn_scoped(scope, move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut source_zip = if exhaust_only {
+                            Some(
+                                zip::ZipArchive::new(
+                                    File::open(&bank.source.archive).map_err(|e| e.to_string())?,
+                                )
+                                .map_err(|e| e.to_string())?,
+                            )
+                        } else {
+                            None
+                        };
+                        let mut rendered = Vec::new();
+                        let context = RenderContext {
+                            bank: &bank,
+                            parameters: p,
+                            settings: h,
+                            exhaust_only,
+                            job,
+                            abort,
+                        };
+                        loop {
+                            job.check()?;
+                            if abort.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(plan) = plans.get(index) else {
+                                break;
+                            };
+                            rendered.push(context.render_plan(plan, index, &mut source_zip)?);
+                        }
+                        Ok::<_, String>(rendered)
+                    }))
+                    .unwrap_or_else(|_| Err("An engine export worker stopped unexpectedly".into()));
+                    if result.is_err() {
+                        abort.store(true, Ordering::Release);
+                    }
+                    result
+                });
+            match thread {
+                Ok(thread) => threads.push(thread),
+                Err(e) => {
+                    abort.store(true, Ordering::Release);
+                    error = Some(format!("Cannot start export worker: {e}"));
+                    break;
+                }
+            }
+        }
+        let mut result = Vec::with_capacity(plans.len());
+        for thread in threads {
+            match thread
+                .join()
+                .unwrap_or_else(|_| Err("An export worker could not be joined".into()))
+            {
+                Ok(rendered) => result.extend(rendered),
+                Err(e) => {
+                    let priority = |message: &str| match message {
+                        "Another export worker failed" => 0,
+                        crate::export_job::CANCELLED => 1,
+                        _ => 2,
+                    };
+                    if error
+                        .as_ref()
+                        .is_none_or(|previous| priority(&e) > priority(previous))
+                    {
+                        error = Some(e)
+                    }
+                }
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        job.check()?;
+        if result.len() != plans.len() {
+            return Err("Incomplete parallel engine rendering".into());
+        }
+        result.sort_by_key(|item| item.index);
+        Ok(result)
+    })
+}
+
+/// Only paths reserved by this export are removed after failure/cancellation.
+/// A caller-owned folder or a file added by another process is never traversed.
+struct OutputFiles {
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+    complete: bool,
+}
+impl OutputFiles {
+    fn create(dir: &Path) -> Result<Self, String> {
+        fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            paths: Vec::new(),
+            complete: false,
+        })
+    }
+    fn reserve(&mut self, name: &str) -> Result<File, String> {
+        let path = self.dir.join(name);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        self.paths.push(path);
+        Ok(file)
+    }
+    fn write(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.reserve(name)?
+            .write_all(bytes)
+            .map_err(|e| e.to_string())
+    }
+}
+impl Drop for OutputFiles {
+    fn drop(&mut self) {
+        if !self.complete {
+            for path in self.paths.iter().rev() {
+                let _ = fs::remove_file(path);
+            }
+            let _ = fs::remove_dir(&self.dir);
+        }
+    }
 }
 
 fn package_inner(
@@ -406,13 +729,26 @@ fn package_inner(
     h: Settings,
     bank: Arc<Bank>,
     exhaust_only: bool,
+    job: &ExportJob,
 ) -> Result<String, String> {
+    job.check()?;
+    if dir.exists() {
+        return Err("Choose a new output folder: the destination already exists".into());
+    }
+    job.begin(
+        ExportStage::Preparing,
+        4,
+        0,
+        "Checking the original vehicle and engine settings",
+    );
     p.validate()?;
     let (h, physical_model) = resolved_settings(&bank, h)?;
     // Verify the file has not been swapped since import before copying the vehicle.
     let fresh = Bank::load(Path::new(&bank.source.archive), Some(&bank.source.blend))?;
     verify_source_identity(&bank.source, &fresh.source)?;
     drop(fresh);
+    job.check()?;
+    job.advance(1, "Original vehicle identity verified");
     let mut zip =
         zip::ZipArchive::new(File::open(&bank.source.archive).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -420,6 +756,7 @@ fn package_inner(
     let mut info_path = None;
     let mut total = 0u64;
     for i in 0..zip.len() {
+        job.check()?;
         let entry = zip.by_index(i).map_err(|e| e.to_string())?;
         total = total.saturating_add(entry.size());
         if entry.enclosed_name().is_none()
@@ -448,8 +785,10 @@ fn package_inner(
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     let blend: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let mut replacements = BTreeMap::new();
-    let mut exhaust_level_gains = BTreeMap::new();
+    job.check()?;
+    job.advance(2, "Vehicle archive structure checked");
+    let mut plans = Vec::new();
+    let mut wav_names = std::collections::HashSet::new();
     for (layer, rows) in blend["samples"]
         .as_array()
         .ok_or("Missing blend")?
@@ -459,41 +798,22 @@ fn package_inner(
         for row in rows.as_array().ok_or("Missing load layer")? {
             let name = row[0].as_str().ok_or("Missing WAV name")?;
             let rpm = row[1].as_f64().ok_or("Missing RPM")? as f32;
-            if replacements.contains_key(name) {
+            if !wav_names.insert(name.to_owned()) {
                 return Err(
                     "A WAV shared by multiple RPM points cannot be replaced unambiguously".into(),
                 );
             }
-            // Replacement and intermediate exhaust rendering use only their
-            // two-second channels; variant conversion renders the four-second
-            // engine stem separately with `loop_stems`.
-            let stems = render_stems(bank.clone(), p, h, rpm, layer as f32, 2.)?;
-            let mut rendered = if exhaust_only { stems.0 } else { stems.2 };
-            if exhaust_only {
-                let (source_rate, source) = source_wav(&mut zip, name)?;
-                signal_stats(&source)?;
-                let (_, rendered_peak) = signal_stats(&rendered)?;
-                let level_gain =
-                    physical_exhaust_level_gain(&source, source_rate, &rendered, rendered_peak)?;
-                if !level_gain.is_finite() || level_gain <= 0. {
-                    return Err(format!("Invalid exhaust level gain: {name}"));
-                }
-                for sample in &mut rendered {
-                    *sample *= level_gain;
-                }
-                exhaust_level_gains.insert(name.to_owned(), level_gain);
-            }
-            replacements.insert(name.to_owned(), rendered);
+            plans.push(RenderPlan {
+                name: name.to_owned(),
+                rpm,
+                load: layer as f32,
+            });
         }
     }
-    let peak = replacements
-        .values()
-        .flatten()
-        .fold(0f32, |a, &b| a.max(b.abs()));
-    if !peak.is_finite() || peak < 1e-8 || replacements.values().flatten().any(|v| !v.is_finite()) {
-        return Err("Silent or non-finite rendering".into());
+    if plans.is_empty() {
+        return Err("The source blend has no engine loops".into());
     }
-    let gain = exhaust_safety_gain(peak);
+    job.advance(3, "RPM and load points prepared");
     let mut handoff = if exhaust_only {
         None
     } else {
@@ -504,20 +824,52 @@ fn package_inner(
                 .strip_suffix("info.json")
                 .ok_or("Invalid vehicle root")?,
             &bank.source.blend,
-            replacements.keys().cloned(),
+            plans.iter().map(|plan| plan.name.clone()),
         )?)
     };
+    job.check()?;
+    job.advance(4, "Source metadata and BABM handoff prepared");
+    // Each voice keeps its original sequential DSP evolution. Only independent
+    // RPM/load loops run concurrently; ZIP order and the common gain stay fixed.
+    let rendered = render_parallel(&plans, bank.clone(), p, h, exhaust_only, job)?;
+    let workers = job.worker_count(plans.len());
+    let mut replacements = BTreeMap::new();
+    let mut exhaust_level_gains = BTreeMap::new();
+    for rendered in rendered {
+        let name = &plans[rendered.index].name;
+        if let Some(gain) = rendered.exhaust_level_gain {
+            exhaust_level_gains.insert(name.clone(), gain);
+        }
+        replacements.insert(name.clone(), rendered.samples);
+    }
+    let peak = replacements
+        .values()
+        .flatten()
+        .fold(0f32, |a, &b| a.max(b.abs()));
+    if !peak.is_finite() || peak < 1e-8 || replacements.values().flatten().any(|v| !v.is_finite()) {
+        return Err("Silent or non-finite rendering".into());
+    }
+    let gain = exhaust_safety_gain(peak);
     let zip_name = package_name(&bank);
-    fs::create_dir(dir).map_err(|e| format!("Choose a new output folder: {e}"))?;
-    let result = (|| -> Result<String, String> {
+    job.check()?;
+    job.begin(
+        ExportStage::Packaging,
+        zip.len() + usize::from(handoff.is_some()),
+        workers,
+        "Writing the complete vehicle ZIP",
+    );
+    let mut files = OutputFiles::create(dir)?;
+    (|| -> Result<String, String> {
         let partial = dir.join(format!("{zip_name}.partial"));
-        let mut output = zip::ZipWriter::new(File::create(&partial).map_err(|e| e.to_string())?);
+        let mut output = zip::ZipWriter::new(files.reserve(&format!("{zip_name}.partial"))?);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         let mut measurements = Vec::new();
         for i in 0..zip.len() {
+            job.check()?;
             let entry = zip.by_index(i).map_err(|e| e.to_string())?;
             if handoff.is_some() && entry.name() == crate::babm_exchange::MARKER_PATH {
+                job.advance(i + 1, "Replacing the previous BABM handoff");
                 continue;
             }
             if let Some(samples) = replacements.get(entry.name()) {
@@ -533,7 +885,10 @@ fn package_inner(
                         },
                     )
                     .map_err(|e| e.to_string())?;
-                    for s in samples {
+                    for (index, s) in samples.iter().enumerate() {
+                        if index % 4096 == 0 {
+                            job.check()?;
+                        }
                         writer
                             .write_sample((s * gain * 8388607.) as i32)
                             .map_err(|e| e.to_string())?;
@@ -562,7 +917,9 @@ fn package_inner(
             } else {
                 output.raw_copy_file(entry).map_err(|e| e.to_string())?;
             }
+            job.advance(i + 1, "Writing vehicle files and replacement sounds");
         }
+        job.check()?;
         if let Some(handoff) = &handoff {
             output
                 .start_file(crate::babm_exchange::MARKER_PATH, options)
@@ -570,13 +927,23 @@ fn package_inner(
             output
                 .write_all(&handoff.bytes()?)
                 .map_err(|e| e.to_string())?;
+            job.advance(zip.len() + 1, "BABM handoff written");
         }
         output.finish().map_err(|e| e.to_string())?;
+        job.check()?;
+        job.begin(
+            ExportStage::Verifying,
+            3,
+            workers,
+            "Reopening the generated vehicle ZIP",
+        );
         // Reimport the real produced archive, not only an in-memory rendering.
         let check = Bank::load(&partial, Some(&bank.source.blend))?;
+        job.check()?;
         if check.layers.iter().map(Vec::len).sum::<usize>() != replacements.len() {
             return Err("Incomplete loop coverage".into());
         }
+        job.advance(1, "Generated sound archive reimported");
         let mut check_zip = zip::ZipArchive::new(File::open(&partial).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         let mut check_info = Vec::new();
@@ -588,7 +955,9 @@ fn package_inner(
         if check_info != labelled_info {
             return Err("Exported vehicle display metadata differs from the prepared label".into());
         }
-        fs::rename(&partial, dir.join(&zip_name)).map_err(|e| e.to_string())?;
+        job.check()?;
+        job.advance(2, "Vehicle metadata and loop coverage verified");
+        drop(files.reserve("settings.bess.json")?);
         crate::project::save_project(
             &dir.join("settings.bess.json"),
             &crate::project::Project {
@@ -625,11 +994,11 @@ fn package_inner(
             "runtime_events":"The original vehicle references for afterfire, turbo, startup, and shutdown are retained. BESS driving transients are not exported.",
             "validation":"BESS reimported the generated archive; testing in BeamNG is still required"
         });
-        fs::write(
-            dir.join("manifest.json"),
-            serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+        job.check()?;
+        files.write(
+            "manifest.json",
+            &serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
+        )?;
         let instructions = if exhaust_only {
             "BESS intermediate exhaust-stem render\n\nDo not install this ZIP directly. It contains only the exhaust half of the selectable BESS sound and is an input to variant conversion. Install the final bess-variant-*.zip beside the original Automation vehicle instead.\n".to_owned()
         } else {
@@ -637,13 +1006,286 @@ fn package_inner(
                 "BESS — full vehicle with modified engine loops\n\nThe vehicle selector shows: {display_name}\n\nWith BABM: refresh BESS sounds, then apply this export to its original vehicle or existing grouped pack. BABM checks the source identity and replaces only the associated sound files, retaining the previous pack. The embedded bess-export.json travels with {zip_name}.\n\nFor a direct BeamNG test without BABM:\n1. Keep a backup of the original Automation ZIP.\n2. Disable the original vehicle in BeamNG's mod manager.\n3. Install {zip_name} in the mods folder under your BeamNG user folder.\n4. Enable only this copy. Do not enable both versions at once.\n5. Reload the vehicle and compare idle, acceleration, lift-off, and camera views.\n6. To restore the original, disable the BESS copy and re-enable the original.\n\nEach BESS copy has a distinct ZIP name to avoid collisions between vehicles.\nThe off-load and on-load loops cover every RPM point in the original blend.\nEvents and physics remain those of the original vehicle. BESS transients are not exported as a BeamNG driving script.\nThe listening volume is not applied to the mod; one common safety gain preserves the relative dynamics.\nIn-game validation is still required.\n"
             )
         };
-        fs::write(dir.join("INSTALLATION.txt"), instructions).map_err(|e| e.to_string())?;
-        Ok(format!("{} loops — {}", replacements.len(), dir.display()))
-    })();
-    if let Err(e) = &result {
-        let _ = fs::write(dir.join("ERROR.txt"), e);
+        files.write("INSTALLATION.txt", instructions.as_bytes())?;
+        job.check()?;
+        job.advance(3, "Verification complete; saving the finished archive");
+        job.publish(|| {
+            let final_path = dir.join(&zip_name);
+            if final_path.exists() {
+                return Err("The final ZIP path already exists".into());
+            }
+            fs::rename(&partial, &final_path).map_err(|e| e.to_string())?;
+            files.paths.push(final_path);
+            files.complete = true;
+            Ok(format!("{} loops — {}", replacements.len(), dir.display()))
+        })
+    })()
+}
+
+#[cfg(test)]
+mod parallel_job_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn fixture() -> (PathBuf, Arc<Bank>) {
+        let path = crate::test_support::automation_fixture();
+        let bank = Arc::new(Bank::load(&path, None).unwrap());
+        (path, bank)
     }
-    result
+    fn read_entries(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let mut entries = BTreeMap::new();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            entries.insert(entry.name().to_string(), data);
+        }
+        entries
+    }
+    fn compressed_entries(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        let bytes = fs::read(path).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| {
+                let entry = archive.by_index(i).unwrap();
+                let start = entry.data_start() as usize;
+                let end = start + entry.compressed_size() as usize;
+                (entry.name().to_string(), bytes[start..end].to_vec())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn export_workers_preserve_exact_pcm_and_raw_vehicle_members_with_back_pressure() {
+        let (source, bank) = fixture();
+        let original = fs::read(&source).unwrap();
+        let original_entries = read_entries(&source);
+        let original_compressed = compressed_entries(&source);
+        for coupled in [false, true] {
+            let mut settings = resolved_settings(&bank, Settings::default()).unwrap().0;
+            settings.engine.as_mut().unwrap().experimental.wave_coupling = coupled;
+            let serial = source.with_extension(format!("serial-{coupled}"));
+            let parallel = source.with_extension(format!("parallel-{coupled}"));
+            let one = ExportJob::with_worker_limit(1);
+            let many = ExportJob::with_worker_limit(3);
+            package_with_job(&serial, Parameters::default(), settings, bank.clone(), &one).unwrap();
+            package_with_job(
+                &parallel,
+                Parameters::default(),
+                settings,
+                bank.clone(),
+                &many,
+            )
+            .unwrap();
+            let a_path = serial.join(package_name(&bank));
+            let b_path = parallel.join(package_name(&bank));
+            let a = read_entries(&a_path);
+            let b = read_entries(&b_path);
+            let compressed = compressed_entries(&b_path);
+            assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+            for (name, bytes) in &a {
+                if name != crate::babm_exchange::MARKER_PATH {
+                    assert_eq!(bytes, &b[name], "workers changed {name}, coupled={coupled}");
+                }
+            }
+            for (name, bytes) in &original_entries {
+                if !name.ends_with(".wav") && !vehicle_info_path(name) {
+                    assert_eq!(&b[name], bytes);
+                    assert_eq!(
+                        compressed[name], original_compressed[name],
+                        "recompressed preserved member {name}"
+                    );
+                }
+            }
+            let a_marker: crate::babm_exchange::ExportMarker =
+                serde_json::from_slice(&a[crate::babm_exchange::MARKER_PATH]).unwrap();
+            let b_marker: crate::babm_exchange::ExportMarker =
+                serde_json::from_slice(&b[crate::babm_exchange::MARKER_PATH]).unwrap();
+            assert_eq!(
+                serde_json::to_value(a_marker.sounds).unwrap(),
+                serde_json::to_value(b_marker.sounds).unwrap()
+            );
+            assert_eq!(one.snapshot().stage, ExportStage::Complete);
+            assert_eq!(many.snapshot().stage, ExportStage::Complete);
+            assert_eq!(many.snapshot().workers, 3);
+            one.cancel();
+            assert_eq!(one.snapshot().stage, ExportStage::Complete);
+            assert!(!one.is_cancelled());
+            fs::remove_dir_all(serial).unwrap();
+            fs::remove_dir_all(parallel).unwrap();
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_generation_stops_workers_without_publishing() {
+        let (source, bank) = fixture();
+        let output = source.with_extension("cancel-render");
+        let original = fs::read(&source).unwrap();
+        let job = ExportJob::with_worker_limit(2);
+        let observer = job.clone();
+        let cancel = std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut previous = 0.;
+            loop {
+                let progress = observer.snapshot();
+                if progress.stage == ExportStage::Rendering {
+                    let fraction = progress.fraction.unwrap_or(0.);
+                    assert!(fraction >= previous);
+                    previous = fraction;
+                    if fraction > 0. {
+                        observer.cancel();
+                        return;
+                    }
+                }
+                assert!(!matches!(
+                    progress.stage,
+                    ExportStage::Complete | ExportStage::Failed
+                ));
+                assert!(start.elapsed() < Duration::from_secs(30));
+                std::thread::yield_now();
+            }
+        });
+        let result = package_with_job(
+            &output,
+            Parameters::default(),
+            Settings::default(),
+            bank,
+            &job,
+        );
+        cancel.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(job.snapshot().stage, ExportStage::Cancelled);
+        assert!(!output.exists());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn cancellation_while_packaging_removes_only_owned_partial_files() {
+        let (source, bank) = fixture();
+        let output = source.with_extension("cancel-package");
+        let partial = output.join(format!("{}.partial", package_name(&bank)));
+        let job = ExportJob::with_worker_limit(2);
+        let observer = job.clone();
+        let watched = output.clone();
+        let cancel = std::thread::spawn(move || {
+            let start = Instant::now();
+            loop {
+                let progress = observer.snapshot();
+                if progress.stage == ExportStage::Packaging && partial.is_file() {
+                    fs::write(watched.join("user-note.txt"), b"keep this file").unwrap();
+                    observer.cancel();
+                    return;
+                }
+                assert!(!matches!(
+                    progress.stage,
+                    ExportStage::Complete | ExportStage::Failed
+                ));
+                assert!(start.elapsed() < Duration::from_secs(30));
+                std::thread::yield_now();
+            }
+        });
+        let result = package_with_job(
+            &output,
+            Parameters::default(),
+            Settings::default(),
+            bank,
+            &job,
+        );
+        cancel.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(job.snapshot().stage, ExportStage::Cancelled);
+        let files: Vec<_> = fs::read_dir(&output)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files, vec![std::ffi::OsString::from("user-note.txt")]);
+        assert_eq!(
+            fs::read(output.join("user-note.txt")).unwrap(),
+            b"keep this file"
+        );
+        fs::remove_file(output.join("user-note.txt")).unwrap();
+        fs::remove_dir(output).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn cancellation_and_existing_destination_fail_before_rendering() {
+        let (source, bank) = fixture();
+        let output = source.with_extension("existing-output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("keep.txt"), b"untouched").unwrap();
+        let job = ExportJob::default();
+        assert!(
+            package_with_job(
+                &output,
+                Parameters::default(),
+                Settings::default(),
+                bank.clone(),
+                &job
+            )
+            .is_err()
+        );
+        assert_eq!(job.snapshot().stage, ExportStage::Failed);
+        assert_eq!(job.snapshot().workers, 0);
+        assert_eq!(fs::read(output.join("keep.txt")).unwrap(), b"untouched");
+        let cancelled = ExportJob::default();
+        cancelled.cancel();
+        let fresh = source.with_extension("never-created");
+        assert!(
+            package_with_job(
+                &fresh,
+                Parameters::default(),
+                Settings::default(),
+                bank,
+                &cancelled
+            )
+            .is_err()
+        );
+        assert_eq!(cancelled.snapshot().stage, ExportStage::Cancelled);
+        assert!(!fresh.exists());
+        fs::remove_dir_all(output).unwrap();
+        fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn worker_failure_aborts_peers_and_keeps_the_actual_failure() {
+        let (source, bank) = fixture();
+        let job = ExportJob::with_worker_limit(2);
+        let plans = [
+            RenderPlan {
+                name: "first.wav".into(),
+                rpm: 800.,
+                load: 0.,
+            },
+            RenderPlan {
+                name: "bad.wav".into(),
+                rpm: 13000.,
+                load: 1.,
+            },
+        ];
+        let result = render_parallel(
+            &plans,
+            bank,
+            Parameters::default(),
+            Settings::default(),
+            false,
+            &job,
+        )
+        .map(|_| "Unexpected successful export".to_owned());
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .contains("Unsupported export RPM 13000")
+        );
+        job.finish(&result);
+        assert_eq!(job.snapshot().stage, ExportStage::Failed);
+        fs::remove_file(source).unwrap();
+    }
 }
 
 #[cfg(test)]

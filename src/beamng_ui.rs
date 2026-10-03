@@ -1,6 +1,123 @@
 //! Local BeamNG folder, vehicle library and explicit export actions.
 use super::*;
-use bess::{beamng_library::VehicleArchive, beamng_paths};
+use bess::{
+    beamng_library::VehicleArchive,
+    beamng_paths,
+    export_job::{ExportJob, ExportProgress, ExportStage},
+};
+
+fn elapsed_label(seconds: f64) -> String {
+    let seconds = seconds.max(0.).round() as u64;
+    if seconds >= 3600 {
+        format!(
+            "{}h {:02}m {:02}s",
+            seconds / 3600,
+            (seconds / 60) % 60,
+            seconds % 60
+        )
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn export_progress_controls(
+    ui: &mut egui::Ui,
+    progress: &ExportProgress,
+    cancelling: bool,
+) -> bool {
+    let terminal = matches!(
+        progress.stage,
+        ExportStage::Complete | ExportStage::Cancelled | ExportStage::Failed
+    );
+    let stage = if cancelling && !terminal {
+        "Cancelling export…"
+    } else {
+        match progress.stage {
+            ExportStage::Preparing => "Preparing vehicle export",
+            ExportStage::Rendering => "Generating engine sounds",
+            ExportStage::Packaging => "Writing vehicle ZIP",
+            ExportStage::Verifying => "Verifying vehicle ZIP",
+            ExportStage::Complete => "Vehicle ZIP verified",
+            ExportStage::Cancelled => "Export cancelled",
+            ExportStage::Failed => "Export failed",
+        }
+    };
+    let mut cancel = false;
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(stage);
+        let unit = match progress.stage {
+            ExportStage::Preparing => Some("preparation steps"),
+            ExportStage::Rendering => Some("sounds generated"),
+            ExportStage::Packaging => Some("files written"),
+            ExportStage::Verifying => Some("checks completed"),
+            ExportStage::Complete | ExportStage::Cancelled | ExportStage::Failed => None,
+        };
+        if progress.total > 0
+            && let Some(unit) = unit
+        {
+            ui.label(format!(
+                "{} / {} {unit}",
+                progress.completed, progress.total
+            ));
+        }
+        cancel = ui
+            .add_enabled(!cancelling && !terminal, egui::Button::new("Cancel export"))
+            .clicked();
+    });
+    // Audio generation is only part of the job. A full bar means the ZIP passed verification.
+    let fraction = match progress.stage {
+        ExportStage::Preparing => 0.,
+        ExportStage::Rendering => (progress.fraction.unwrap_or_else(|| {
+            if progress.total == 0 {
+                0.
+            } else {
+                progress.completed as f32 / progress.total as f32
+            }
+        }) * 0.94)
+            .clamp(0., 0.94),
+        ExportStage::Packaging => 0.95,
+        ExportStage::Verifying => 0.98,
+        ExportStage::Complete => 1.,
+        ExportStage::Cancelled | ExportStage::Failed => {
+            progress.fraction.unwrap_or(0.).clamp(0., 0.99)
+        }
+    };
+    ui.add(egui::ProgressBar::new(fraction).show_percentage());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!(
+            "Elapsed: {}",
+            elapsed_label(progress.elapsed_seconds)
+        ));
+        if let Some(rpm) = progress.current_rpm {
+            let load = progress
+                .current_load
+                .map(|load| format!(" · {:.0}% load", load * 100.))
+                .unwrap_or_default();
+            ui.label(format!("Latest sound: {rpm:.0} rpm{load}"));
+        }
+        if progress.workers > 0 {
+            ui.label(format!("{} parallel tasks", progress.workers));
+        }
+        if progress.stage == ExportStage::Rendering && !cancelling {
+            ui.label(match progress.estimated_remaining_seconds {
+                Some(seconds) => format!(
+                    "Sound generation left (estimate): about {}",
+                    elapsed_label(seconds)
+                ),
+                None => "Estimating time left…".into(),
+            });
+        }
+    });
+    if cancelling && !terminal {
+        ui.small("Stopping work and removing the incomplete export. The original vehicle stays unchanged.");
+    } else if !progress.detail.is_empty() {
+        ui.small(&progress.detail);
+    }
+    cancel
+}
 
 fn folder_label(path: &Path) -> String {
     let text = path.to_string_lossy();
@@ -80,6 +197,7 @@ pub(super) struct BeamngWorkspace {
     session: Option<CompanionWorkspace>,
     pending_export_dir: Option<PathBuf>,
     last_export_dir: Option<PathBuf>,
+    export_job: Option<ExportJob>,
     filter: String,
     error: Option<String>,
     pub(super) worker: Option<mpsc::Receiver<Result<WorkspaceScan, String>>>,
@@ -442,6 +560,8 @@ impl App {
         let h = self.settings.for_beamng_export();
         let (tx, rx) = mpsc::channel();
         self.beamng_workspace.pending_export_dir = Some(parent.clone());
+        let job = ExportJob::default();
+        self.beamng_workspace.export_job = Some(job.clone());
         self.worker = Some(rx);
         self.status = "Creating and verifying the complete vehicle ZIP…".into();
         std::thread::spawn(move || {
@@ -455,7 +575,7 @@ impl App {
                         .map_err(|e| e.to_string())?
                         .as_nanos()
                 ));
-                bess::export::package(&folder, p, h, bank)
+                bess::export::package_with_job(&folder, p, h, bank, &job)
             })();
             let _ = tx.send(result);
         });
@@ -468,11 +588,50 @@ impl App {
             .or(self.beamng_workspace.export_dir.as_deref())
     }
 
-    pub(super) fn finish_beamng_export(&mut self, result: &Result<String, String>) {
+    pub(super) fn finish_beamng_export(&mut self, result: &Result<String, String>) -> bool {
         if let Some(parent) = self.beamng_workspace.pending_export_dir.take()
             && result.is_ok()
         {
             self.beamng_workspace.last_export_dir = Some(parent);
+        }
+        let Some(job) = self.beamng_workspace.export_job.take() else {
+            return false;
+        };
+        let progress = job.snapshot();
+        let elapsed = elapsed_label(progress.elapsed_seconds);
+        self.status = match result {
+            Ok(message) => format!("Export completed and verified in {elapsed}. {message}"),
+            Err(_) if progress.stage == ExportStage::Cancelled => {
+                format!("Export cancelled after {elapsed}. The original vehicle is unchanged.")
+            }
+            Err(error) => format!("Export failed after {elapsed}: {error}"),
+        };
+        true
+    }
+
+    pub(super) fn poll_output_worker(&mut self) {
+        let Some(receiver) = self.worker.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Output worker stopped unexpectedly".into())
+            }
+        };
+        self.worker = None;
+        if !self.finish_beamng_export(&result) {
+            self.status = result.unwrap_or_else(|error| format!("Error: {error}"));
+        }
+    }
+
+    pub(super) fn beamng_export_progress(&mut self, ui: &mut egui::Ui) {
+        if let Some(job) = &self.beamng_workspace.export_job {
+            let progress = job.snapshot();
+            if export_progress_controls(ui, &progress, job.is_cancelled()) {
+                job.cancel();
+            }
         }
     }
 }
@@ -480,6 +639,253 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress(stage: ExportStage) -> ExportProgress {
+        ExportProgress {
+            stage,
+            completed: 12,
+            total: 12,
+            current_rpm: Some(4200.),
+            current_load: Some(0.7),
+            workers: 4,
+            elapsed_seconds: 65.,
+            estimated_remaining_seconds: Some(20.),
+            fraction: Some(1.),
+            detail: "Current vehicle export".into(),
+        }
+    }
+
+    #[test]
+    fn export_progress_exposes_cancellation_and_never_finishes_before_verification() {
+        for (stage, label, cancelling, disabled, complete) in [
+            (
+                ExportStage::Preparing,
+                "Preparing vehicle export",
+                false,
+                false,
+                false,
+            ),
+            (
+                ExportStage::Rendering,
+                "Generating engine sounds",
+                false,
+                false,
+                false,
+            ),
+            (
+                ExportStage::Packaging,
+                "Writing vehicle ZIP",
+                false,
+                false,
+                false,
+            ),
+            (
+                ExportStage::Verifying,
+                "Verifying vehicle ZIP",
+                false,
+                false,
+                false,
+            ),
+            (
+                ExportStage::Rendering,
+                "Cancelling export…",
+                true,
+                true,
+                false,
+            ),
+            (
+                ExportStage::Complete,
+                "Vehicle ZIP verified",
+                false,
+                true,
+                true,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let draw = || {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(480., 800.),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::TopBottomPanel::top("export-progress-header").show(ctx, |ui| {
+                            export_progress_controls(ui, &progress(stage), cancelling);
+                        });
+                    },
+                )
+            };
+            // TopBottomPanel initially clips to one row, then keeps its measured
+            // height. Inspect the settled frame, as the live repaint does.
+            let _ = draw();
+            let output = draw();
+            let accessibility = output.platform_output.accesskit_update.unwrap();
+            let cancel = accessibility
+                .nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.label() == Some("Cancel export")
+                })
+                .expect("Cancel must stay visible throughout the export");
+            assert_eq!(cancel.is_disabled(), disabled);
+            assert!(
+                accessibility
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.value() == Some(label)),
+                "missing stage {label}"
+            );
+            fn texts(shape: &egui::Shape, output: &mut String) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        output.push_str(&text.galley.job.text);
+                        output.push('\n');
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            texts(shape, output);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut visible = String::new();
+            for shape in &output.shapes {
+                texts(&shape.shape, &mut visible);
+            }
+            assert_eq!(visible.contains("100%"), complete, "{stage:?}: {visible}");
+            let expected_count = match stage {
+                ExportStage::Preparing => Some("12 / 12 preparation steps"),
+                ExportStage::Rendering => Some("12 / 12 sounds generated"),
+                ExportStage::Packaging => Some("12 / 12 files written"),
+                ExportStage::Verifying => Some("12 / 12 checks completed"),
+                ExportStage::Complete | ExportStage::Cancelled | ExportStage::Failed => None,
+            };
+            if let Some(count) = expected_count {
+                assert!(visible.contains(count), "{stage:?}: {visible}");
+            } else {
+                assert!(!visible.contains("12 / 12"));
+            }
+            assert_eq!(
+                visible.contains("sounds generated"),
+                stage == ExportStage::Rendering
+            );
+            assert!(
+                visible.contains("4200 rpm") && visible.contains("70% load"),
+                "{stage:?}: {visible}"
+            );
+            assert!(visible.contains("Elapsed: 1m 05s"));
+            if stage == ExportStage::Rendering && !cancelling {
+                assert!(visible.contains("Sound generation left (estimate): about 20s"));
+            }
+        }
+    }
+
+    #[test]
+    fn output_completion_clears_progress_and_only_success_changes_companion_folder() {
+        let mut app = App::with_ctx(&egui::Context::default(), None);
+        let previous = PathBuf::from("previous successful exports");
+        app.beamng_workspace.last_export_dir = Some(previous.clone());
+        for success in [false, true] {
+            app.beamng_workspace.export_job = Some(ExportJob::default());
+            app.beamng_workspace.pending_export_dir = Some(PathBuf::from("new exports"));
+            let (tx, rx) = mpsc::channel();
+            app.worker = Some(rx);
+            app.poll_output_worker();
+            assert!(app.worker.is_some() && app.beamng_workspace.export_job.is_some());
+            tx.send(if success {
+                Ok("ZIP: vehicle.zip".into())
+            } else {
+                Err("Disk full".into())
+            })
+            .unwrap();
+            app.poll_output_worker();
+            assert!(app.worker.is_none() && app.beamng_workspace.export_job.is_none());
+            assert!(app.beamng_workspace.pending_export_dir.is_none());
+            if success {
+                assert_eq!(app.babm_export_directory(), Some(Path::new("new exports")));
+                assert!(
+                    app.status.contains("Export completed and verified in")
+                        && app.status.contains("vehicle.zip")
+                );
+            } else {
+                assert_eq!(app.babm_export_directory(), Some(previous.as_path()));
+                assert!(
+                    app.status.contains("Export failed after") && app.status.contains("Disk full")
+                );
+            }
+        }
+        // Other output jobs keep their ordinary status and never acquire export controls.
+        let (tx, rx) = mpsc::channel();
+        app.worker = Some(rx);
+        tx.send(Ok("WAV: comparison.wav".into())).unwrap();
+        app.poll_output_worker();
+        assert_eq!(app.status, "WAV: comparison.wav");
+        assert!(app.beamng_workspace.export_job.is_none());
+    }
+
+    #[test]
+    fn cancelled_export_releases_progress_and_does_not_change_the_source_or_companion_folder() {
+        let source = crate::test_support::automation_fixture();
+        let original = std::fs::read(&source).unwrap();
+        let destination = source.with_extension("cancelled-export");
+        let bank = Arc::new(Bank::load(&source, None).unwrap());
+        let job = ExportJob::default();
+        job.cancel();
+        let result = bess::export::package_with_job(
+            &destination,
+            Parameters::default(),
+            Settings::default(),
+            bank,
+            &job,
+        );
+        assert!(result.is_err());
+        assert_eq!(job.snapshot().stage, ExportStage::Cancelled);
+        let mut app = App::with_ctx(&egui::Context::default(), None);
+        app.beamng_workspace.export_job = Some(job);
+        app.beamng_workspace.pending_export_dir = Some(destination.clone());
+        app.beamng_workspace.last_export_dir = Some(PathBuf::from("previous export"));
+        let (tx, rx) = mpsc::channel();
+        app.worker = Some(rx);
+        tx.send(result).unwrap();
+        app.poll_output_worker();
+        assert!(app.worker.is_none() && app.beamng_workspace.export_job.is_none());
+        assert!(app.beamng_workspace.pending_export_dir.is_none());
+        assert_eq!(
+            app.babm_export_directory(),
+            Some(Path::new("previous export"))
+        );
+        assert!(app.status.starts_with("Export cancelled after"));
+        assert!(!app.status.contains("Error:"));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        std::fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn stopped_export_worker_releases_the_busy_state_and_preserves_last_export() {
+        let mut app = App::with_ctx(&egui::Context::default(), None);
+        app.beamng_workspace.last_export_dir = Some(PathBuf::from("verified exports"));
+        app.beamng_workspace.pending_export_dir = Some(PathBuf::from("incomplete exports"));
+        app.beamng_workspace.export_job = Some(ExportJob::default());
+        let (tx, rx) = mpsc::channel();
+        app.worker = Some(rx);
+        drop(tx);
+        app.poll_output_worker();
+        assert!(app.worker.is_none() && app.beamng_workspace.export_job.is_none());
+        assert!(app.beamng_workspace.pending_export_dir.is_none());
+        assert_eq!(
+            app.babm_export_directory(),
+            Some(Path::new("verified exports"))
+        );
+        assert!(app.status.contains("worker stopped unexpectedly"));
+    }
 
     #[test]
     fn companion_uses_last_successful_export_without_changing_default() {

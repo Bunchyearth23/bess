@@ -4,6 +4,8 @@ mod beamng_ui;
 #[cfg(test)]
 mod control_count;
 mod spectrum;
+#[cfg(test)]
+mod test_support;
 mod ui_kit;
 #[cfg(test)]
 mod workshop_tests;
@@ -2845,13 +2847,7 @@ impl eframe::App for App {
             }
             self.importer = None;
         }
-        if let Some(rx) = &self.worker
-            && let Ok(result) = rx.try_recv()
-        {
-            self.finish_beamng_export(&result);
-            self.status = result.unwrap_or_else(|e| format!("Error: {e}"));
-            self.worker = None;
-        }
+        self.poll_output_worker();
         if let Some(rx) = &self.level_worker {
             match rx.try_recv() {
                 Ok(result) => {
@@ -2902,6 +2898,7 @@ impl eframe::App for App {
                     self.show_driving = !self.show_driving;
                 }
             });
+            self.beamng_export_progress(ui);
             ui.add_space(8.);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {

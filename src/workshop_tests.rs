@@ -1,7 +1,5 @@
 //! End-to-end editor state boundaries without opening an audio device.
 use super::*;
-#[path = "test_support.rs"]
-mod test_support;
 
 fn imported_app(ctx: &egui::Context) -> App {
     let bank = Arc::new(Bank::load(&test_support::automation_fixture(), None).unwrap());
