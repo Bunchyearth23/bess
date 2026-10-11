@@ -64,6 +64,15 @@ impl AfterTreatment {
     pub fn wall_temperature_k(&self) -> f64 {
         self.wall_temperature_k
     }
+
+    /// Preparation only: an initial solid-wall temperature, no reaction/flux.
+    pub fn initialize_wall_temperature(&mut self, temperature_k: f64) -> Result<(), ThermoError> {
+        if !(200.0..=1200.).contains(&temperature_k) || self.fuel_kg != 0. || self.oxygen_kg != 0. {
+            return Err(ThermoError::InvalidInput);
+        }
+        self.wall_temperature_k = temperature_k;
+        Ok(())
+    }
     pub fn stored_fuel_kg(&self) -> f64 {
         self.fuel_kg
     }
@@ -294,6 +303,7 @@ pub struct Manifolds {
     /// Turbocharged: collector → turbine nozzle ∥ wastegate → catalyst/muffler
     /// volume → pipe. Zero turbine area keeps the single lumped restriction.
     turbine_area_m2: f64,
+    turbine_network_enabled: bool,
     wastegate_area_m2: f64,
     wastegate: f64,
     active_bank_mask: [bool; 2],
@@ -482,6 +492,7 @@ impl Manifolds {
             exhaust_area_m2,
             exhaust_cd: 0.85 / (1.0_f64 + cat_loss + muffler_loss).sqrt(),
             turbine_area_m2: tuning.turbine_area_m2,
+            turbine_network_enabled: tuning.turbine_area_m2 > 0.,
             wastegate_area_m2: tuning.wastegate_area_m2,
             wastegate: 0.0,
             active_bank_mask: [true, false],
@@ -522,6 +533,65 @@ impl Manifolds {
     }
     pub fn intake(&self) -> Reservoir {
         reservoir(self.intake)
+    }
+
+    /// Preparation before the first engine step. Set all gas volumes to the
+    /// explicit initial temperature at atmospheric pressure, retaining their
+    /// initial composition (including estimated residual products in exhaust).
+    /// Ambient supply remains the existing 300 K boundary.
+    pub fn initialize_temperature(&mut self, temperature_k: f64) -> Result<(), ThermoError> {
+        if !(200.0..=1200.).contains(&temperature_k) {
+            return Err(ThermoError::InvalidInput);
+        }
+        let reinitialize = |g: GasState| {
+            GasState::at_pressure(
+                g.volume_m3(),
+                ATMOSPHERE.pressure_pa,
+                temperature_k,
+                g.mixture(),
+            )
+        };
+        let rescale = |s: &mut Species, old: f64, new: f64| {
+            s.fresh_air_kg *= new / old;
+            s.fuel_kg *= new / old;
+        };
+        let intake = reinitialize(self.intake)?;
+        rescale(
+            &mut self.intake_species,
+            self.intake.mass_kg(),
+            intake.mass_kg(),
+        );
+        self.intake = intake;
+        for i in 0..self.runner_count {
+            let gas = reinitialize(self.runners[i])?;
+            rescale(
+                &mut self.runner_species[i],
+                self.runners[i].mass_kg(),
+                gas.mass_kg(),
+            );
+            self.runners[i] = gas;
+            self.runner_flow_kg_s[i] = 0.;
+        }
+        for bank in 0..2 {
+            let gas = reinitialize(self.exhaust[bank])?;
+            rescale(
+                &mut self.exhaust_species[bank],
+                self.exhaust[bank].mass_kg(),
+                gas.mass_kg(),
+            );
+            self.exhaust[bank] = gas;
+            let gas = reinitialize(self.tailpipe[bank])?;
+            for cell in &mut self.tailpipe_cells[bank] {
+                rescale(cell, self.tailpipe[bank].mass_kg(), gas.mass_kg());
+            }
+            rescale(
+                &mut self.tailpipe_species[bank],
+                self.tailpipe[bank].mass_kg(),
+                gas.mass_kg(),
+            );
+            self.tailpipe[bank] = gas;
+        }
+        Ok(())
     }
     /// Gas properties follow the transported species (same mass and energy).
     fn refresh_mixtures(&mut self) {
@@ -707,6 +777,15 @@ impl Manifolds {
             }),
         }
     }
+    /// Effective mapped turbine nozzle area for the next conservative gas step.
+    pub fn set_turbine_area_m2(&mut self, area_m2: f64) -> Result<(), ThermoError> {
+        if !(0.0..=1.0).contains(&area_m2) {
+            return Err(ThermoError::InvalidInput);
+        }
+        self.turbine_area_m2 = area_m2;
+        Ok(())
+    }
+
     /// Wastegate opening 0–1 for the next step (turbocharged builds only).
     pub fn set_wastegate(&mut self, opening: f64) -> Result<(), ThermoError> {
         if !(0.0..=1.0).contains(&opening) {
@@ -963,7 +1042,7 @@ impl Manifolds {
             }
             let mut input = *exchange;
             // Turbine nozzle Cd 0.9; the aftertreatment loss moves downstream.
-            let (area, cd, tail_cd) = if self.turbine_area_m2 > 0.0 {
+            let (area, cd, tail_cd) = if self.turbine_network_enabled {
                 (
                     (self.turbine_area_m2 + self.wastegate * self.wastegate_area_m2)
                         / active_banks as f64,

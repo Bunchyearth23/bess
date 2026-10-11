@@ -135,6 +135,64 @@ pub struct Sample {
     pub fuel_injected_kg: f64,
 }
 
+/// Initial conditions, not a measured warm-up map. Ambient remains 300 K.
+#[derive(Clone, Copy, Debug)]
+pub struct StartupThermalState {
+    pub gas_temperature_k: f64,
+    pub cylinder_wall_temperature_k: f64,
+    pub coolant_temperature_k: f64,
+    pub aftertreatment_temperature_k: f64,
+}
+impl StartupThermalState {
+    pub const fn uniform(temperature_k: f64) -> Self {
+        Self {
+            gas_temperature_k: temperature_k,
+            cylinder_wall_temperature_k: temperature_k,
+            coolant_temperature_k: temperature_k,
+            aftertreatment_temperature_k: temperature_k,
+        }
+    }
+    fn valid(self) -> bool {
+        (200.0..=1200.).contains(&self.gas_temperature_k)
+            && (200.0..=1200.).contains(&self.cylinder_wall_temperature_k)
+            && (200.0..=600.).contains(&self.coolant_temperature_k)
+            && (200.0..=1200.).contains(&self.aftertreatment_temperature_k)
+    }
+}
+
+/// Latest physical frame; rates integrated across its gas substeps. These are
+/// cylinder control-volume accounts, not the entire intake/exhaust/turbo plant.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransientLedger {
+    pub injected_fuel_kg: f64,
+    pub fuel_burned_kg: f64,
+    pub fuel_boundary_net_kg: f64,
+    pub evaporated_fuel_kg: f64,
+    pub latent_heat_j: f64,
+    pub combined_energy_input_j: f64,
+    pub gas_residual_max_j: f64,
+    pub transfer_mass_residual_max_kg: f64,
+    pub transfer_energy_residual_max_j: f64,
+    pub gas_correction_abs_j: f64,
+    pub numerical_energy_added_j: f64,
+    pub wall_correction_abs_j: f64,
+    pub gas_correction_after_injection_abs_j: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransientDiagnostics {
+    pub ledger: TransientLedger,
+    pub fuel_vapor_kg: f64,
+    pub film_kg: f64,
+    pub droplets_kg: f64,
+    pub cylinder_stored_energy_j: f64,
+    pub cylinder_temperature_min_k: f64,
+    pub cylinder_temperature_max_k: f64,
+    pub cylinder_wall_mean_k: f64,
+    pub crank_angle_rad: f64,
+    pub starter_nm: f64,
+}
+
 /// Offline attribution of the mechanical observation at fixed sound settings.
 /// Construct before the first engine sample, then feed every excitation,
 /// including warm-up. This owns only diagnostic filters; it never alters Engine.
@@ -205,12 +263,17 @@ pub struct Engine {
     /// Intake acoustic pulsations and residual airflow/compressor observation,
     /// before optional Tone processing; diagnostic, not a second rendering path.
     intake_sources: [f32; 2],
+    intake_jet_m_s: f64,
+    last_turbo_step: Option<super::induction::InductionStep>,
     mechanics: Modes,
     tone: Tone,
     previous_mechanics: Option<Modes>,
     previous_tone: Option<Tone>,
     sound_fade: f32,
     last: Sample,
+    has_stepped: bool,
+    transient_ledger: Option<TransientLedger>,
+    has_injected: [bool; 12],
 }
 
 impl Engine {
@@ -275,8 +338,16 @@ impl Engine {
         let seed = scratch.life().seed;
         let cylinders = (0..n)
             .map(|i| {
-                CycleCylinder::new(config, phases[i], seed.wrapping_add(i as u64 * 7919))
-                    .map_err(|e| format!("Cylinder {}: {e:?}", i + 1))
+                let mut cylinder =
+                    CycleCylinder::new(config, phases[i], seed.wrapping_add(i as u64 * 7919))
+                        .map_err(|e| format!("Cylinder {}: {e:?}", i + 1))?;
+                cylinder
+                    .set_fuel_transient(scratch.experimental.fuel_transients)
+                    .map_err(|e| format!("Cylinder {} fuel: {e:?}", i + 1))?;
+                cylinder
+                    .set_predictive_combustion(scratch.experimental.predictive_combustion)
+                    .map_err(|e| format!("Cylinder {} combustion: {e:?}", i + 1))?;
+                Ok::<_, String>(cylinder)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let banks = std::array::from_fn(|i| scratch.design.banks[i] as usize);
@@ -289,13 +360,16 @@ impl Engine {
             .set_active_bank_mask(bank_counts.map(|count| count > 0))
             .map_err(|e| format!("Manifolds: {e:?}"))?;
         let rpm = f64::from(scratch.idle_rpm);
-        let crank = Crank::new(
+        let mut crank = Crank::new(
             f64::from(scratch.inertia),
             config.stroke_m,
             displacement,
             rpm,
         )
         .map_err(|e| e.to_string())?;
+        crank
+            .set_torsion(scratch.experimental.torsion)
+            .map_err(|e| e.to_string())?;
         let controller = Controller::new(rpm, f64::from(scratch.redline_rpm), scratch.build.fuel)
             .map_err(|e| e.to_string())?;
         let mut acoustic = Acoustic::new(rate, &scratch.design, &scratch.build, &scratch.sound);
@@ -311,7 +385,7 @@ impl Engine {
             &scratch.sound,
         );
         let tone = Tone::new(rate, &scratch.sound);
-        let mechanics = Modes::new(
+        let mut mechanics = Modes::new(
             rate as f32,
             scratch.sound.mechanical_pitch_hz,
             scratch.sound.mechanical_resonance,
@@ -319,11 +393,15 @@ impl Engine {
             scratch.build.bore_mm,
             seed,
         );
-        let induction = if scratch.build.aspiration == Aspiration::Natural {
+        mechanics.set_response(scratch.experimental.mechanical_transfer.as_ref(), rate)?;
+        let mut induction = if scratch.build.aspiration == Aspiration::Natural {
             None
         } else {
             Some(Induction::new(&scratch.build, &tuning, displacement)?)
         };
+        if let Some(induction) = &mut induction {
+            induction.set_model(scratch.experimental.turbo_model)?;
+        }
         let aftertreatment = std::array::from_fn(|_| AfterTreatment::new(scratch.build.catalyst));
         let substeps = (96000. / f64::from(rate)).ceil().max(1.) as usize;
         let (slap, knock) = mechanical_events(&scratch, &config, rate, substeps, seed);
@@ -374,6 +452,8 @@ impl Engine {
             knock,
             excitation: [0.; 3],
             intake_sources: [0.; 2],
+            intake_jet_m_s: 0.,
+            last_turbo_step: None,
             mechanics,
             tone,
             previous_mechanics: None,
@@ -383,6 +463,9 @@ impl Engine {
                 rpm,
                 ..Default::default()
             },
+            has_stepped: false,
+            transient_ledger: None,
+            has_injected: [false; 12],
         })
     }
     pub fn inertia(&self) -> f64 {
@@ -393,6 +476,87 @@ impl Engine {
     }
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    pub fn initialize_stopped(&mut self, temperature_k: f64) -> Result<(), String> {
+        self.initialize_stopped_with_thermal(StartupThermalState::uniform(temperature_k))
+    }
+
+    /// Explicit preparation only, before the FIRST next call. Initializes
+    /// actual gas/metal inventories and crank at zero. Re-start later with the
+    /// starter command, retaining fuel and heat; do not call reset for that.
+    pub fn initialize_stopped_with_thermal(
+        &mut self,
+        thermal: StartupThermalState,
+    ) -> Result<(), String> {
+        if self.has_stepped || self.transient_ledger.is_some() || self.failed || !thermal.valid() {
+            return Err(
+                "Stopped initialization requires valid thermal state before the first step".into(),
+            );
+        }
+        self.manifolds
+            .initialize_temperature(thermal.gas_temperature_k)
+            .map_err(|e| format!("Initial manifolds: {e:?}"))?;
+        for (i, cylinder) in self.cylinders.iter_mut().enumerate() {
+            cylinder
+                .initialize_at_rest(
+                    0.,
+                    self.manifolds.runner(i),
+                    thermal.cylinder_wall_temperature_k,
+                    thermal.coolant_temperature_k,
+                )
+                .map_err(|e| format!("Initial cylinder {i}: {e:?}"))?;
+        }
+        for treatment in &mut self.aftertreatment {
+            treatment
+                .initialize_wall_temperature(thermal.aftertreatment_temperature_k)
+                .map_err(|e| format!("Initial treatment: {e:?}"))?;
+        }
+        if let Some(induction) = &mut self.induction {
+            induction
+                .initialize_temperature(thermal.gas_temperature_k)
+                .map_err(|e| format!("Initial induction: {e:?}"))?;
+        }
+        self.crank = Crank::new(
+            self.inertia(),
+            self.config.stroke_m,
+            self.config.displacement_m3() * self.cylinders.len() as f64,
+            0.,
+        )
+        .map_err(|e| e.to_string())?;
+        self.crank
+            .set_torsion(self.scratch.experimental.torsion)
+            .map_err(|e| e.to_string())?;
+        self.angle = 0.;
+        self.rpm = 0.;
+        self.was_imposed = false;
+        self.last = Sample::default();
+        self.transient_ledger = Some(TransientLedger::default());
+        self.has_injected = [false; 12];
+        Ok(())
+    }
+
+    /// Scan inventory outside the hot path; never allocates. None means the
+    /// observer was not explicitly enabled by stopped initialization.
+    pub fn transient_diagnostics(&self) -> Option<TransientDiagnostics> {
+        let mut out = TransientDiagnostics {
+            ledger: self.transient_ledger?,
+            cylinder_temperature_min_k: f64::INFINITY,
+            ..Default::default()
+        };
+        for cylinder in &self.cylinders {
+            out.fuel_vapor_kg += cylinder.fuel_vapor_kg();
+            out.film_kg += cylinder.fuel_film_kg();
+            out.droplets_kg += cylinder.fuel_droplets_kg();
+            out.cylinder_stored_energy_j += cylinder.stored_energy_j();
+            let temperature = cylinder.gas_state().map_or(0., |g| g.temperature_k());
+            out.cylinder_temperature_min_k = out.cylinder_temperature_min_k.min(temperature);
+            out.cylinder_temperature_max_k = out.cylinder_temperature_max_k.max(temperature);
+            out.cylinder_wall_mean_k += cylinder.wall_temperature_k() / self.cylinders.len() as f64;
+        }
+        out.crank_angle_rad = self.angle;
+        out.starter_nm = self.crank.state().starter_nm;
+        Some(out)
     }
     /// Last mechanical excitations (valve/DI contact, combustion, piston slap)
     /// before the modal bank; a calibration diagnostic.
@@ -407,6 +571,17 @@ impl Engine {
     /// Crank friction torque at the current speed and cylinder peak pressure.
     pub fn friction_nm(&self) -> f64 {
         self.crank.friction_nm(self.rpm)
+    }
+
+    /// Mechanical qualification telemetry, independent of audio observation.
+    pub fn torsion_ledger(&self) -> super::crank::TorsionLedger {
+        self.crank.torsion_ledger()
+    }
+
+    /// Last physical gas substep, including its turbo energy increments.
+    /// This is not an accumulated audio-frame work ledger.
+    pub fn turbo_step(&self) -> Option<super::induction::InductionStep> {
+        self.last_turbo_step
     }
 
     /// A source-balance change must not restart unrelated filters or a tone
@@ -506,6 +681,9 @@ impl Engine {
         self.rpm = f64::from(self.scratch.idle_rpm);
         self.crank = Crank::new(self.inertia(), self.config.stroke_m, displacement, self.rpm)
             .expect("validated crank");
+        self.crank
+            .set_torsion(self.scratch.experimental.torsion)
+            .expect("validated torsion");
         let tuning = self.scratch.tuning.resolve(&self.scratch.build, n as u32);
         self.manifolds = Manifolds::new(&self.scratch.build, &tuning, n as u32, displacement)
             .expect("validated manifolds");
@@ -517,6 +695,11 @@ impl Engine {
                 Induction::new(&self.scratch.build, &tuning, displacement)
                     .expect("validated induction"),
             );
+            self.induction
+                .as_mut()
+                .expect("induction rebuilt")
+                .set_model(self.scratch.experimental.turbo_model)
+                .expect("validated turbo model");
         }
         self.aftertreatment =
             std::array::from_fn(|_| AfterTreatment::new(self.scratch.build.catalyst));
@@ -543,6 +726,12 @@ impl Engine {
         self.combustion.reset();
         self.excitation = [0.; 3];
         self.intake_sources = [0.; 2];
+        self.intake_jet_m_s = 0.;
+        self.last_turbo_step = None;
+        if self.transient_ledger.is_some() {
+            self.transient_ledger = Some(TransientLedger::default());
+        }
+        self.has_injected = [false; 12];
         (self.slap, self.knock) = mechanical_events(
             &self.scratch,
             &self.config,
@@ -553,6 +742,10 @@ impl Engine {
     }
 
     pub fn next(&mut self, commands: Commands) -> Sample {
+        self.has_stepped = true;
+        if self.transient_ledger.is_some() {
+            self.transient_ledger = Some(TransientLedger::default());
+        }
         if self.failed {
             return Sample::default();
         }
@@ -587,6 +780,9 @@ impl Engine {
             )
             .map_err(|_| ())?;
             self.crank.set_angle_unwrapped(self.angle).map_err(|_| ())?;
+            self.crank
+                .set_torsion(self.scratch.experimental.torsion)
+                .map_err(|_| ())?;
         }
         self.was_imposed = commands.imposed_rpm.is_some();
         self.crank.set_accessories(commands.ac, commands.steering);
@@ -611,6 +807,7 @@ impl Engine {
         // X-017 opt-in: read the arriving primary waves first, so each valve
         // flow is solved jointly with its port (`wave_junction`).
         let coupled = self.scratch.experimental.wave_coupling;
+        let intake_coupled = self.scratch.experimental.intake_wave_coupling;
         if coupled {
             let exhaust = [0, 1].map(|b| self.manifolds.exhaust_bank(b));
             // Pipe γ and R of each collector's own gas (X-026 composition).
@@ -629,7 +826,7 @@ impl Engine {
                 None,
             );
         }
-        for _ in 0..substeps {
+        for substep in 0..substeps {
             self.rpm = commands.imposed_rpm.unwrap_or(self.crank.state().rpm);
             let mut controller = self
                 .controller
@@ -742,6 +939,24 @@ impl Engine {
             if !shared.shared_valid() {
                 return Err(());
             }
+            if intake_coupled && substep == 0 {
+                let runner_ports: [_; 12] =
+                    std::array::from_fn(|i| self.manifolds.runner_port(i.min(n - 1)));
+                let reservoirs = runner_ports.map(|p| p.0);
+                let gas = runner_ports.map(|p| {
+                    let mixture = super::thermo::Mixture::from_fractions(
+                        p.1.fresh_air_fraction,
+                        p.1.fuel_fraction,
+                    );
+                    (mixture.gamma(p.0.temperature_k), mixture.gas_constant())
+                });
+                let aperture = self
+                    .manifolds
+                    .throttle_area_m2(controller.throttle, controller.bypass)
+                    / self.manifolds.throttle_area_m2(1., 0.);
+                self.intake_acoustic
+                    .begin(&reservoirs, &gas, aperture, self.intake_jet_m_s);
+            }
             for (i, cylinder_flow) in flow.iter_mut().enumerate().take(n) {
                 let bank = self.banks[i];
                 // The conservative 0D system supplies the valve mass flow.
@@ -764,6 +979,9 @@ impl Engine {
                 let port = coupled.then(|| self.acoustic.port(i, boundary.pressure_pa));
                 self.cylinders[i].set_exhaust_port(port);
                 let (intake, intake_composition, intake_budget) = self.manifolds.runner_port(i);
+                self.cylinders[i].set_intake_port(
+                    intake_coupled.then(|| self.intake_acoustic.port(i, intake.pressure_pa)),
+                );
                 let (_, exhaust_composition, exhaust_budget) = exhaust_ports[bank];
                 let output = self.cylinders[i]
                     .step_shared_checked(CycleInput {
@@ -804,6 +1022,38 @@ impl Engine {
                 torque += output.gas_torque_nm;
                 heat += output.heat_j;
                 injected += output.injected_fuel_kg;
+                if let Some(ledger) = &mut self.transient_ledger {
+                    self.has_injected[i] |= output.injected_fuel_kg > 0.;
+                    ledger.injected_fuel_kg += output.injected_fuel_kg;
+                    ledger.fuel_burned_kg += output.fuel_burned_kg;
+                    ledger.fuel_boundary_net_kg += output.intake_fuel_kg - output.exhaust_fuel_kg;
+                    ledger.evaporated_fuel_kg += output.gas_fuel_added_kg;
+                    ledger.latent_heat_j += output.fuel_transfer.latent_heat_j;
+                    ledger.combined_energy_input_j += output.heat_j + output.intake_enthalpy_j
+                        - output.exhaust_enthalpy_j
+                        + output.injected_fuel_enthalpy_j
+                        - output.ledger.boundary_work_j
+                        - output.coolant_heat_j
+                        + output.ledger.numerical_correction_j
+                        + output.wall_numerical_correction_j;
+                    ledger.gas_residual_max_j = ledger
+                        .gas_residual_max_j
+                        .max(output.ledger.residual_j().abs());
+                    ledger.transfer_mass_residual_max_kg = ledger
+                        .transfer_mass_residual_max_kg
+                        .max(output.fuel_transfer.mass_residual_kg().abs());
+                    ledger.transfer_energy_residual_max_j = ledger
+                        .transfer_energy_residual_max_j
+                        .max(output.fuel_transfer.energy_residual_j().abs());
+                    ledger.gas_correction_abs_j += output.ledger.numerical_correction_j.abs();
+                    ledger.numerical_energy_added_j +=
+                        output.ledger.numerical_correction_j + output.wall_numerical_correction_j;
+                    ledger.wall_correction_abs_j += output.wall_numerical_correction_j.abs();
+                    if self.has_injected[i] {
+                        ledger.gas_correction_after_injection_abs_j +=
+                            output.ledger.numerical_correction_j.abs();
+                    }
+                }
                 correction += output.ledger.numerical_correction_j.abs()
                     + output.wall_numerical_correction_j.abs();
                 peak = peak.max(output.pressure_pa);
@@ -864,6 +1114,35 @@ impl Engine {
                 if self.scratch.build.fuel == Fuel::DirectInjection && output.injected_fuel_kg > 0.
                 {
                     impact += (output.injected_fuel_kg * 250.).min(0.05);
+                }
+            }
+            if let Some(induction) = &mut self.induction {
+                // Weighted collector state, including bank-two-only designs.
+                let total = self.bank_counts.iter().sum::<usize>().max(1) as f64;
+                let weights = self.bank_counts.map(|n| n as f64 / total);
+                let compositions = [0, 1].map(|b| self.manifolds.exhaust_composition(b));
+                if self.scratch.experimental.turbo_model.is_some() {
+                    induction
+                        .set_turbine_composition(super::manifolds::Composition {
+                            fresh_air_fraction: (0..2)
+                                .map(|b| compositions[b].fresh_air_fraction * weights[b])
+                                .sum(),
+                            fuel_fraction: (0..2)
+                                .map(|b| compositions[b].fuel_fraction * weights[b])
+                                .sum(),
+                        })
+                        .map_err(|_| ())?;
+                }
+                let turbine_inlet = super::cylinder::Reservoir {
+                    pressure_pa: (0..2)
+                        .map(|b| exhaust[b].pressure_pa * self.bank_counts[b] as f64 / total)
+                        .sum(),
+                    temperature_k: (0..2)
+                        .map(|b| exhaust[b].temperature_k * self.bank_counts[b] as f64 / total)
+                        .sum(),
+                };
+                if let Some(area) = induction.mapped_turbine_area_m2(turbine_inlet) {
+                    self.manifolds.set_turbine_area_m2(area).map_err(|_| ())?;
                 }
             }
             let manifold = self
@@ -927,6 +1206,24 @@ impl Engine {
                 } else {
                     exhaust[0]
                 };
+                if self.scratch.experimental.turbo_model.is_some() {
+                    let weights = if total > 0. {
+                        manifold.exhaust_mass_flow_kg_s.map(|f| f.max(0.) / total)
+                    } else {
+                        [1., 0.]
+                    };
+                    let compositions = [0, 1].map(|b| exhaust_ports[b].1);
+                    induction
+                        .set_turbine_composition(super::manifolds::Composition {
+                            fresh_air_fraction: (0..2)
+                                .map(|b| compositions[b].fresh_air_fraction * weights[b])
+                                .sum(),
+                            fuel_fraction: (0..2)
+                                .map(|b| compositions[b].fuel_fraction * weights[b])
+                                .sum(),
+                        })
+                        .map_err(|_| ())?;
+                }
                 let outlet = if total > 0. {
                     (0..2)
                         .map(|b| {
@@ -949,6 +1246,7 @@ impl Engine {
                         (manifold.supply_exchange, manifold.supply_species),
                     )
                     .map_err(|_| ())?;
+                self.last_turbo_step = Some(turbo);
                 correction += turbo.charge_ledger.numerical_correction_j.abs();
                 self.manifolds
                     .set_wastegate(induction.wastegate())
@@ -1050,11 +1348,19 @@ impl Engine {
             compressor_kg_s: compressor_flow as f32,
         };
         // The same butterfly aperture and jet drive the throttle junction and hiss.
-        let pulse = self.intake_acoustic.next(
-            &intake_flows,
-            f64::from(air.gap_m2 / air.bore_m2),
-            f64::from(air.jet_m_s()),
-        );
+        self.intake_jet_m_s = f64::from(air.jet_m_s());
+        let pulse = if intake_coupled {
+            self.intake_acoustic.finish(&intake_flows)
+        } else {
+            self.intake_acoustic.next(
+                &intake_flows,
+                f64::from(air.gap_m2 / air.bore_m2),
+                f64::from(air.jet_m_s()),
+            )
+        };
+        if self.intake_acoustic.failed() {
+            return Err(());
+        }
         // Preserve the intake PRNG sequence, including its reserved contact
         // draw. Contacts now have their own event source and independent RNG.
         let (intake_audio, _) = self.radiation.next(pulse, 0., air);
@@ -1199,6 +1505,104 @@ fn mechanical_events(
 fn crossed(from: f64, to: f64, event: f64) -> bool {
     use super::gas::floor_fast;
     floor_fast((from - event) / (2. * TAU)) < floor_fast((to - event) / (2. * TAU))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    fn on_large_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn stopped_initialization_is_thermal_and_repeated_call_is_atomic() {
+        on_large_stack(|| {
+            let mut engine = Engine::new(&Scratch::default(), 48_000).unwrap();
+            assert!(engine.initialize_stopped(f64::NAN).is_err());
+            assert!(engine.transient_diagnostics().is_none());
+            engine.initialize_stopped(280.).unwrap();
+            let initial = engine.transient_diagnostics().unwrap();
+            let mass = engine.manifolds.total_mass_kg();
+            let energy = engine.manifolds.total_internal_energy_j();
+            assert!((initial.cylinder_temperature_min_k - 280.).abs() < 1e-10);
+            assert_eq!(initial.cylinder_wall_mean_k, 280.);
+            assert_eq!(engine.rpm, 0.);
+            assert!((engine.manifolds.intake().temperature_k - 280.).abs() < 1e-10);
+            assert!(
+                engine
+                    .aftertreatment
+                    .iter()
+                    .all(|t| t.wall_temperature_k() == 280.)
+            );
+            assert!(engine.initialize_stopped(450.).is_err());
+            let after = engine.transient_diagnostics().unwrap();
+            assert_eq!(
+                initial.cylinder_stored_energy_j,
+                after.cylinder_stored_energy_j
+            );
+            assert_eq!(
+                initial.cylinder_temperature_min_k,
+                after.cylinder_temperature_min_k
+            );
+            assert_eq!(mass, engine.manifolds.total_mass_kg());
+            assert_eq!(energy, engine.manifolds.total_internal_energy_j());
+            engine.next(Commands {
+                imposed_rpm: None,
+                throttle: 0.,
+                ..Default::default()
+            });
+            assert!(engine.initialize_stopped(280.).is_err());
+            engine.reset();
+            assert!(engine.initialize_stopped(280.).is_err());
+            let mut already_running = Engine::new(&Scratch::default(), 48_000).unwrap();
+            already_running.next(Commands::default());
+            assert!(already_running.initialize_stopped(280.).is_err());
+            already_running.reset();
+            assert!(already_running.initialize_stopped(280.).is_err());
+        });
+    }
+
+    #[test]
+    fn physical_starter_preserves_cylinder_fuel_and_energy_ledgers() {
+        on_large_stack(|| {
+            let mut scratch = Scratch::default();
+            scratch.experimental.fuel_transients =
+                Some(super::super::fuel_transient::FuelTransientConfig::default());
+            scratch.experimental.predictive_combustion =
+                Some(super::super::combustion_model::PredictiveCombustionConfig::default());
+            let mut engine = Engine::new(&scratch, 48_000).unwrap();
+            engine.initialize_stopped(280.).unwrap();
+            let initial = engine.transient_diagnostics().unwrap();
+            let (mut fuel, mut energy, mut correction) = (0., initial.cylinder_stored_energy_j, 0.);
+            for _ in 0..24_000 {
+                let sample = engine.next(Commands {
+                    imposed_rpm: None,
+                    starter: true,
+                    throttle: 0.2,
+                    ..Default::default()
+                });
+                assert!(!engine.failed());
+                let d = engine.transient_diagnostics().unwrap();
+                fuel += d.ledger.injected_fuel_kg + d.ledger.fuel_boundary_net_kg
+                    - d.ledger.fuel_burned_kg;
+                energy += d.ledger.combined_energy_input_j;
+                correction += d.ledger.gas_correction_after_injection_abs_j;
+                assert!((fuel - d.fuel_vapor_kg - d.film_kg - d.droplets_kg).abs() < 1e-12);
+                assert!((energy - d.cylinder_stored_energy_j).abs() < 1e-5);
+                assert!(d.ledger.gas_residual_max_j < 1e-7);
+                assert!(sample.rpm.is_finite());
+            }
+            assert!(engine.rpm > 0.);
+            assert!(fuel > 0.);
+            assert!(correction < 1e-6, "active gas correction {correction} J");
+        });
+    }
 }
 
 #[cfg(test)]

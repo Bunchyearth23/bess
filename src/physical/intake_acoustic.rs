@@ -1,6 +1,7 @@
 //! Per-cylinder intake runners, plenum and airbox radiated from the open
 //! snorkel, or from each trumpet with individual throttles. Linear acoustic
 //! perturbations ride on the 0D mean state. This is not 1D CFD.
+use super::{cylinder::Reservoir, wave_junction::WavePort};
 use crate::{
     engine_build::{EngineBuild, ResolvedTuning, Throttle},
     scratch::SoundTuning,
@@ -48,6 +49,17 @@ impl Tube {
         self.forward.write(near.clamp(-200000., 200000.) as f32);
         self.backward.write(far.clamp(-200000., 200000.) as f32);
     }
+    fn write_checked(&mut self, near: f64, far: f64) -> bool {
+        if [near, far]
+            .iter()
+            .any(|v| !v.is_finite() || v.abs() > 200000.)
+        {
+            return false;
+        }
+        self.forward.write(near as f32);
+        self.backward.write(far as f32);
+        true
+    }
 }
 
 /// Line read delay: the loss low-pass group delay, (1 - g) / g samples, is
@@ -90,6 +102,15 @@ pub struct IntakeAcoustic {
     open_step: f64,
     length_slew: f64,
     previous_volume_flow: f64,
+    arrivals: [[f64; 2]; 12],
+    far: [f64; 12],
+    volume_flow: f64,
+    coupled: bool,
+    speeds: [f64; 12],
+    gamma: [f64; 12],
+    reference_pa: [f64; 12],
+    runner_admittance: [f64; 12],
+    failed: bool,
 }
 
 /// Throttle as a series resistance R on the duct (impedance Z = rho c / A):
@@ -168,6 +189,15 @@ impl IntakeAcoustic {
             open_step: 1. - (-1. / (0.001 * rate)).exp(),
             length_slew: 1. - (-1. / (0.05 * rate)).exp(),
             previous_volume_flow: 0.,
+            arrivals: [[0.; 2]; 12],
+            far: [0.; 12],
+            volume_flow: 0.,
+            coupled: false,
+            speeds: [C; 12],
+            gamma: [1.4; 12],
+            reference_pa: [f64::NAN; 12],
+            runner_admittance: [runner_area; 12],
+            failed: false,
         }
     }
 
@@ -179,12 +209,75 @@ impl IntakeAcoustic {
     /// Valve mass flows (kg/s, into the cylinder) to radiated pressure.
     /// `open`: throttle aperture / bore area; `jet_m_s`: throttle jet speed.
     pub fn next(&mut self, flow_kg_s: &[f64; 12], open: f64, jet_m_s: f64) -> f32 {
+        self.coupled = false;
+        self.speeds = [C; 12];
+        self.prepare(open, jet_m_s);
+        self.finish(flow_kg_s)
+    }
+
+    /// Read every arriving wave before solving the intake valves. Mean mass,
+    /// species and enthalpy remain owned by the conservative 0D runners.
+    /// Gas constants are obtained from each runner's actual donor mixture.
+    pub fn begin(
+        &mut self,
+        reservoirs: &[Reservoir; 12],
+        gas: &[(f64, f64); 12],
+        open: f64,
+        jet_m_s: f64,
+    ) {
+        self.coupled = true;
+        for i in 0..self.runners.len() {
+            self.gamma[i] = gas[i].0;
+            self.speeds[i] = (gas[i].0 * gas[i].1 * reservoirs[i].temperature_k).sqrt();
+            let pressure = reservoirs[i].pressure_pa;
+            let density = pressure / (gas[i].1 * reservoirs[i].temperature_k);
+            // Express physical volume admittances in the room-air impedance
+            // used by the duct/airbox. Areas alone only apply to identical gas.
+            let room_impedance = 101325. / (287. * 305.) * C;
+            self.runner_admittance[i] =
+                self.runners[i].tube.area * room_impedance / (density * self.speeds[i]);
+            self.reference_pa[i] = if self.reference_pa[i].is_nan() {
+                pressure
+            } else {
+                self.pole * self.reference_pa[i] + (1. - self.pole) * pressure
+            };
+        }
+        self.prepare(open, jet_m_s);
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Implicit characteristic/orifice boundary. Positive flow enters the
+    /// cylinder, hence its impedance opposes suction. The HP memory exactly
+    /// matches the launch in finish; closed valves reflect without a source.
+    pub fn port(&self, cylinder: usize, mean_pa: f64) -> WavePort {
+        let r = &self.runners[cylinder];
+        let z = self.speeds[cylinder] / r.tube.area;
+        WavePort {
+            mean_pa,
+            wave_pa: 2. * self.arrivals[cylinder][1]
+                + z * (r.previous_flow - self.pole * r.ac_flow),
+            reference_pa: self.reference_pa[cylinder],
+            gamma: self.gamma[cylinder],
+            impedance: z,
+            guess_inflow_kg_s: r.previous_flow,
+        }
+    }
+
+    fn prepare(&mut self, open: f64, jet_m_s: f64) {
         let throttle = throttle_transmission(open, jet_m_s);
         self.length_m += self.length_slew * (self.target_length_m - self.length_m);
-        let delay = line_delay(self.length_m * self.rate / C, self.filter);
-        let runner_loss = loss(self.length_m);
         let mut arrivals = [[0.; 2]; 12];
-        for (arrival, r) in arrivals.iter_mut().zip(&mut self.runners) {
+        for (i, (arrival, r)) in arrivals.iter_mut().zip(&mut self.runners).enumerate() {
+            let speed = self.speeds[i];
+            let delay = line_delay(self.length_m * self.rate / speed, self.filter);
+            let runner_loss = if self.coupled {
+                0.001_f64.powf((self.length_m / speed) / 0.12)
+            } else {
+                loss(self.length_m)
+            };
             *arrival = r.tube.read(delay, self.filter, runner_loss);
         }
         let mut far = [0.; 12];
@@ -202,9 +295,14 @@ impl IntakeAcoustic {
             let throttle_area = throttle * a.duct.area;
             let mut weighted = throttle_area * duct[1];
             let mut area = throttle_area;
-            for (arrival, r) in arrivals.iter().zip(&self.runners) {
-                weighted += r.tube.area * arrival[0];
-                area += r.tube.area;
+            for (i, (arrival, r)) in arrivals.iter().zip(&self.runners).enumerate() {
+                let y = if self.coupled {
+                    self.runner_admittance[i]
+                } else {
+                    r.tube.area
+                };
+                weighted += y * arrival[0];
+                area += y;
             }
             a.pressure[0] =
                 (a.compliance[0] * a.pressure[0] + 2. * weighted) / (a.compliance[0] + area);
@@ -213,11 +311,17 @@ impl IntakeAcoustic {
                 / (a.compliance[1] + a.duct.area + a.snorkel.area);
             a.mouth += a.mouth_filter * (snorkel[0] - a.mouth);
             // Duct end behind the resistor: k (p - a) + (1 - k) a; k = 0 is rigid.
-            a.duct.write(
-                throttle * (a.pressure[0] - duct[1]) + (1. - throttle) * duct[1],
-                a.pressure[1] - duct[0],
-            );
-            a.snorkel.write(a.pressure[1] - snorkel[1], -a.mouth);
+            let near = throttle * (a.pressure[0] - duct[1]) + (1. - throttle) * duct[1];
+            let duct_far = a.pressure[1] - duct[0];
+            if self.coupled {
+                self.failed |= !a.duct.write_checked(near, duct_far);
+                self.failed |= !a
+                    .snorkel
+                    .write_checked(a.pressure[1] - snorkel[1], -a.mouth);
+            } else {
+                a.duct.write(near, duct_far);
+                a.snorkel.write(a.pressure[1] - snorkel[1], -a.mouth);
+            }
             volume_flow = a.snorkel.area * (snorkel[0] + a.mouth);
             for (f, arrival) in far.iter_mut().zip(&arrivals) {
                 *f = a.pressure[0] - arrival[0];
@@ -230,6 +334,20 @@ impl IntakeAcoustic {
                 volume_flow += throttle * r.tube.area * (arrival[0] + r.mouth);
             }
         }
+        self.arrivals = arrivals;
+        self.far = far;
+        self.volume_flow = volume_flow;
+    }
+
+    /// Launch once using the valve flows which were solved against port().
+    pub fn finish(&mut self, flow_kg_s: &[f64; 12]) -> f32 {
+        let outgoing: [f64; 12] = std::array::from_fn(|i| {
+            if self.coupled && i < self.runners.len() {
+                self.port(i, 0.).wave_sum(flow_kg_s[i]) - self.arrivals[i][1]
+            } else {
+                0.
+            }
+        });
         for (i, r) in self.runners.iter_mut().enumerate() {
             // Remove the slowly varying mean already represented by 0D mass.
             r.ac_flow = flow_kg_s[i] - r.previous_flow + self.pole * r.ac_flow;
@@ -240,14 +358,18 @@ impl IntakeAcoustic {
             // Flow source Q = -mdot/rho in parallel with the valve impedance:
             // p+ = R p- + Z Q (1 + R) / 2, Z Q = -c mdot / A. Closed: rigid.
             let source = -C / r.tube.area * r.ac_flow;
-            r.tube.write(
-                reflection * arrivals[i][1] + source * 0.5 * (1. + reflection),
-                far[i],
-            );
+            if self.coupled {
+                self.failed |= !r.tube.write_checked(outgoing[i], self.far[i]);
+            } else {
+                r.tube.write(
+                    reflection * self.arrivals[i][1] + source * 0.5 * (1. + reflection),
+                    self.far[i],
+                );
+            }
         }
         // Monopole at 1 m: p = rho dQ/dt / (4 pi), Q = A (p+ - p-) / (rho c).
-        let pressure = (volume_flow - self.previous_volume_flow) * self.rate / (4. * PI * C);
-        self.previous_volume_flow = volume_flow;
+        let pressure = (self.volume_flow - self.previous_volume_flow) * self.rate / (4. * PI * C);
+        self.previous_volume_flow = self.volume_flow;
         (pressure * PA_TO_SAMPLE) as f32
     }
 }
@@ -255,6 +377,45 @@ impl IntakeAcoustic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joint_intake_impedance_opposes_flow_and_unforced_network_decays() {
+        for rate in [48000, 96000] {
+            let mut n = network(rate, Throttle::Single, 0.38);
+            let reservoirs = [Reservoir {
+                pressure_pa: 85000.,
+                temperature_k: 310.,
+            }; 12];
+            let gas = [(1.4, 287.); 12];
+            n.begin(&reservoirs, &gas, 1., 0.);
+            let p = n.port(0, 85000.);
+            assert!(p.port_pressure(0.005) < p.port_pressure(0.));
+            assert!(p.port_pressure(-0.005) > p.port_pressure(0.));
+            let mut early = 0.;
+            let mut late = 0.;
+            for frame in 0..rate / 2 {
+                if frame > 0 {
+                    n.begin(&reservoirs, &gas, 1., 0.);
+                }
+                let mut flow = [0.; 12];
+                if frame == 0 {
+                    flow[0] = 0.005;
+                }
+                let sample = f64::from(n.finish(&flow));
+                assert!(sample.is_finite() && !n.failed());
+                if frame < rate / 10 {
+                    early += sample * sample;
+                }
+                if frame >= rate * 2 / 5 {
+                    late += sample * sample;
+                }
+            }
+            assert!(
+                early > 0. && late < early * 1e-3,
+                "{rate}: early {early}, late {late}"
+            );
+        }
+    }
 
     fn network(rate: u32, throttle: Throttle, length: f32) -> IntakeAcoustic {
         let build = EngineBuild {

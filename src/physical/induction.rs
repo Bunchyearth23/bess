@@ -21,6 +21,10 @@ use crate::engine_build::{Aspiration, BlowOff, EngineBuild, ResolvedTuning};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InductionStep {
+    /// Boundary-hold means a map was queried outside its supplied domain.
+    pub map_outside_domain: bool,
+    pub mapped_turbine_capacity_kg_s: f64,
+    pub charge_wall_heat_j: f64,
     pub turbine_energy_j: f64,
     pub compressor_energy_j: f64,
     pub bearing_loss_j: f64,
@@ -47,6 +51,9 @@ pub struct InductionStep {
 }
 #[derive(Clone)]
 pub struct Induction {
+    turbine_mixture: Mixture,
+    model: Option<super::turbo_map::TurboModel>,
+    bov_opening: f64,
     charge: GasState,
     species: Species,
     shaft_energy_j: f64,
@@ -91,6 +98,9 @@ impl Induction {
         .map_err(|e| format!("{e:?}"))?;
         let mass = charge.mass_kg();
         Ok(Self {
+            turbine_mixture: Mixture::PRODUCTS,
+            model: None,
+            bov_opening: 0.0,
             charge,
             species: Species {
                 fresh_air_kg: mass,
@@ -113,6 +123,85 @@ impl Induction {
     /// Wastegate opening for the exhaust network's turbine-bypass area.
     pub fn wastegate(&self) -> f64 {
         self.wastegate
+    }
+    pub fn bov_opening(&self) -> f64 {
+        self.bov_opening
+    }
+    pub fn set_model(&mut self, model: Option<super::turbo_map::TurboModel>) -> Result<(), String> {
+        if let Some(m) = &model {
+            m.validate()?;
+        }
+        self.model = model;
+        self.turbine_mixture = Mixture::PRODUCTS;
+        self.bov_opening = 0.0;
+        Ok(())
+    }
+    /// Shared exhaust constituent state for mapped nozzle/work. Compatibility
+    /// callers retain the historical PRODUCTS approximation until supplied.
+    pub fn set_turbine_composition(&mut self, composition: Composition) -> Result<(), ThermoError> {
+        if !(0.0..=1.0).contains(&composition.fresh_air_fraction)
+            || !(0.0..=1.0).contains(&composition.fuel_fraction)
+            || composition.fresh_air_fraction + composition.fuel_fraction > 1.0 + 1e-10
+        {
+            return Err(ThermoError::InvalidInput);
+        }
+        self.turbine_mixture = composition.mixture();
+        Ok(())
+    }
+    /// Preparation of a genuinely stopped cold/hot stand, before its first step.
+    /// The imported wall temperature remains its explicit external boundary.
+    pub fn initialize_temperature(&mut self, temperature_k: f64) -> Result<(), ThermoError> {
+        if !(200.0..=1000.0).contains(&temperature_k) {
+            return Err(ThermoError::InvalidInput);
+        }
+        let charge = GasState::at_pressure(
+            self.charge.volume_m3(),
+            ATMOSPHERE.pressure_pa,
+            temperature_k,
+            Mixture::AIR,
+        )?;
+        self.charge = charge;
+        self.species = Species {
+            fresh_air_kg: charge.mass_kg(),
+            fuel_kg: 0.0,
+        };
+        self.shaft_energy_j = 0.0;
+        self.compressor_flow_kg_s = 0.0;
+        self.wastegate = 0.0;
+        self.bov_opening = 0.0;
+        self.turbine_outlet_pa = ATMOSPHERE.pressure_pa;
+        Ok(())
+    }
+    /// Convert the turbine map's corrected capacity to the network's nozzle
+    /// area. This is a boundary flow coupling, not a second removal of mass.
+    pub fn mapped_turbine_area_m2(&self, exhaust: Reservoir) -> Option<f64> {
+        self.model.as_ref().map(|m| {
+            let ratio = (exhaust.pressure_pa / self.turbine_outlet_pa).max(1.0);
+            let speed = m
+                .provenance
+                .corrected_speed(self.shaft_rpm(), exhaust.temperature_k);
+            let point = m.turbine.sample(speed, ratio);
+            let actual =
+                m.provenance
+                    .actual_flow(point.value, exhaust.temperature_k, exhaust.pressure_pa);
+            let unit = Orifice {
+                area_m2: 1.0,
+                discharge_coefficient: 0.9,
+            }
+            .mass_flow_from_states(
+                exhaust.pressure_pa,
+                exhaust.temperature_k,
+                self.turbine_outlet_pa,
+                300.0,
+                self.turbine_mixture.properties(exhaust.temperature_k),
+            )
+            .max(0.0);
+            if unit > 0.0 {
+                (actual / unit).clamp(0.0, 0.1)
+            } else {
+                self.turbine_area_m2
+            }
+        })
     }
     /// Turbine exit (downstream catalyst/muffler volume) for the next step.
     pub fn set_turbine_outlet_pa(&mut self, pressure_pa: f64) -> Result<(), ThermoError> {
@@ -209,35 +298,81 @@ impl Induction {
         let old_energy = self.shaft_energy_j;
         let mut result = InductionStep::default();
         // Turbine inlet gas taken as products (its tracers are not passed in).
-        let g = Mixture::PRODUCTS.gamma(exhaust.temperature_k);
+        let g = self.turbine_mixture.gamma(exhaust.temperature_k);
         let pressure_ratio = (exhaust.pressure_pa / self.turbine_outlet_pa).max(1.0);
         // Spring-preloaded actuator on charge pressure: cracks at 90 % of the
         // target and is fully open at 110 %, the proportional band of a
         // conventional internal wastegate (no ECU duty cycle modelled).
         let boost = self.charge.pressure_pa() - ATMOSPHERE.pressure_pa;
-        let wastegate = if self.enabled && self.max_boost_pa > 0.0 {
+        let wastegate_target = if self.enabled && self.max_boost_pa > 0.0 {
             ((boost / self.max_boost_pa - 0.9) / 0.2).clamp(0.0, 1.0)
         } else {
             0.0
         };
+        let wastegate = self.model.as_ref().map_or(wastegate_target, |m| {
+            self.wastegate
+                + (wastegate_target - self.wastegate) * (1.0 - (-dt / m.wastegate_tau_s).exp())
+        });
+        let bov_target = if self.enabled && self.bov != BlowOff::None && throttle < 0.12 {
+            1.0
+        } else {
+            0.0
+        };
+        let bov_opening = self.model.as_ref().map_or(bov_target, |m| {
+            self.bov_opening + (bov_target - self.bov_opening) * (1.0 - (-dt / m.bov_tau_s).exp())
+        });
+        let effective_turbine_area = self
+            .mapped_turbine_area_m2(exhaust)
+            .unwrap_or(self.turbine_area_m2);
         // Nozzle and gate see the same pressure ratio: flow splits by area.
-        let turbine_share = if self.turbine_area_m2 > 0.0 {
-            self.turbine_area_m2 / (self.turbine_area_m2 + wastegate * self.wastegate_area_m2)
+        let turbine_share = if effective_turbine_area > 0.0 {
+            effective_turbine_area / (effective_turbine_area + wastegate * self.wastegate_area_m2)
+        } else if self.model.is_some() {
+            0.0
         } else {
             1.0
+        };
+        let turbine_efficiency = if let Some(m) = &self.model {
+            let point = m.turbine.sample(
+                m.provenance
+                    .corrected_speed(self.shaft_rpm(), exhaust.temperature_k),
+                pressure_ratio,
+            );
+            result.map_outside_domain |= point.outside;
+            result.mapped_turbine_capacity_kg_s =
+                m.provenance
+                    .actual_flow(point.value, exhaust.temperature_k, exhaust.pressure_pa);
+            point.efficiency
+        } else {
+            0.65
         };
         if self.enabled {
             result.turbine_energy_j = exhaust_mass_flow_kg_s.max(0.0)
                 * turbine_share
                 * dt
-                * (Mixture::PRODUCTS.cv(exhaust.temperature_k) + Mixture::PRODUCTS.gas_constant())
+                * (self.turbine_mixture.cv(exhaust.temperature_k)
+                    + self.turbine_mixture.gas_constant())
                 * exhaust.temperature_k
                 * (1.0 - pressure_ratio.powf(-(g - 1.0) / g))
-                * 0.65;
+                * turbine_efficiency;
         }
         let available = old_energy + result.turbine_energy_j;
         let omega = (2.0 * available / self.inertia).sqrt();
         let speed_ratio = (omega / 18000.0).min(1.0);
+        let mapped_compressor = self.model.as_ref().map(|m| {
+            let speed = m
+                .provenance
+                .corrected_speed(omega * 60.0 / std::f64::consts::TAU, 300.0);
+            let flow = m.provenance.corrected_flow(
+                self.compressor_flow_kg_s,
+                300.0,
+                ATMOSPHERE.pressure_pa,
+            );
+            m.compressor.sample(speed, flow)
+        });
+        if let Some(point) = mapped_compressor {
+            result.map_outside_domain |= point.outside;
+        }
         // Peak (surge-line) pressure rise at the speed limit: 4 × target, a
         // compressor of PR ≈ 4 at 172k rpm. Surge flow ∝ ω and head ∝ ω², so
         // this places the target at half speed and widens the constant-boost
@@ -277,7 +412,24 @@ impl Induction {
             } else {
                 1.0 + (r - 2.0 * surge) * (ZERO_HEAD - 2.0) / (ZERO_HEAD - 2.0 * surge)
             };
-            let characteristic = if self.enabled {
+            let characteristic = if self.enabled
+                && let Some(m) = self.model.as_ref()
+            {
+                let speed = m
+                    .provenance
+                    .corrected_speed(omega * 60.0 / std::f64::consts::TAU, 300.0);
+                let corrected = m
+                    .provenance
+                    .corrected_flow(flow, 300.0, ATMOSPHERE.pressure_pa);
+                let point = m.compressor.sample(speed, corrected);
+                // Below the lowest supplied speed use explicit similarity to
+                // zero head. Reverse flow is an estimated boundary hold and
+                // always flagged outside, never claimed as measured surge.
+                let startup = (speed / m.compressor.corrected_speed_rpm[0])
+                    .min(1.0)
+                    .powi(2);
+                (point.value - 1.0) * ATMOSPHERE.pressure_pa * startup
+            } else if self.enabled {
                 head * (0.2 + 0.4 * (1.0 + 1.5 * x - 0.5 * x * x * x))
             } else {
                 0.0
@@ -296,7 +448,7 @@ impl Induction {
         let work_per_kg = (air.cv(300.0) + air.gas_constant())
             * 300.0
             * (compressor_ratio.powf((ga - 1.0) / ga) - 1.0)
-            / 0.7;
+            / mapped_compressor.map_or(0.7, |point| point.efficiency);
         let requested = next_flow * dt;
         let dm = if requested >= 0.0 && work_per_kg > 0.0 {
             requested.min(available / work_per_kg)
@@ -329,9 +481,12 @@ impl Induction {
         } else {
             dm * old_composition.fuel_fraction
         };
-        let bov_mass = if self.enabled && self.bov != BlowOff::None && throttle < 0.12 {
+        let bov_mass = if self.enabled
+            && self.bov != BlowOff::None
+            && (throttle < 0.12 || self.model.is_some())
+        {
             Orifice {
-                area_m2: 0.0005,
+                area_m2: 0.0005 * bov_opening,
                 discharge_coefficient: 0.8,
             }
             .mass_flow_from_states(
@@ -361,15 +516,26 @@ impl Induction {
             fuel_kg: bov_mass * old_composition.fuel_fraction,
         };
         let remaining = (available - result.compressor_energy_j).max(0.0);
-        result.bearing_loss_j = remaining * (1.0 - (-dt / 1.5).exp());
+        result.bearing_loss_j = self.model.as_ref().map_or_else(
+            || remaining * (1.0 - (-dt / 1.5).exp()),
+            |m| remaining * (1.0 - (-2.0 * m.bearing_nm_per_rad_s * dt / self.inertia).exp()),
+        );
         let after_drag = remaining - result.bearing_loss_j;
         let max_energy = 0.5 * self.inertia * 18000.0_f64.powi(2);
         result.overspeed_loss_j = (after_drag - max_energy).max(0.0);
         let next_energy = after_drag.min(max_energy);
         let mut next_charge = self.charge;
+        result.charge_wall_heat_j = self.model.as_ref().map_or(0.0, |m| {
+            let capacity =
+                self.charge.mass_kg() * self.charge.mixture().cv(self.charge.temperature_k());
+            capacity
+                * (self.charge.temperature_k() - m.charge_wall_temperature_k)
+                * (1.0 - (-m.charge_wall_conductance_w_k * dt / capacity).exp())
+        });
         result.charge_ledger = next_charge.step(
             self.charge.volume_m3(),
             EnergyInput {
+                wall_heat_j: result.charge_wall_heat_j,
                 mass_in_kg: dm.max(0.0) + exchange.mass_in_kg,
                 enthalpy_in_j: result.compressor_enthalpy_j.max(0.0) + exchange.enthalpy_in_j,
                 mass_out_kg: bov_mass + exchange.mass_out_kg + (-dm).max(0.0),
@@ -392,6 +558,7 @@ impl Induction {
         self.shaft_energy_j = next_energy;
         self.compressor_flow_kg_s = dm / dt;
         self.wastegate = wastegate;
+        self.bov_opening = bov_opening;
         result.shaft_energy_change_j = next_energy - old_energy;
         Ok(result)
     }
@@ -402,6 +569,186 @@ mod tests {
     use super::*;
     use crate::engine_build::EngineTuning;
     const DT: f64 = 1.0 / 96000.0;
+    #[test]
+    fn mapped_nozzle_reconstructs_corrected_flow_at_network_cd() {
+        let mut t = turbo(BlowOff::None);
+        let model = super::super::turbo_map::TurboModel::synthetic_example();
+        t.set_model(Some(model)).unwrap();
+        for composition in [
+            Composition {
+                fresh_air_fraction: 0.0,
+                fuel_fraction: 0.0,
+            },
+            Composition {
+                fresh_air_fraction: 1.0,
+                fuel_fraction: 0.0,
+            },
+            Composition {
+                fresh_air_fraction: 0.8,
+                fuel_fraction: 0.02,
+            },
+        ] {
+            t.set_turbine_composition(composition).unwrap();
+            for rpm in [30000.0, 90000.0, 170000.0] {
+                for pressure_pa in [130000.0, 220000.0, 400000.0] {
+                    for temperature_k in [500.0, 1000.0, 1500.0] {
+                        t.shaft_energy_j =
+                            0.5 * t.inertia * (rpm * std::f64::consts::TAU / 60.0).powi(2);
+                        let exhaust = Reservoir {
+                            pressure_pa,
+                            temperature_k,
+                        };
+                        let area = t.mapped_turbine_area_m2(exhaust).unwrap();
+                        let actual = Orifice {
+                            area_m2: area,
+                            discharge_coefficient: 0.9,
+                        }
+                        .mass_flow_from_states(
+                            pressure_pa,
+                            temperature_k,
+                            ATMOSPHERE.pressure_pa,
+                            300.0,
+                            composition.mixture().properties(temperature_k),
+                        );
+                        let point = model.turbine.sample(
+                            model.provenance.corrected_speed(rpm, temperature_k),
+                            pressure_pa / ATMOSPHERE.pressure_pa,
+                        );
+                        let expected =
+                            model
+                                .provenance
+                                .actual_flow(point.value, temperature_k, pressure_pa);
+                        assert!((actual - expected).abs() < 1e-12);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn mapped_actuators_follow_analytic_response_and_initialization_is_atomic() {
+        for rate in [96000, 192000] {
+            let mut t = turbo(BlowOff::Atmospheric);
+            let model = super::super::turbo_map::TurboModel::synthetic_example();
+            t.set_model(Some(model)).unwrap();
+            for _ in 0..rate / 100 {
+                t.step(
+                    1.0 / f64::from(rate),
+                    3000.0,
+                    0.0,
+                    ATMOSPHERE,
+                    0.0,
+                    Exchange::default(),
+                )
+                .unwrap();
+            }
+            assert!((t.bov_opening() - (1.0 - (-0.01 / model.bov_tau_s).exp())).abs() < 1e-12);
+            let before = t.supply();
+            assert!(t.initialize_temperature(f64::NAN).is_err());
+            assert_eq!(before.temperature_k, t.supply().temperature_k);
+            t.initialize_temperature(260.0).unwrap();
+            assert!((t.supply().temperature_k - 260.0).abs() < 1e-8);
+            assert_eq!(t.shaft_rpm(), 0.0);
+            assert_eq!(t.bov_opening(), 0.0);
+            assert_eq!(t.species().fresh_air_kg, t.charge_mass_kg());
+            for _ in 0..rate / 100 {
+                // Prescribed pressure stand isolates the actuator transfer;
+                // its external reservoir reset is deliberately outside gas budgets.
+                t.charge = GasState::at_pressure(
+                    t.charge.volume_m3(),
+                    ATMOSPHERE.pressure_pa + 1.2 * t.max_boost_pa,
+                    300.0,
+                    Mixture::AIR,
+                )
+                .unwrap();
+                t.species = Species {
+                    fresh_air_kg: t.charge.mass_kg(),
+                    fuel_kg: 0.0,
+                };
+                t.step(
+                    1.0 / f64::from(rate),
+                    3000.0,
+                    1.0,
+                    ATMOSPHERE,
+                    0.0,
+                    Exchange::default(),
+                )
+                .unwrap();
+            }
+            assert!((t.wastegate() - (1.0 - (-0.01 / model.wastegate_tau_s).exp())).abs() < 1e-12);
+        }
+    }
+    #[test]
+    fn mapped_spool_lift_and_wall_close_all_energy_accounts() {
+        let mut t = turbo(BlowOff::Atmospheric);
+        t.set_model(Some(
+            super::super::turbo_map::TurboModel::synthetic_example(),
+        ))
+        .unwrap();
+        let initial = t.charge_internal_energy_j();
+        let mut enthalpy = 0.0;
+        let mut wall = 0.0;
+        let mut vents = 0.0;
+        let mut outside = false;
+        let mut peak: f64 = 0.0;
+        for i in 0..24000 {
+            let s = t
+                .step(
+                    DT,
+                    3000.0,
+                    if i < 12000 { 1.0 } else { 0.0 },
+                    EXHAUST,
+                    if i < 12000 { 0.08 } else { 0.0 },
+                    Exchange::default(),
+                )
+                .unwrap();
+            enthalpy += s.compressor_enthalpy_j;
+            wall += s.charge_wall_heat_j;
+            vents += s.bov_enthalpy_j;
+            outside |= s.map_outside_domain;
+            peak = peak.max(t.supply().pressure_pa);
+            assert!(
+                (s.shaft_energy_change_j - s.turbine_energy_j
+                    + s.compressor_energy_j
+                    + s.bearing_loss_j
+                    + s.overspeed_loss_j)
+                    .abs()
+                    < 1e-8
+            );
+            assert!(s.charge_ledger.numerical_correction_j.abs() < 1e-8);
+        }
+        assert!(peak > 101325.0);
+        assert!(outside);
+        assert!(vents > 0.0);
+        assert!((t.charge_internal_energy_j() - initial - enthalpy + wall + vents).abs() < 1e-7);
+        assert!(t.bov_opening > 0.99);
+    }
+    #[test]
+    fn omitted_map_is_bit_identical_and_bad_import_is_atomic() {
+        let mut a = turbo(BlowOff::Recirculating);
+        let mut b = a.clone();
+        b.set_model(None).unwrap();
+        for _ in 0..1000 {
+            let x = a
+                .step(DT, 3000.0, 0.7, EXHAUST, 0.08, Exchange::default())
+                .unwrap();
+            let y = b
+                .step(DT, 3000.0, 0.7, EXHAUST, 0.08, Exchange::default())
+                .unwrap();
+            assert_eq!(
+                x.compressor_enthalpy_j.to_bits(),
+                y.compressor_enthalpy_j.to_bits()
+            );
+            assert_eq!(
+                a.supply().pressure_pa.to_bits(),
+                b.supply().pressure_pa.to_bits()
+            );
+            assert_eq!(a.shaft_rpm().to_bits(), b.shaft_rpm().to_bits());
+        }
+        let mut invalid = super::super::turbo_map::TurboModel::synthetic_example();
+        invalid.wastegate_tau_s = 0.0;
+        assert!(a.set_model(Some(invalid)).is_err());
+        assert!(a.model.is_none());
+    }
     fn turbo(bov: BlowOff) -> Induction {
         let build = EngineBuild {
             aspiration: Aspiration::Turbo,

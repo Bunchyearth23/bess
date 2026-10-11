@@ -783,6 +783,7 @@ impl App {
         }
         section(ui, "Combustion and engine physics", |ui| {
             combustion_controls(ui, &mut scratch.sound);
+            simulation_model_controls(ui, &mut scratch.experimental);
             section(ui, "Advanced acoustics", |ui| {
                 ui.checkbox(&mut scratch.experimental.native_rate_acoustics, "Efficient listening rate")
                     .on_hover_text("Keeps the gas calculation at its high rate and runs the acoustic chain at the output rate. Changing this option restarts audio.");
@@ -3705,6 +3706,205 @@ mod wheel_tests {
 }
 
 /// Cylinder-pressure controls: they change torque as well as sound.
+fn simulation_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f32>,
+) {
+    let original = *value as f32;
+    let mut edited = original;
+    slider(ui, label, &mut edited, range);
+    if edited != original {
+        *value = f64::from(edited);
+    }
+}
+
+fn import_model_text(path: &Path) -> Result<String, String> {
+    if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > 1024 * 1024 {
+        return Err("Model import exceeds 1 MiB".into());
+    }
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+/// The same saved options serve both imported and freely created engines.
+fn simulation_model_controls(ui: &mut egui::Ui, spec: &mut bess::scratch::ExperimentalSpec) {
+    section(ui, "Simulation models", |ui| {
+        ui.checkbox(&mut spec.intake_wave_coupling, "Intake pressure feedback")
+            .on_hover_text("Intake reflections act on valve flow and cylinder filling. Independent of exhaust back pressure; experimental and off by default.");
+        let mut fuel = spec.fuel_transients.is_some();
+        if ui
+            .checkbox(&mut fuel, "Liquid fuel and wall film")
+            .changed()
+        {
+            spec.fuel_transients = fuel.then(Default::default);
+        }
+        if let Some(config) = &mut spec.fuel_transients {
+            simulation_slider(
+                ui,
+                "Injection start (crank degrees)",
+                &mut config.injection_start_deg,
+                0.0..=719.0,
+            );
+            let maximum = (720. - config.injection_start_deg).min(180.) as f32;
+            simulation_slider(
+                ui,
+                "Injection duration (crank degrees)",
+                &mut config.injection_duration_deg,
+                1.0..=maximum.max(1.),
+            );
+            simulation_slider(
+                ui,
+                "Fuel deposited on walls",
+                &mut config.deposited_fraction,
+                0.0..=1.0,
+            );
+            simulation_slider(
+                ui,
+                "Film evaporation time (s)",
+                &mut config.film_time_constant_s,
+                0.001..=2.0,
+            );
+            ui.small("Reduced admitted-charge model with estimated coefficients. Injection timing is explicit; fuel type is not inferred.");
+        }
+        let mut flame = spec.predictive_combustion.is_some();
+        if ui
+            .checkbox(&mut flame, "State-dependent flame propagation")
+            .changed()
+        {
+            spec.predictive_combustion = flame.then(Default::default);
+        }
+        if let Some(config) = &mut spec.predictive_combustion {
+            simulation_slider(
+                ui,
+                "Reference flame speed (m/s)",
+                &mut config.reference_flame_speed_m_s,
+                0.05..=5.0,
+            );
+            simulation_slider(
+                ui,
+                "Turbulence contribution",
+                &mut config.turbulence_gain,
+                0.0..=5.0,
+            );
+            simulation_slider(
+                ui,
+                "Residual-gas dilution effect",
+                &mut config.dilution_penalty,
+                0.0..=10.0,
+            );
+            ui.small("Pressure, temperature, richness and residual gas change burn timing. This setting does not calibrate knock.");
+        }
+        let mut torsion = spec.torsion.is_some();
+        if ui
+            .checkbox(&mut torsion, "Crankshaft and flywheel torsion")
+            .changed()
+        {
+            spec.torsion = torsion.then(Default::default);
+        }
+        if let Some(config) = &mut spec.torsion {
+            simulation_slider(
+                ui,
+                "Crank inertia fraction",
+                &mut config.crank_inertia_fraction,
+                0.05..=0.95,
+            );
+            simulation_slider(
+                ui,
+                "Shaft stiffness (Nm/rad)",
+                &mut config.stiffness_nm_rad,
+                1.0..=100_000.0,
+            );
+            simulation_slider(
+                ui,
+                "Shaft damping (Nm·s/rad)",
+                &mut config.damping_nm_s_rad,
+                0.0..=100.0,
+            );
+            ui.small("Estimated two-inertia shaft. Direct RPM mode holds speed; driving mode exposes the torsional dynamics.");
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Import turbo maps…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Turbo model", &["json"])
+                    .pick_file()
+            {
+                match import_model_text(&path)
+                    .and_then(|text| bess::physical::turbo_map::TurboModel::from_json(&text))
+                {
+                    Ok(model) => spec.turbo_model = Some(model),
+                    Err(error) => {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    }
+                }
+            }
+            if spec.turbo_model.is_some() && ui.button("Remove turbo maps").clicked() {
+                spec.turbo_model = None;
+            }
+        });
+        if let Some(model) = &mut spec.turbo_model {
+            ui.label(format!(
+                "{} · {}",
+                model.provenance.hardware.text(),
+                if model.provenance.measured {
+                    "declared measured map"
+                } else {
+                    "synthetic / estimated map"
+                }
+            ));
+            ui.small(model.provenance.source.text());
+            simulation_slider(
+                ui,
+                "Wastegate response time (s)",
+                &mut model.wastegate_tau_s,
+                0.001..=2.0,
+            );
+            simulation_slider(
+                ui,
+                "Blow-off response time (s)",
+                &mut model.bov_tau_s,
+                0.001..=2.0,
+            );
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Import block/head response…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Structural response", &["json"])
+                    .pick_file()
+            {
+                match import_model_text(&path).and_then(|text| {
+                    bess::physical::structural::StructuralResponse::from_json(&text)
+                }) {
+                    Ok(response) => spec.mechanical_transfer = Some(response),
+                    Err(error) => {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    }
+                }
+            }
+            if spec.mechanical_transfer.is_some()
+                && ui.button("Remove structural response").clicked()
+            {
+                spec.mechanical_transfer = None;
+            }
+        });
+        if let Some(response) = &spec.mechanical_transfer {
+            ui.label(format!(
+                "{} · {} modes · {}",
+                response.hardware.text(),
+                response.count,
+                if response.measured {
+                    "declared measured response"
+                } else {
+                    "synthetic / estimated response"
+                }
+            ));
+            ui.small(response.source.text());
+            ui.small("The mechanical layer gain still controls audibility. New projects keep its gain at zero.");
+        }
+        ui.small("These options are saved with the engine and reach WAV/BeamNG loops. Measured calibration and listening reception remain separate.");
+    });
+}
+
 fn combustion_controls(ui: &mut egui::Ui, sound: &mut SoundTuning) {
     slider_help(
         ui,

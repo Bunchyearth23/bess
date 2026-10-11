@@ -14,6 +14,7 @@ const LEVEL: f32 = 0.62;
 /// Inline modal bank. Clone/retune never allocate.
 #[derive(Clone)]
 pub(crate) struct Modes {
+    imported: Option<super::structural::StructuralObserver>,
     modes: [StateVariableFilter; 8],
     ratio: [f32; 8],
     q_scale: [f32; 8],
@@ -49,6 +50,7 @@ impl Modes {
             1. + 0.06 * (((z ^ (z >> 31)) >> 40) as f32 / 8388608. - 1.)
         };
         let mut modes = Self {
+            imported: None,
             modes: std::array::from_fn(|_| {
                 StateVariableFilter::new(rate, 1000., 1., SvfMode::Bandpass)
             }),
@@ -88,6 +90,9 @@ impl Modes {
         }
     }
     pub fn next(&mut self, head: f32, block: f32) -> f32 {
+        if let Some(observer) = &mut self.imported {
+            return observer.next(head, block);
+        }
         let head = self.head_radiation.next_sample(head);
         let block = self.block_radiation.next_sample(block);
         let mut out = 0.;
@@ -96,6 +101,16 @@ impl Modes {
                 * self.gain[i];
         }
         out
+    }
+    pub fn set_response(
+        &mut self,
+        response: Option<&super::structural::StructuralResponse>,
+        rate: u32,
+    ) -> Result<(), String> {
+        self.imported = response
+            .map(|r| super::structural::StructuralObserver::new(*r, rate))
+            .transpose()?;
+        Ok(())
     }
 }
 

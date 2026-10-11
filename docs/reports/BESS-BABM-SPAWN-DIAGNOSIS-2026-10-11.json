@@ -1,0 +1,1282 @@
+{
+  "date": "2026-10-11",
+  "boundary": "Read-only inspection of sources, BESS exports, installed BABM packs and retained game logs; no repair or new spawn trial",
+  "vehicles": [
+    {
+      "slug": "advent_tc",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_advent_tc.zip",
+          "lua": {
+            "vehicles/advent_tc/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99808,
+              "sha256": "47437d5c0ef36243e4f9edf9409a23dc280d798d9cbb2543f62648ee234b14ed"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\advent_tc\\bess-complete-advent_tc-c25854bcd7f674227dce_sport_classic_2c0ba2.zip",
+          "lua": {
+            "vehicles/advent_tc/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99808,
+              "sha256": "47437d5c0ef36243e4f9edf9409a23dc280d798d9cbb2543f62648ee234b14ed"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_advent_tc.zip",
+          "lua": {
+            "vehicles/advent_tc/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99808,
+              "sha256": "47437d5c0ef36243e4f9edf9409a23dc280d798d9cbb2543f62648ee234b14ed"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/advent_tc/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/advent_tc/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/advent_tc/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "archo_coupe",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_archo_coupe.zip",
+          "lua": {
+            "vehicles/archo_coupe/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\archo_coupe\\bess-complete-archo_coupe-4778cd72988264457f83_classic_coupe_59f67b.zip",
+          "lua": {
+            "vehicles/archo_coupe/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_archo_coupe.zip",
+          "lua": {
+            "vehicles/archo_coupe/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/archo_coupe/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/archo_coupe/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/archo_coupe/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "b5_a",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_b5_a.zip",
+          "lua": {
+            "vehicles/b5_a/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            },
+            "vehicles/b5_a/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\b5_a\\bess-complete-b5_a-b4ed4595271a5eaa5796_economy_c1d078.zip",
+          "lua": {
+            "vehicles/b5_a/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            },
+            "vehicles/b5_a/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_b5_a.zip",
+          "lua": {
+            "vehicles/b5_a/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            },
+            "vehicles/b5_a/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_a/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": []
+        }
+      },
+      "emptied_members": []
+    },
+    {
+      "slug": "b5_c",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_b5_c.zip",
+          "lua": {
+            "vehicles/b5_c/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            },
+            "vehicles/b5_c/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\b5_c\\bess-complete-b5_c-2dfe941ecbc224513898_turbo_sport_831523.zip",
+          "lua": {
+            "vehicles/b5_c/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            },
+            "vehicles/b5_c/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_b5_c.zip",
+          "lua": {
+            "vehicles/b5_c/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            },
+            "vehicles/b5_c/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_c/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": []
+        }
+      },
+      "emptied_members": []
+    },
+    {
+      "slug": "b5_gt",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_b5_gt.zip",
+          "lua": {
+            "vehicles/b5_gt/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\b5_gt\\bess-complete-b5_gt-0be1c2f6c565133fe838_turbo_road_e8a1fb.zip",
+          "lua": {
+            "vehicles/b5_gt/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_b5_gt.zip",
+          "lua": {
+            "vehicles/b5_gt/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            },
+            "vehicles/b5_gt/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": []
+        }
+      },
+      "emptied_members": []
+    },
+    {
+      "slug": "berlingo_1000lingo",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_berlingo_1000lingo.zip",
+          "lua": {
+            "vehicles/berlingo_1000lingo/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\berlingo_1000lingo\\bess-complete-berlingo_1000lingo-f73f0a41652aa07bfc23_turbo_extreme_93e1d2.zip",
+          "lua": {
+            "vehicles/berlingo_1000lingo/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_berlingo_1000lingo.zip",
+          "lua": {
+            "vehicles/berlingo_1000lingo/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/berlingo_1000lingo/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "cerberus_a",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_cerberus_a.zip",
+          "lua": {
+            "vehicles/cerberus_a/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\cerberus_a\\bess-complete-cerberus_a-67337b2ea651aba7de75_sport_road_2aef2c.zip",
+          "lua": {
+            "vehicles/cerberus_a/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_cerberus_a.zip",
+          "lua": {
+            "vehicles/cerberus_a/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/cerberus_a/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/cerberus_a/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/cerberus_a/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "genesis_phantom",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_genesis_phantom.zip",
+          "lua": {
+            "vehicles/genesis_phantom/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            },
+            "vehicles/genesis_phantom/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\genesis_phantom\\bess-complete-genesis_phantom-04c49d9d42a281078240_modern_sport_a04d01.zip",
+          "lua": {
+            "vehicles/genesis_phantom/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            },
+            "vehicles/genesis_phantom/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_genesis_phantom.zip",
+          "lua": {
+            "vehicles/genesis_phantom/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8172,
+              "sha256": "5e116eb362978336ed82c6d34444dce654d5fea0fa7ea3bc157553a99e74377f"
+            },
+            "vehicles/genesis_phantom/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99806,
+              "sha256": "6c398aff352070be4600ce1589188483b74b055e42c2481e53741b4f16671c6c"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92074,
+              "sha256": "5f9474f43221545b6380be34ac33cfc0c333f6ed17cff771ea25680c353aec79"
+            },
+            "vehicles/genesis_phantom/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21799,
+              "sha256": "81de0a03554079af07fa2d04adeb593aed51e20008ef8ab0269ade2de33027a6"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": []
+        }
+      },
+      "emptied_members": []
+    },
+    {
+      "slug": "nord_optis",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_nord_optis.zip",
+          "lua": {
+            "vehicles/nord_optis/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\nord_optis\\bess-complete-nord_optis-6d026272ef42fbd09063_classic_economy_2d04a6.zip",
+          "lua": {
+            "vehicles/nord_optis/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_nord_optis.zip",
+          "lua": {
+            "vehicles/nord_optis/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/nord_optis/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/nord_optis/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/nord_optis/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "pulsar_opti",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_pulsar_opti.zip",
+          "lua": {
+            "vehicles/pulsar_opti/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\pulsar_opti\\bess-complete-pulsar_opti-35fbce85b9bb838003e2_modern_turbo_1051b4.zip",
+          "lua": {
+            "vehicles/pulsar_opti/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_pulsar_opti.zip",
+          "lua": {
+            "vehicles/pulsar_opti/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/pulsar_opti/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/pulsar_opti/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/pulsar_opti/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "thunderhawk_zero",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_thunderhawk_zero.zip",
+          "lua": {
+            "vehicles/thunderhawk_zero/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\thunderhawk_zero\\bess-complete-thunderhawk_zero-a2cc99a32ede9cf6a743_classic_road_e37325.zip",
+          "lua": {
+            "vehicles/thunderhawk_zero/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_thunderhawk_zero.zip",
+          "lua": {
+            "vehicles/thunderhawk_zero/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/thunderhawk_zero/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/thunderhawk_zero/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "volk_icarus",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_volk_icarus.zip",
+          "lua": {
+            "vehicles/volk_icarus/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\volk_icarus\\bess-complete-volk_icarus-83b16a180725701e4641_historic_ca5746.zip",
+          "lua": {
+            "vehicles/volk_icarus/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_volk_icarus.zip",
+          "lua": {
+            "vehicles/volk_icarus/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/volk_icarus/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/volk_icarus/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/volk_icarus/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    },
+    {
+      "slug": "volk_icarus_ii",
+      "archives": {
+        "source": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\sources\\bunchyearth23_volk_icarus_ii.zip",
+          "lua": {
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/volk_icarus_ii/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            }
+          }
+        },
+        "export": {
+          "path": "D:\\BeamMP\\current\\BESS-exports\\clean-20261004\\volk_icarus_ii\\bess-complete-volk_icarus_ii-02c03806820ccb9e921f_historic_ca5746.zip",
+          "lua": {
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 92072,
+              "sha256": "d429fe2e656be631becb16b30fd778c47ba6b13b5adf87a0e1e26d990dd13b1b"
+            },
+            "vehicles/volk_icarus_ii/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            }
+          }
+        },
+        "installed_pack": {
+          "path": "D:\\BeamMP\\current\\mods\\babm_volk_icarus_ii.zip",
+          "lua": {
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoSupercharger.lua": {
+              "bytes": 8171,
+              "sha256": "e87db29e228fd33cb4b270b125e4198ee7209c8097bb6d797155883b35d6c196"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoEngineThermals.lua": {
+              "bytes": 0,
+              "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "vehicles/volk_icarus_ii/lua/controller/cefaero.lua": {
+              "bytes": 8480,
+              "sha256": "ffcfeed1d5fbdf008a2b1640f5f452ff7bbd7699bb072216b0ce2793886343eb"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoEngine.lua": {
+              "bytes": 99506,
+              "sha256": "91392d703ac3d54a9c45dfa2fb6ba7ef1f87aa6df6c1e4e95f61a3763f8de8bb"
+            },
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoTurbocharger.lua": {
+              "bytes": 21798,
+              "sha256": "1d2180f20745b7e8d4ad282711e84c7d478fd5b8f911b4af11a2f8a3d55adc76"
+            }
+          }
+        }
+      },
+      "lua_comparison": {
+        "BESS": {
+          "missing": [],
+          "changed": []
+        },
+        "BABM": {
+          "missing": [],
+          "changed": [
+            "vehicles/volk_icarus_ii/lua/powertrain/camsoEngineThermals.lua"
+          ]
+        }
+      },
+      "emptied_members": [
+        "vehicles/volk_icarus_ii/lua/powertrain/camsoEngineThermals.lua"
+      ]
+    }
+  ],
+  "affected_vehicles": [
+    "advent_tc",
+    "archo_coupe",
+    "berlingo_1000lingo",
+    "cerberus_a",
+    "nord_optis",
+    "pulsar_opti",
+    "thunderhawk_zero",
+    "volk_icarus",
+    "volk_icarus_ii"
+  ],
+  "active_history_zips": [
+    "D:\\BeamMP\\current\\mods\\.babm_backup\\thunderhawk_zero\\bess-history\\before-bess-29572-1791103469650148700.zip",
+    "D:\\BeamMP\\current\\mods\\.babm_backup\\pulsar_opti\\bess-history\\before-bess-29572-1791103583708129900.zip",
+    "D:\\BeamMP\\current\\mods\\.babm_backup\\pulsar_opti\\bess-history\\before-bess-29572-1791103853930372400.zip",
+    "D:\\BeamMP\\current\\mods\\.babm_backup\\pulsar_opti\\bess-history\\before-bess-variant-29572-1791103730844667400.zip",
+    "D:\\BeamMP\\current\\mods\\.babm_backup\\pulsar_opti\\bess-history\\before-bess-variant-29572-1791103993298032600.zip"
+  ],
+  "fatal_log_matches": [
+    {
+      "line": 696,
+      "text": "105.32064|E|libbeamng.Lua.Exception| /vehicles/thunderhawk_zero//lua/powertrain/camsoEngine.lua:2127: attempt to index field 'thermals' (a boolean value)"
+    },
+    {
+      "line": 726,
+      "text": "105.32088|E|libbeamng.Lua.Exception|   (*temporary) = string[51]: \"attempt to index field 'thermals' (a boolean value)\""
+    },
+    {
+      "line": 746,
+      "text": "105.32113|E|GELua.onSpawnError| Error 0 spawning vehicle \"thunderhawk_zero\""
+    },
+    {
+      "line": 1273,
+      "text": "174.39138|E|libbeamng.Lua.Exception| /vehicles/thunderhawk_zero//lua/powertrain/camsoEngine.lua:2127: attempt to index field 'thermals' (a boolean value)"
+    },
+    {
+      "line": 1303,
+      "text": "174.39169|E|libbeamng.Lua.Exception|   (*temporary) = string[51]: \"attempt to index field 'thermals' (a boolean value)\""
+    },
+    {
+      "line": 1323,
+      "text": "174.39194|E|GELua.onSpawnError| Error 0 spawning vehicle \"thunderhawk_zero\""
+    },
+    {
+      "line": 1770,
+      "text": "193.08102|E|libbeamng.Lua.Exception| /vehicles/nord_optis//lua/powertrain/camsoEngine.lua:2127: attempt to index field 'thermals' (a boolean value)"
+    },
+    {
+      "line": 1800,
+      "text": "193.08135|E|libbeamng.Lua.Exception|   (*temporary) = string[51]: \"attempt to index field 'thermals' (a boolean value)\""
+    },
+    {
+      "line": 1820,
+      "text": "193.08246|E|GELua.onSpawnError| Error 0 spawning vehicle \"nord_optis\""
+    }
+  ],
+  "log_date": "2026-10-04; beamng.2.log retained from earlier game session"
+}

@@ -1,7 +1,55 @@
 //! One-degree-of-freedom forward-rotating crankshaft, SI units and f64 state.
 //! Gas and reciprocating torques come from the caller's cylinder mechanics.
 //! No RPM target, torque curve or idle-restoring force is present here.
+use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};
+
+/// Two-inertia engineering model; inertia fraction partitions the existing
+/// total inertia, so enabling it never adds hidden rotational energy.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TorsionConfig {
+    pub crank_inertia_fraction: f64,
+    pub stiffness_nm_rad: f64,
+    pub damping_nm_s_rad: f64,
+}
+impl Default for TorsionConfig {
+    fn default() -> Self {
+        Self {
+            crank_inertia_fraction: 0.35,
+            stiffness_nm_rad: 18000.0,
+            damping_nm_s_rad: 2.0,
+        }
+    }
+}
+impl TorsionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.05..=0.95).contains(&self.crank_inertia_fraction)
+            || !(1.0..=1e7).contains(&self.stiffness_nm_rad)
+            || !(0.0..=1e4).contains(&self.damping_nm_s_rad)
+        {
+            return Err("Invalid torsion inertia split, stiffness or damping".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TorsionLedger {
+    pub spring_energy_j: f64,
+    pub damping_loss_j: f64,
+    /// Inelastic forward-stop projection, explicitly accounted, never clipped silently.
+    pub stop_loss_j: f64,
+    pub flywheel_rpm: f64,
+    pub twist_rad: f64,
+    pub transmitted_torque_nm: f64,
+    pub stop_events: u32,
+    pub event_solver_iterations: u32,
+}
+struct Torsion {
+    config: TorsionConfig,
+    flywheel_omega: f64,
+    twist: f64,
+    ledger: TorsionLedger,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrankError {
@@ -85,6 +133,7 @@ pub struct Crank {
     peak_pressure_pa: f64,
     accessory_nm: f64,
     state: CrankState,
+    torsion: Option<Torsion>,
 }
 
 impl Crank {
@@ -109,6 +158,7 @@ impl Crank {
             friction: FrictionModel::default(),
             peak_pressure_pa: 0.,
             accessory_nm: 0.,
+            torsion: None,
             state: CrankState {
                 omega_rad_s,
                 rpm: initial_rpm,
@@ -121,6 +171,29 @@ impl Crank {
 
     pub fn state(&self) -> CrankState {
         self.state
+    }
+
+    pub fn set_torsion(&mut self, config: Option<TorsionConfig>) -> Result<(), CrankError> {
+        if let Some(config) = config {
+            config.validate().map_err(|_| CrankError::InvalidGeometry)?;
+            self.torsion = Some(Torsion {
+                config,
+                flywheel_omega: self.state.omega_rad_s,
+                twist: 0.0,
+                ledger: TorsionLedger {
+                    flywheel_rpm: self.state.rpm,
+                    ..Default::default()
+                },
+            });
+        } else {
+            self.torsion = None;
+        }
+        Ok(())
+    }
+    pub fn torsion_ledger(&self) -> TorsionLedger {
+        self.torsion
+            .as_ref()
+            .map_or(TorsionLedger::default(), |t| t.ledger)
     }
 
     pub fn set_friction(&mut self, friction: FrictionModel) -> Result<(), CrankError> {
@@ -193,6 +266,106 @@ impl Crank {
             - load_nm
             - friction_nm
             - self.accessory_nm;
+        if let Some(t) = &mut self.torsion {
+            let j1 = self.inertia_kg_m2 * t.config.crank_inertia_fraction;
+            let j2 = self.inertia_kg_m2 - j1;
+            let omega1 = self.state.omega_rad_s;
+            let omega2 = t.flywheel_omega;
+            let drive = gas_torque_nm + reciprocating_torque_nm + starter_nm
+                - friction_nm
+                - self.accessory_nm;
+            let response = -load_nm;
+            let k = t.config.stiffness_nm_rad;
+            let c = t.config.damping_nm_s_rad;
+            let mut w1 = omega1;
+            let mut w2 = omega2;
+            let mut q = t.twist;
+            let mut remaining = dt;
+            let mut angle1 = 0.0;
+            let mut angle2 = 0.0;
+            let mut damping = 0.0;
+            let mut stop_loss = 0.0;
+            let mut transmitted = 0.0;
+            let mut stop_events = 0;
+            let mut event_solver_iterations = 0;
+            // Resolve an intra-step zero-speed event before changing its static
+            // constraint. This prevents backwards angles/negative drag work.
+            for _ in 0..64 {
+                if remaining <= dt * 1e-14 {
+                    break;
+                }
+                let mut h = remaining;
+                let mut trial = torsion_midpoint(h, [j1, j2, k, c], [w1, w2, q], [drive, response]);
+                if trial[0] < 0.0 || trial[1] < 0.0 {
+                    stop_events += 1;
+                    let mut lo = 0.0;
+                    let mut hi = h;
+                    for _ in 0..52 {
+                        event_solver_iterations += 1;
+                        let mid = 0.5 * (lo + hi);
+                        let candidate =
+                            torsion_midpoint(mid, [j1, j2, k, c], [w1, w2, q], [drive, response]);
+                        if candidate[0] >= 0.0 && candidate[1] >= 0.0 {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    h = hi;
+                    trial = torsion_midpoint(h, [j1, j2, k, c], [w1, w2, q], [drive, response]);
+                }
+                let a1 = h * 0.5 * (w1 + trial[0]);
+                let a2 = h * 0.5 * (w2 + trial[1]);
+                let vm = 0.5 * (w1 + trial[0] - w2 - trial[1]);
+                angle1 += a1;
+                angle2 += a2;
+                damping += h * c * vm * vm;
+                transmitted += h * (k * 0.5 * (q + trial[2]) + c * vm);
+                stop_loss +=
+                    0.5 * j1 * trial[0].min(0.0).powi(2) + 0.5 * j2 * trial[1].min(0.0).powi(2);
+                w1 = trial[0].max(0.0);
+                w2 = trial[1].max(0.0);
+                q = trial[2];
+                remaining -= h;
+            }
+            // The supported physics cadence resolves at most a few events.
+            // Failure is explicit rather than silently omitting elapsed time.
+            if remaining > dt * 1e-12 {
+                return Err(CrankError::InvalidInput);
+            }
+            let next1 = w1;
+            let next2 = w2;
+            t.twist = q;
+            t.flywheel_omega = next2;
+            t.ledger = TorsionLedger {
+                spring_energy_j: 0.5 * k * q * q,
+                damping_loss_j: damping,
+                stop_loss_j: stop_loss,
+                flywheel_rpm: next2 * 60.0 / TAU,
+                twist_rad: q,
+                transmitted_torque_nm: transmitted / dt,
+                stop_events,
+                event_solver_iterations,
+            };
+            self.state = CrankState {
+                angle_unwrapped: self.state.angle_unwrapped + angle1,
+                omega_rad_s: next1,
+                rpm: next1 * 60.0 / TAU,
+                stalled: next1 * 60.0 / TAU < 40.0,
+                friction_nm,
+                accessory_nm: self.accessory_nm,
+                starter_nm,
+                net_torque_nm: drive + response,
+                kinetic_energy_j: 0.5 * j1 * next1 * next1 + 0.5 * j2 * next2 * next2,
+                gas_work_j: gas_torque_nm * angle1,
+                reciprocating_work_j: reciprocating_torque_nm * angle1,
+                starter_work_j: starter_nm * angle1,
+                load_work_j: load_nm * angle2,
+                friction_work_j: friction_nm * angle1,
+                accessory_work_j: self.accessory_nm * angle1,
+            };
+            return Ok(self.state);
+        }
         let alpha = net_torque_nm / self.inertia_kg_m2;
         let omega = self.state.omega_rad_s;
         // Integrate constant torque exactly for this short step. If braking
@@ -227,11 +400,181 @@ impl Crank {
     }
 }
 
+/// [next crank speed,next flywheel speed,next relative angle]. A static
+/// constraint has zero angle/work and disappears as soon as torque releases it.
+fn torsion_midpoint(h: f64, parameters: [f64; 4], state: [f64; 3], torques: [f64; 2]) -> [f64; 3] {
+    let [j1, j2, k, c] = parameters;
+    let [w1, w2, q] = state;
+    let [drive, response] = torques;
+    let spring = k * q + c * (w1 - w2);
+    let held1 = w1 == 0.0 && drive - spring <= 0.0;
+    let held2 = w2 == 0.0 && response + spring <= 0.0;
+    let (mid1, mid2) = if held1 && held2 {
+        (0.0, 0.0)
+    } else if held1 {
+        (
+            0.0,
+            (w2 + 0.5 * h * (response + k * q) / j2)
+                / (1.0 + 0.5 * h * c / j2 + 0.25 * h * h * k / j2),
+        )
+    } else if held2 {
+        (
+            (w1 + 0.5 * h * (drive - k * q) / j1)
+                / (1.0 + 0.5 * h * c / j1 + 0.25 * h * h * k / j1),
+            0.0,
+        )
+    } else {
+        let a = 1.0 / j1 + 1.0 / j2;
+        let vm = (w1 - w2 + 0.5 * h * (drive / j1 - response / j2 - a * k * q))
+            / (1.0 + 0.5 * h * a * c + 0.25 * h * h * a * k);
+        let torque = k * (q + 0.5 * h * vm) + c * vm;
+        (
+            w1 + 0.5 * h * (drive - torque) / j1,
+            w2 + 0.5 * h * (response + torque) / j2,
+        )
+    };
+    [2.0 * mid1 - w1, 2.0 * mid2 - w2, q + h * (mid1 - mid2)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn crank(rpm: f64) -> Crank {
         Crank::new(0.22, 0.086, 0.002, rpm).unwrap()
+    }
+    #[test]
+    fn torsion_static_load_holds_both_rotors_and_one_blocked_rotor_has_zero_work() {
+        let mut parked = crank(0.0);
+        parked.set_torsion(Some(TorsionConfig::default())).unwrap();
+        for _ in 0..9600 {
+            let s = parked.step(1.0 / 96000.0, 0.0, 0.0, 400.0, false).unwrap();
+            let t = parked.torsion_ledger();
+            assert_eq!(s.angle_unwrapped, 0.0);
+            assert_eq!(s.kinetic_energy_j, 0.0);
+            assert_eq!(t.spring_energy_j, 0.0);
+            assert_eq!(t.stop_events, 0);
+            assert_eq!(t.event_solver_iterations, 0);
+        }
+        let mut one = crank(0.0);
+        one.set_friction(FrictionModel::ZERO).unwrap();
+        one.set_torsion(Some(TorsionConfig::default())).unwrap();
+        let mut total_events = 0;
+        for _ in 0..9600 {
+            let s = one.step(1.0 / 96000.0, 40.0, 0.0, 400.0, false).unwrap();
+            let t = one.torsion_ledger();
+            assert_eq!(t.flywheel_rpm, 0.0);
+            assert_eq!(s.load_work_j, 0.0);
+            assert!(t.stop_events <= 2);
+            assert_eq!(t.event_solver_iterations, 52 * t.stop_events);
+            total_events += t.stop_events;
+        }
+        assert!(one.state().angle_unwrapped > 0.0);
+        assert!(total_events > 0);
+    }
+    #[test]
+    fn torsion_stall_grid_never_reverses_or_turns_drag_into_a_source() {
+        for rate in [48000, 96000, 192000] {
+            for rpm in [0.0, 0.01, 40.0, 850.0] {
+                for load in [0.0, 80.0, 400.0] {
+                    let mut c = crank(rpm);
+                    c.set_torsion(Some(TorsionConfig::default())).unwrap();
+                    c.set_accessories(true, true);
+                    let initial = c.state().kinetic_energy_j;
+                    let mut work = 0.0;
+                    let mut loss = 0.0;
+                    let mut previous_angle = 0.0;
+                    for _ in 0..rate / 20 {
+                        let s = c
+                            .step(1.0 / f64::from(rate), 0.0, 0.0, load, false)
+                            .unwrap();
+                        let t = c.torsion_ledger();
+                        assert!(
+                            s.angle_unwrapped >= previous_angle - 1e-15
+                                && s.rpm >= 0.0
+                                && t.flywheel_rpm >= 0.0
+                        );
+                        assert!(
+                            s.friction_work_j >= -1e-14
+                                && s.accessory_work_j >= -1e-14
+                                && s.load_work_j >= -1e-14
+                        );
+                        previous_angle = s.angle_unwrapped;
+                        work -= s.friction_work_j + s.accessory_work_j + s.load_work_j;
+                        loss += t.damping_loss_j + t.stop_loss_j;
+                        assert!(
+                            (s.kinetic_energy_j + t.spring_energy_j - initial - work + loss).abs()
+                                < 1e-7,
+                            "rate={rate} rpm={rpm} load={load}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn torsion_conserves_work_and_damping_over_load_transient() {
+        let mut c = crank(3000.0);
+        c.set_friction(FrictionModel::ZERO).unwrap();
+        c.set_torsion(Some(TorsionConfig::default())).unwrap();
+        let initial = c.state().kinetic_energy_j;
+        let mut work = 0.0;
+        let mut damping = 0.0;
+        let mut peak_twist: f64 = 0.0;
+        for i in 0..9600 {
+            let s = c
+                .step(
+                    1.0 / 96000.0,
+                    if i < 4800 { 80.0 } else { 20.0 },
+                    0.0,
+                    40.0,
+                    false,
+                )
+                .unwrap();
+            let t = c.torsion_ledger();
+            work += s.gas_work_j - s.load_work_j;
+            damping += t.damping_loss_j + t.stop_loss_j;
+            peak_twist = peak_twist.max(t.twist_rad.abs());
+            assert!(
+                (s.kinetic_energy_j + t.spring_energy_j - initial - work + damping).abs() < 1e-7
+            );
+        }
+        assert!(peak_twist > 0.0);
+        assert!(damping > 0.0);
+    }
+    #[test]
+    fn torsion_energy_converges_and_stopping_loss_is_reported() {
+        let run = |rate: f64| {
+            let mut c = crank(1000.0);
+            c.set_friction(FrictionModel::ZERO).unwrap();
+            let config = TorsionConfig {
+                damping_nm_s_rad: 0.0,
+                ..Default::default()
+            };
+            c.set_torsion(Some(config)).unwrap();
+            for _ in 0..(rate / 10.0) as usize {
+                c.step(1.0 / rate, 80.0, 0.0, 40.0, false).unwrap();
+            }
+            c.state().rpm
+        };
+        let a = run(96000.0);
+        let b = run(192000.0);
+        assert!((a - b).abs() < 0.02);
+        let mut c = crank(0.01);
+        c.set_torsion(Some(TorsionConfig::default())).unwrap();
+        let initial = c.state().kinetic_energy_j;
+        let s = c.step(1.0 / 96000.0, 0.0, 0.0, 400.0, false).unwrap();
+        let t = c.torsion_ledger();
+        assert!(t.stop_loss_j >= 0.0);
+        assert!(s.angle_unwrapped >= 0.0 && s.friction_work_j >= 0.0 && s.load_work_j >= 0.0);
+        assert!(
+            (s.kinetic_energy_j + t.spring_energy_j - initial
+                + s.load_work_j
+                + s.friction_work_j
+                + t.stop_loss_j
+                + t.damping_loss_j)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]

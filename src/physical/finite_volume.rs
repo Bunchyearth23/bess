@@ -1,10 +1,11 @@
 //! Optional finite-volume primary pipe: ideal-gas 1D Euler, MUSCL/SSP-RK2,
 //! HLLC flux with HLLE fallback. No cell clipping or hidden energy injection.
 //!
-//! Validity: constant-area, inviscid, calorically perfect gas; no heat transfer,
-//! wall friction, chemical species or moving-wall work. This is an acoustic
-//! primary extension of the shared engine, not a replacement combustion model.
+//! EulerPipe/Primary1d: constant-area, inviscid, calorically perfect gas;
+//! no heat transfer, wall friction or moving-wall work. SpeciesPipe is a separate
+//! offline extension with frozen transported species and optional variable EOS.
 //! See docs/reports/BESS-QUALITY-CALIBRATION-2026-10-03.md for sources and limits.
+use super::thermo::Mixture;
 use serde::Serialize;
 
 type Conserved = [f64; 3];
@@ -63,6 +64,10 @@ pub enum Boundary {
     Transmissive,
     Reflective,
     Reservoir(Primitive),
+    /// Conservative prescribed [mass, momentum, total-energy] flux per unit
+    /// area, positive along the pipe axis at either end. Used for a shared
+    /// cylinder transfer or a junction, never as an independent source copy.
+    Flux([f64; 3]),
     /// Must be selected at both ends.
     Periodic,
 }
@@ -78,6 +83,8 @@ pub struct Diagnostics {
     pub min_pressure: f64,
     /// Integrated [mass, axial momentum, energy] entering through boundaries.
     pub boundary_exchange: [f64; 3],
+    /// Same integrated transfer separated into left/right (positive inward).
+    pub boundary_by_side: [[f64; 3]; 2],
     /// Explicit inventory change from retargeting geometry, not Euler flux.
     pub geometry_exchange: [f64; 3],
 }
@@ -175,6 +182,31 @@ fn hllc(left: Primitive, right: Primitive, gamma: f64, low_order: bool) -> (Cons
 }
 
 impl EulerPipe {
+    /// One conservative HLLC face flux for both owners of a junction.
+    pub fn interface_flux(
+        left: Primitive,
+        right: Primitive,
+        gamma: f64,
+    ) -> Result<[f64; 3], &'static str> {
+        if !left.valid() || !right.valid() || !(1.01..=2.).contains(&gamma) {
+            return Err("Invalid finite-volume interface state");
+        }
+        Ok(hllc(left, right, gamma, false).0)
+    }
+
+    /// Global network steps must respect the fastest cell before computing
+    /// frozen shared interface fluxes. Internal recovery may still subdivide.
+    pub fn stable_time_step(&self) -> f64 {
+        let speed = self
+            .state
+            .iter()
+            .map(|&u| {
+                let q = Primitive::from_conserved(u, self.gamma);
+                q.velocity.abs() + q.sound_speed(self.gamma)
+            })
+            .fold(0_f64, f64::max);
+        CFL * self.dx() / speed
+    }
     pub fn new(
         length_m: f64,
         area_m2: f64,
@@ -282,7 +314,9 @@ impl EulerPipe {
                     Boundary::Periodic => {
                         self.primitive[if side == 0 { n + 1 - ghost } else { 2 + ghost }]
                     }
-                    Boundary::Transmissive => self.primitive[if side == 0 { 2 } else { n + 1 }],
+                    Boundary::Transmissive | Boundary::Flux(_) => {
+                        self.primitive[if side == 0 { 2 } else { n + 1 }]
+                    }
                     Boundary::Reservoir(q) => q,
                     Boundary::Reflective => Primitive {
                         velocity: -self.primitive[inside].velocity,
@@ -327,6 +361,11 @@ impl EulerPipe {
             fallback += u64::from(used_hlle);
             speed = speed.max(a);
         }
+        for (side, boundary) in boundaries.into_iter().enumerate() {
+            if let Boundary::Flux(flux) = boundary {
+                self.fluxes[if side == 0 { 0 } else { n }] = flux;
+            }
+        }
         (fallback, speed)
     }
     fn trial(
@@ -334,12 +373,11 @@ impl EulerPipe {
         dt: f64,
         boundaries: [Boundary; 2],
         first_order: bool,
-    ) -> Option<([f64; 3], u64, f64)> {
+    ) -> Option<([[f64; 3]; 2], u64, f64)> {
         let ratio = dt / self.dx();
         let n = self.cells();
         let (mut fallback, a1) = self.fluxes(false, boundaries, first_order);
-        let first_boundary: [f64; 3] =
-            std::array::from_fn(|k| self.fluxes[0][k] - self.fluxes[n][k]);
+        let first_boundary = [self.fluxes[0], self.fluxes[n]];
         if ratio * a1 > 0.48 {
             return None;
         }
@@ -365,8 +403,12 @@ impl EulerPipe {
                 return None;
             }
         }
-        let exchange = std::array::from_fn(|k| {
-            0.5 * dt * self.area * (first_boundary[k] + self.fluxes[0][k] - self.fluxes[n][k])
+        let exchange = std::array::from_fn(|side| {
+            std::array::from_fn(|k| {
+                let index = if side == 0 { 0 } else { n };
+                let sign = if side == 0 { 1. } else { -1. };
+                sign * 0.5 * dt * self.area * (first_boundary[side][k] + self.fluxes[index][k])
+            })
         });
         Some((exchange, fallback, ratio * a1.max(a2)))
     }
@@ -384,6 +426,11 @@ impl EulerPipe {
                 && !q.valid()
             {
                 return Err("Invalid finite-volume reservoir");
+            }
+            if let Boundary::Flux(flux) = boundary
+                && flux.iter().any(|v| !v.is_finite())
+            {
+                return Err("Invalid prescribed finite-volume flux");
             }
         }
         let mut remaining = seconds;
@@ -420,12 +467,697 @@ impl EulerPipe {
             self.diagnostics.first_order_steps += u64::from(first_order);
             self.diagnostics.hlle_faces += fallback;
             self.diagnostics.max_cfl = self.diagnostics.max_cfl.max(cfl);
-            for (total, value) in self.diagnostics.boundary_exchange.iter_mut().zip(exchange) {
-                *total += value;
+            for (side, values) in exchange.iter().enumerate() {
+                for (k, value) in values.iter().enumerate() {
+                    self.diagnostics.boundary_exchange[k] += value;
+                    self.diagnostics.boundary_by_side[side][k] += value;
+                }
             }
             self.record_bounds();
         }
         Ok(())
+    }
+}
+
+/// Offline EOS selection. Fixed is a reduction/transport reference; SharedMixture
+/// uses exactly the frozen species and sensible-energy reference of cylinders.
+#[derive(Clone, Copy, Debug)]
+pub enum GasEquation {
+    Fixed { gamma: f64, gas_constant: f64 },
+    SharedMixture,
+}
+
+/// Euler state plus transported mass fractions; products are the remainder.
+#[derive(Clone, Copy, Debug)]
+pub struct SpeciesState {
+    pub gas: Primitive,
+    pub fresh_air_fraction: f64,
+    pub fuel_fraction: f64,
+}
+
+pub type SpeciesConserved = [f64; 5];
+
+impl GasEquation {
+    fn valid(self) -> bool {
+        match self {
+            Self::Fixed {
+                gamma,
+                gas_constant,
+            } => (1.01..=1.67).contains(&gamma) && (50.0..=600.).contains(&gas_constant),
+            Self::SharedMixture => true,
+        }
+    }
+    fn mixture(q: SpeciesState) -> Mixture {
+        Mixture::from_fractions(q.fresh_air_fraction, q.fuel_fraction)
+    }
+    pub fn temperature(self, q: SpeciesState) -> f64 {
+        let r = match self {
+            Self::Fixed { gas_constant, .. } => gas_constant,
+            Self::SharedMixture => Self::mixture(q).gas_constant(),
+        };
+        q.gas.pressure / (q.gas.density * r)
+    }
+    pub fn gamma(self, q: SpeciesState) -> f64 {
+        match self {
+            Self::Fixed { gamma, .. } => gamma,
+            Self::SharedMixture => Self::mixture(q).gamma(self.temperature(q)),
+        }
+    }
+    pub fn sound_speed(self, q: SpeciesState) -> f64 {
+        q.gas.sound_speed(self.gamma(q))
+    }
+    pub fn at_pressure(
+        self,
+        pressure: f64,
+        temperature: f64,
+        fresh: f64,
+        fuel: f64,
+    ) -> Result<SpeciesState, &'static str> {
+        let r = match self {
+            Self::Fixed { gas_constant, .. } => gas_constant,
+            Self::SharedMixture => Mixture::from_fractions(fresh, fuel).gas_constant(),
+        };
+        let q = SpeciesState {
+            gas: Primitive {
+                density: pressure / (r * temperature),
+                velocity: 0.,
+                pressure,
+            },
+            fresh_air_fraction: fresh,
+            fuel_fraction: fuel,
+        };
+        self.conserved(q)?;
+        Ok(q)
+    }
+    pub fn conserved(self, q: SpeciesState) -> Result<SpeciesConserved, &'static str> {
+        // A few ulps in the fractions are allowed solely for roundoff after
+        // conservative operations. The conserved species are never clipped.
+        if !self.valid()
+            || !q.gas.valid()
+            || !q.fresh_air_fraction.is_finite()
+            || !q.fuel_fraction.is_finite()
+            || q.fresh_air_fraction < 0.
+            || q.fuel_fraction < 0.
+            || q.fresh_air_fraction + q.fuel_fraction > 1. + 8. * f64::EPSILON
+            || !(200. * (1. - 8. * f64::EPSILON)..=3500. * (1. + 8. * f64::EPSILON))
+                .contains(&self.temperature(q))
+        {
+            return Err("Invalid species/EOS state (no cell repair)");
+        }
+        let internal = match self {
+            Self::Fixed { gamma, .. } => q.gas.pressure / (q.gas.density * (gamma - 1.)),
+            Self::SharedMixture => Self::mixture(q).internal_energy(self.temperature(q)),
+        };
+        let rho = q.gas.density;
+        Ok([
+            rho,
+            rho * q.gas.velocity,
+            rho * (internal + 0.5 * q.gas.velocity.powi(2)),
+            rho * q.fresh_air_fraction,
+            rho * q.fuel_fraction,
+        ])
+    }
+    pub fn state(self, u: SpeciesConserved) -> Result<SpeciesState, &'static str> {
+        if u.iter().any(|v| !v.is_finite()) || u[0] < RHO_MIN {
+            return Err("Invalid conservative species state");
+        }
+        let (rho, velocity) = (u[0], u[1] / u[0]);
+        let fresh = u[3] / rho;
+        let fuel = u[4] / rho;
+        let internal = u[2] / rho - 0.5 * velocity.powi(2);
+        let pressure = match self {
+            Self::Fixed { gamma, .. } => (gamma - 1.) * rho * internal,
+            Self::SharedMixture => {
+                let m = Mixture::from_fractions(fresh, fuel);
+                // Same rationalized quadratic inversion as thermo::Mixture;
+                // use its public caloric functions, no separate species table.
+                let a = m.cv(0.);
+                let b = (m.cv(1000.) - a) / 1000.;
+                let e = internal - m.internal_energy(0.);
+                let temperature = 2. * e / (a + (a * a + 2. * b * e).sqrt());
+                rho * m.gas_constant() * temperature
+            }
+        };
+        let q = SpeciesState {
+            gas: Primitive {
+                density: rho,
+                velocity,
+                pressure,
+            },
+            fresh_air_fraction: fresh,
+            fuel_fraction: fuel,
+        };
+        self.conserved(q)?;
+        Ok(q)
+    }
+}
+
+/// Boundary includes species in every imposed conservative flux.
+#[derive(Clone, Copy, Debug)]
+pub enum SpeciesBoundary {
+    Transmissive,
+    Reflective,
+    Reservoir(SpeciesState),
+    Flux(SpeciesConserved),
+    Periodic,
+}
+
+/// First-order spatial HLLC/HLLE, SSP-RK2 in time. This separate offline solver
+/// leaves the production calorically-perfect MUSCL path byte unchanged. Five
+/// conserved unknowns per cell prevent instantaneous whole-pipe scalar mixing.
+pub struct SpeciesPipe {
+    state: Vec<SpeciesConserved>,
+    stage: Vec<SpeciesConserved>,
+    next: Vec<SpeciesConserved>,
+    faces: Vec<SpeciesConserved>,
+    length: f64,
+    area: f64,
+    eos: GasEquation,
+    boundary_by_side: [SpeciesConserved; 2],
+    rejected_trials: u64,
+}
+
+impl SpeciesPipe {
+    pub fn new(
+        length: f64,
+        area: f64,
+        cells: usize,
+        eos: GasEquation,
+        initial: SpeciesState,
+    ) -> Result<Self, &'static str> {
+        if !(0.02..=10.).contains(&length)
+            || !(1e-6..=1.).contains(&area)
+            || !(8..=2048).contains(&cells)
+        {
+            return Err("Invalid species pipe geometry");
+        }
+        let u = eos.conserved(initial)?;
+        Ok(Self {
+            state: vec![u; cells],
+            stage: vec![u; cells],
+            next: vec![u; cells],
+            faces: vec![[0.; 5]; cells + 1],
+            length,
+            area,
+            eos,
+            boundary_by_side: [[0.; 5]; 2],
+            rejected_trials: 0,
+        })
+    }
+    pub fn cells(&self) -> usize {
+        self.state.len()
+    }
+    pub fn dx(&self) -> f64 {
+        self.length / self.cells() as f64
+    }
+    pub fn state(&self, cell: usize) -> Option<SpeciesState> {
+        self.state.get(cell).and_then(|u| self.eos.state(*u).ok())
+    }
+    pub fn totals(&self) -> SpeciesConserved {
+        let mut sum = [0.; 5];
+        for u in &self.state {
+            for k in 0..5 {
+                sum[k] += u[k] * self.area * self.dx();
+            }
+        }
+        sum
+    }
+    pub fn boundary_by_side(&self) -> [SpeciesConserved; 2] {
+        self.boundary_by_side
+    }
+    pub fn rejected_trials(&self) -> u64 {
+        self.rejected_trials
+    }
+    pub fn initialize(
+        &mut self,
+        mut initial: impl FnMut(f64) -> SpeciesState,
+    ) -> Result<(), &'static str> {
+        let dx = self.dx();
+        for (i, u) in self.next.iter_mut().enumerate() {
+            *u = self.eos.conserved(initial((i as f64 + 0.5) * dx))?;
+        }
+        std::mem::swap(&mut self.next, &mut self.state);
+        self.boundary_by_side = [[0.; 5]; 2];
+        Ok(())
+    }
+    pub fn stable_time_step(&self) -> f64 {
+        let speed = self
+            .state
+            .iter()
+            .map(|u| {
+                let q = self.eos.state(*u).expect("accepted species state");
+                q.gas.velocity.abs() + self.eos.sound_speed(q)
+            })
+            .fold(0., f64::max);
+        CFL * self.dx() / speed
+    }
+    pub fn interface_flux(
+        eos: GasEquation,
+        left: SpeciesState,
+        right: SpeciesState,
+    ) -> Result<SpeciesConserved, &'static str> {
+        Self::flux(eos, left, right, false).map(|(flux, _)| flux)
+    }
+    fn flux(
+        eos: GasEquation,
+        l: SpeciesState,
+        r: SpeciesState,
+        low_order: bool,
+    ) -> Result<(SpeciesConserved, f64), &'static str> {
+        let ul = eos.conserved(l)?;
+        let ur = eos.conserved(r)?;
+        let physical = |q: SpeciesState, u: SpeciesConserved| {
+            [
+                u[1],
+                u[1] * q.gas.velocity + q.gas.pressure,
+                (u[2] + q.gas.pressure) * q.gas.velocity,
+                u[3] * q.gas.velocity,
+                u[4] * q.gas.velocity,
+            ]
+        };
+        let fl = physical(l, ul);
+        let fr = physical(r, ur);
+        let sl = (l.gas.velocity - eos.sound_speed(l)).min(r.gas.velocity - eos.sound_speed(r));
+        let sr = (l.gas.velocity + eos.sound_speed(l)).max(r.gas.velocity + eos.sound_speed(r));
+        let speed = sl.abs().max(sr.abs());
+        if sl >= 0. {
+            return Ok((fl, speed));
+        }
+        if sr <= 0. {
+            return Ok((fr, speed));
+        }
+        let hlle = || {
+            let mut f = [0.; 5];
+            for k in 0..5 {
+                f[k] = (sr * fl[k] - sl * fr[k] + sl * sr * (ur[k] - ul[k])) / (sr - sl);
+            }
+            f
+        };
+        if low_order {
+            return Ok((hlle(), speed));
+        }
+        let dl = l.gas.density * (sl - l.gas.velocity);
+        let dr = r.gas.density * (sr - r.gas.velocity);
+        let sm = (r.gas.pressure - l.gas.pressure + dl * l.gas.velocity - dr * r.gas.velocity)
+            / (dl - dr);
+        let (q, u, f, s) = if sm >= 0. {
+            (l, ul, fl, sl)
+        } else {
+            (r, ur, fr, sr)
+        };
+        let rho_star = q.gas.density * (s - q.gas.velocity) / (s - sm);
+        let pressure_star =
+            q.gas.pressure + q.gas.density * (s - q.gas.velocity) * (sm - q.gas.velocity);
+        let energy_star = ((s - q.gas.velocity) * u[2] - q.gas.pressure * q.gas.velocity
+            + pressure_star * sm)
+            / (s - sm);
+        let star = [
+            rho_star,
+            rho_star * sm,
+            energy_star,
+            rho_star * q.fresh_air_fraction,
+            rho_star * q.fuel_fraction,
+        ];
+        if !sm.is_finite()
+            || sm <= sl
+            || sm >= sr
+            || pressure_star <= 0.
+            || eos.state(star).is_err()
+        {
+            return Ok((hlle(), speed));
+        }
+        let mut flux = f;
+        for k in 0..5 {
+            flux[k] += s * (star[k] - u[k]);
+        }
+        // A contact transports the donor fractions with exactly the computed
+        // mass flux. Separate subtractions at vanishing flow can otherwise
+        // create a negative trace scalar despite a positive hydro state.
+        flux[3] = flux[0] * q.fresh_air_fraction;
+        flux[4] = flux[0] * q.fuel_fraction;
+        Ok((flux, speed))
+    }
+    fn fill_faces(
+        &mut self,
+        staged: bool,
+        boundaries: [SpeciesBoundary; 2],
+        low_order: bool,
+    ) -> Result<f64, &'static str> {
+        let u = if staged { &self.stage } else { &self.state };
+        let ghost = |side: usize| -> Result<SpeciesState, &'static str> {
+            let q = self.eos.state(u[if side == 0 { 0 } else { u.len() - 1 }])?;
+            Ok(match boundaries[side] {
+                SpeciesBoundary::Reservoir(q) => q,
+                SpeciesBoundary::Periodic => {
+                    self.eos.state(u[if side == 0 { u.len() - 1 } else { 0 }])?
+                }
+                SpeciesBoundary::Reflective => SpeciesState {
+                    gas: Primitive {
+                        velocity: -q.gas.velocity,
+                        ..q.gas
+                    },
+                    ..q
+                },
+                _ => q,
+            })
+        };
+        let mut maximum = 0_f64;
+        for face in 0..=u.len() {
+            let l = if face == 0 {
+                ghost(0)?
+            } else {
+                self.eos.state(u[face - 1])?
+            };
+            let r = if face == u.len() {
+                ghost(1)?
+            } else {
+                self.eos.state(u[face])?
+            };
+            let (f, speed) = Self::flux(self.eos, l, r, low_order)?;
+            self.faces[face] = f;
+            maximum = maximum.max(speed);
+        }
+        if let SpeciesBoundary::Flux(f) = boundaries[0] {
+            self.faces[0] = f;
+        }
+        if let SpeciesBoundary::Flux(f) = boundaries[1] {
+            self.faces[u.len()] = f;
+        }
+        Ok(maximum)
+    }
+    fn trial(
+        &mut self,
+        dt: f64,
+        boundaries: [SpeciesBoundary; 2],
+        low_order: bool,
+    ) -> Result<[SpeciesConserved; 2], &'static str> {
+        let ratio = dt / self.dx();
+        if self.fill_faces(false, boundaries, low_order)? * ratio > 0.48 {
+            return Err("Species CFL trial");
+        }
+        let first = [self.faces[0], self.faces[self.cells()]];
+        for i in 0..self.cells() {
+            for k in 0..5 {
+                self.stage[i][k] =
+                    self.state[i][k] - ratio * (self.faces[i + 1][k] - self.faces[i][k]);
+            }
+            self.eos.state(self.stage[i])?;
+        }
+        if self.fill_faces(true, boundaries, low_order)? * ratio > 0.48 {
+            return Err("Species CFL stage");
+        }
+        for i in 0..self.cells() {
+            for k in 0..5 {
+                self.next[i][k] = 0.5
+                    * (self.state[i][k] + self.stage[i][k]
+                        - ratio * (self.faces[i + 1][k] - self.faces[i][k]));
+            }
+            self.eos.state(self.next[i])?;
+        }
+        let mut exchange = [[0.; 5]; 2];
+        for side in 0..2 {
+            for k in 0..5 {
+                let last = self.faces[if side == 0 { 0 } else { self.cells() }][k];
+                exchange[side][k] = (if side == 0 { 1. } else { -1. })
+                    * self.area
+                    * dt
+                    * 0.5
+                    * (first[side][k] + last);
+            }
+        }
+        Ok(exchange)
+    }
+    pub fn advance(
+        &mut self,
+        seconds: f64,
+        boundaries: [SpeciesBoundary; 2],
+    ) -> Result<(), &'static str> {
+        if !(0.0..=0.05).contains(&seconds)
+            || matches!(boundaries[0], SpeciesBoundary::Periodic)
+                != matches!(boundaries[1], SpeciesBoundary::Periodic)
+        {
+            return Err("Invalid species pipe interval/boundaries");
+        }
+        for b in boundaries {
+            match b {
+                SpeciesBoundary::Reservoir(q) => {
+                    self.eos.conserved(q)?;
+                }
+                SpeciesBoundary::Flux(f) if f.iter().any(|v| !v.is_finite()) => {
+                    return Err("Nonfinite species flux");
+                }
+                _ => (),
+            }
+        }
+        let mut remaining = seconds;
+        let mut substeps = 0;
+        while remaining > seconds * 1e-12 {
+            substeps += 1;
+            if substeps > MAX_SUBSTEPS {
+                return Err("Species substep budget exhausted");
+            }
+            let mut dt = remaining.min(self.stable_time_step());
+            let mut accepted = None;
+            for attempt in 0..14 {
+                match self.trial(dt, boundaries, attempt > 0) {
+                    Ok(exchange) => {
+                        accepted = Some(exchange);
+                        break;
+                    }
+                    Err(_) => {
+                        self.rejected_trials += 1;
+                        dt *= 0.5;
+                    }
+                }
+            }
+            let exchange = accepted.ok_or("Species positivity/EOS recovery exhausted")?;
+            std::mem::swap(&mut self.state, &mut self.next);
+            for (side, values) in exchange.iter().enumerate() {
+                for (k, value) in values.iter().enumerate() {
+                    self.boundary_by_side[side][k] += value;
+                }
+            }
+            remaining -= dt;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod species_tests {
+    use super::*;
+    use crate::physical::thermo::GasState;
+
+    #[test]
+    fn shared_eos_matches_cylinder_energy_pressure_and_temperature() {
+        let eos = GasEquation::SharedMixture;
+        for (fresh, fuel) in [(1., 0.), (0., 0.), (0.2, 0.03), (0.1, 0.7)] {
+            for temperature in [200., 298.15, 673., 1800., 3500.] {
+                let q = eos.at_pressure(220000., temperature, fresh, fuel).unwrap();
+                let u = eos.conserved(q).unwrap();
+                let cylinder = GasState::new(
+                    q.gas.density * 0.001,
+                    temperature,
+                    0.001,
+                    Mixture::from_fractions(fresh, fuel),
+                )
+                .unwrap();
+                assert!((u[2] * 0.001 - cylinder.internal_energy_j()).abs() < 1e-9);
+                let back = eos.state(u).unwrap();
+                assert!((eos.temperature(back) - cylinder.temperature_k()).abs() < 1e-8);
+                assert!((back.gas.pressure - cylinder.pressure_pa()).abs() < 1e-6);
+            }
+        }
+        assert!(eos.at_pressure(101325., 673., 0.8, 0.3).is_err());
+        assert!(eos.at_pressure(101325., 199., 0.5, 0.).is_err());
+    }
+
+    #[test]
+    fn mixing_species_at_common_reference_does_not_release_chemical_energy() {
+        let eos = GasEquation::SharedMixture;
+        let air = eos
+            .conserved(eos.at_pressure(101325., 298.15, 1., 0.).unwrap())
+            .unwrap();
+        let fuel = eos
+            .conserved(eos.at_pressure(101325., 298.15, 0., 1.).unwrap())
+            .unwrap();
+        let mixed = std::array::from_fn(|k| 0.3 * air[k] + 0.7 * fuel[k]);
+        let q = eos.state(mixed).unwrap();
+        assert!((eos.temperature(q) - 298.15).abs() < 1e-9);
+        assert!((mixed[2] - (0.3 * air[2] + 0.7 * fuel[2])).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fixed_eos_reduces_to_legacy_euler_energy_and_uniform_flux() {
+        let eos = GasEquation::Fixed {
+            gamma: 1.4,
+            gas_constant: 287.,
+        };
+        let mut q = eos.at_pressure(101325., 673., 0.2, 0.03).unwrap();
+        q.gas.velocity = 125.;
+        let u = eos.conserved(q).unwrap();
+        let old = q.gas.conserved(1.4);
+        for k in 0..3 {
+            assert!((u[k] - old[k]).abs() < 1e-9);
+        }
+        let flux = SpeciesPipe::interface_flux(eos, q, q).unwrap();
+        let legacy = EulerPipe::interface_flux(q.gas, q.gas, 1.4).unwrap();
+        for k in 0..3 {
+            assert!((flux[k] - legacy[k]).abs() < 1e-7);
+        }
+        assert!((flux[3] - flux[0] * 0.2).abs() < 1e-12);
+        assert!((flux[4] - flux[0] * 0.03).abs() < 1e-12);
+        let mut pipe = SpeciesPipe::new(1., 0.01, 64, eos, q).unwrap();
+        let initial = pipe.totals();
+        pipe.advance(0.002, [SpeciesBoundary::Periodic; 2]).unwrap();
+        for (after, before) in pipe.totals().iter().zip(initial) {
+            assert!((after - before).abs() < 1e-9);
+        }
+    }
+
+    fn advected_species_error(cells: usize) -> f64 {
+        let eos = GasEquation::Fixed {
+            gamma: 1.4,
+            gas_constant: 287.,
+        };
+        let mut base = eos.at_pressure(101325., 673., 0.2, 0.05).unwrap();
+        base.gas.velocity = 100.;
+        let mut pipe = SpeciesPipe::new(1., 0.01, cells, eos, base).unwrap();
+        let profile = |x: f64| 0.2 + 0.1 * (std::f64::consts::TAU * x).sin();
+        pipe.initialize(|x| SpeciesState {
+            fresh_air_fraction: profile(x),
+            ..base
+        })
+        .unwrap();
+        let initial = pipe.totals();
+        pipe.advance(0.003, [SpeciesBoundary::Periodic; 2]).unwrap();
+        let mut error = 0.;
+        for i in 0..cells {
+            let q = pipe.state(i).unwrap();
+            error += (q.fresh_air_fraction - profile((i as f64 + 0.5) * pipe.dx() - 0.3)).abs()
+                / cells as f64;
+            assert!((q.gas.pressure - 101325.).abs() < 1e-6);
+        }
+        for (after, before) in pipe.totals().iter().zip(initial) {
+            assert!((after - before).abs() < 1e-8);
+        }
+        error
+    }
+
+    #[test]
+    fn conservative_species_front_advects_and_converges_with_refinement() {
+        let coarse = advected_species_error(64);
+        let medium = advected_species_error(128);
+        let fine = advected_species_error(256);
+        eprintln!("species L1 errors 64/128/256: {coarse:.8e}/{medium:.8e}/{fine:.8e}");
+        assert!(medium < coarse * 0.6 && fine < medium * 0.6);
+    }
+
+    #[test]
+    fn species_ssp_rk2_converges_in_time_against_semidiscrete_advection() {
+        let eos = GasEquation::Fixed {
+            gamma: 1.4,
+            gas_constant: 287.,
+        };
+        let mut base = eos.at_pressure(101325., 673., 0.2, 0.05).unwrap();
+        base.gas.velocity = 100.;
+        let mut errors = Vec::new();
+        for factor in [1, 2, 4] {
+            let mut pipe = SpeciesPipe::new(1., 0.01, 32, eos, base).unwrap();
+            pipe.initialize(|x| SpeciesState {
+                fresh_air_fraction: 0.2 + 0.1 * (std::f64::consts::TAU * x).sin(),
+                ..base
+            })
+            .unwrap();
+            let duration = 0.001;
+            let steps = (duration / pipe.stable_time_step()).ceil() as usize * factor;
+            let dt = duration / steps as f64;
+            for _ in 0..steps {
+                pipe.advance(dt, [SpeciesBoundary::Periodic; 2]).unwrap();
+            }
+            let theta = std::f64::consts::TAU * pipe.dx();
+            let real = -100. / pipe.dx() * (1. - theta.cos());
+            let imaginary = -100. / pipe.dx() * theta.sin();
+            let error = (0..pipe.cells())
+                .map(|i| {
+                    let x = (i as f64 + 0.5) * pipe.dx();
+                    let exact = 0.2
+                        + 0.1
+                            * (real * duration).exp()
+                            * (std::f64::consts::TAU * x + imaginary * duration).sin();
+                    (pipe.state(i).unwrap().fresh_air_fraction - exact).abs() / pipe.cells() as f64
+                })
+                .sum::<f64>();
+            errors.push(error);
+        }
+        eprintln!("species temporal RK2 errors dt/dt2/dt4: {errors:?}");
+        assert!(errors[1] < errors[0] * 0.3 && errors[2] < errors[1] * 0.3);
+    }
+
+    #[test]
+    fn shared_eos_periodic_contact_closes_all_five_inventories() {
+        let eos = GasEquation::SharedMixture;
+        let base = eos.at_pressure(101325., 673., 0.2, 0.03).unwrap();
+        let mut pipe = SpeciesPipe::new(1., 0.01, 96, eos, base).unwrap();
+        pipe.initialize(|x| {
+            let fresh = 0.25 + 0.2 * (std::f64::consts::TAU * x).sin();
+            let mut q = eos.at_pressure(101325., 673., fresh, 0.03).unwrap();
+            q.gas.velocity = 80.;
+            q
+        })
+        .unwrap();
+        let initial = pipe.totals();
+        pipe.advance(0.002, [SpeciesBoundary::Periodic; 2]).unwrap();
+        for (after, before) in pipe.totals().iter().zip(initial) {
+            assert!((after - before).abs() < 1e-8);
+        }
+        let maximum = (0..pipe.cells())
+            .map(|i| (pipe.state(i).unwrap().gas.pressure - 101325.).abs())
+            .fold(0., f64::max);
+        eprintln!("variable EOS conservative contact pressure error: {maximum:.6} Pa");
+        // Conservation is not an exact-pressure multi-EOS contact guarantee.
+        assert!(maximum < 200.);
+    }
+
+    #[test]
+    fn material_contact_quantifies_variable_eos_pressure_error_against_fixed_reduction() {
+        for eos in [
+            GasEquation::Fixed {
+                gamma: 1.4,
+                gas_constant: 287.,
+            },
+            GasEquation::SharedMixture,
+        ] {
+            let base = eos.at_pressure(101325., 673., 0.2, 0.03).unwrap();
+            let mut pipe = SpeciesPipe::new(1., 0.01, 128, eos, base).unwrap();
+            pipe.initialize(|x| {
+                let (t, a, f) = if x < 0.5 {
+                    (500., 0.8, 0.02)
+                } else {
+                    (1100., 0.1, 0.12)
+                };
+                let mut q = eos.at_pressure(101325., t, a, f).unwrap();
+                q.gas.velocity = 100.;
+                q
+            })
+            .unwrap();
+            let initial = pipe.totals();
+            pipe.advance(0.001, [SpeciesBoundary::Periodic; 2]).unwrap();
+            for (after, before) in pipe.totals().iter().zip(initial) {
+                assert!((after - before).abs() < 1e-8);
+            }
+            let maximum = (0..pipe.cells())
+                .map(|i| (pipe.state(i).unwrap().gas.pressure - 101325.).abs())
+                .fold(0., f64::max);
+            eprintln!("material contact {eos:?} max pressure departure: {maximum:.6} Pa");
+            match eos {
+                GasEquation::Fixed { .. } => assert!(maximum < 1e-6),
+                // An explicit known limitation, not a measured accuracy gate:
+                // conservative mixing across different T/cv produces pressure
+                // errors. Do not erase them with nonconservative double-flux.
+                GasEquation::SharedMixture => assert!(maximum > 1e-3 && maximum < 20000.),
+            }
+        }
     }
 }
 

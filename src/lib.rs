@@ -19,6 +19,7 @@ pub mod export;
 pub mod export_job;
 pub mod hybrid;
 pub mod maps;
+pub mod measured_reference;
 pub mod output_limiter;
 mod period;
 pub mod physical;

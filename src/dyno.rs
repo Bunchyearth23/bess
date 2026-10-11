@@ -62,6 +62,12 @@ pub fn key(scratch: &Scratch) -> Scratch {
     key.experimental.primary_1d =
         scratch.experimental.primary_1d && scratch.experimental.wave_coupling;
     key.experimental.knock = scratch.experimental.knock;
+    key.experimental.intake_wave_coupling = scratch.experimental.intake_wave_coupling;
+    key.experimental.fuel_transients = scratch.experimental.fuel_transients;
+    key.experimental.predictive_combustion = scratch.experimental.predictive_combustion;
+    key.experimental.turbo_model = scratch.experimental.turbo_model;
+    key.experimental.torsion = scratch.experimental.torsion;
+    // Structural transfer observes forces only; it cannot change the dyno.
     key.design.bank_delay_ms = 0.;
     key.design.bank_gain_db = 0.;
     // With feedback every propagation/damping control can change the valve
@@ -74,6 +80,10 @@ pub fn key(scratch: &Scratch) -> Scratch {
         key.sound.muffler_volume_scale = sound.muffler_volume_scale;
         key.sound.muffler_absorption = sound.muffler_absorption;
         key.sound.exhaust_decay_ms = sound.exhaust_decay_ms;
+    }
+    if scratch.experimental.intake_wave_coupling {
+        key.experimental.native_rate_acoustics = scratch.experimental.native_rate_acoustics;
+        key.sound.intake_length_m = sound.intake_length_m;
     }
     // Dormant event/calibration data cannot create another physical dyno key.
     crate::engine_definition::EngineDefinition::from_scratch(&key).to_scratch()
@@ -95,7 +105,7 @@ pub fn sweep_with(
     // Coupled acoustics feed valve flow: use the chosen 48 kHz output policy,
     // including its 2x synthesis when selected. Keep the cheaper 8 kHz only
     // for prescribed flow, where the wave propagation never changes torque.
-    let rate = if scratch.experimental.wave_coupling {
+    let rate = if scratch.experimental.wave_coupling || scratch.experimental.intake_wave_coupling {
         scratch.synthesis_rate(48000)
     } else {
         RATE

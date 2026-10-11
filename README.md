@@ -1,5 +1,7 @@
 # BESS — Bunchy's Engine Synthesis System
 
+Current release: **0.12.0**. See the [release notes](RELEASE_NOTES_0.12.0.md) for the simulation additions and their remaining qualification gates.
+
 BESS is a Windows engine sound workshop built with Rust, egui and BDSP. It reads an Automation vehicle ZIP, builds a physical engine from its verified engine data, and exports a complete vehicle ZIP with the original configuration and a separate selectable BESS sound variant for BeamNG.drive. The same physical engine also powers engines designed from scratch.
 
 There are two listening choices:

@@ -71,6 +71,16 @@ pub struct ExperimentalSpec {
     /// Reduce low-speed WOT intake advance to avoid excessive overlap.
     /// An explicit alternative schedule, not a measured engine map.
     pub vvt_overlap_safe: bool,
+    /// Independent experimental intake-wave feedback; legacy exhaust unchanged.
+    pub intake_wave_coupling: bool,
+    /// Explicit reduced liquid/film/vapour model. None preserves old projects.
+    pub fuel_transients: Option<crate::physical::fuel_transient::FuelTransientConfig>,
+    /// State-dependent reduced flame propagation; coefficients are estimates.
+    pub predictive_combustion:
+        Option<crate::physical::combustion_model::PredictiveCombustionConfig>,
+    pub turbo_model: Option<crate::physical::turbo_map::TurboModel>,
+    pub torsion: Option<crate::physical::crank::TorsionConfig>,
+    pub mechanical_transfer: Option<crate::physical::structural::StructuralResponse>,
 }
 
 impl Default for ExperimentalSpec {
@@ -99,12 +109,37 @@ impl Default for ExperimentalSpec {
             primary_1d: false,
             coupled_level_db: 0.,
             vvt_overlap_safe: false,
+            intake_wave_coupling: false,
+            fuel_transients: None,
+            predictive_combustion: None,
+            turbo_model: None,
+            torsion: None,
+            mechanical_transfer: None,
         }
     }
 }
 
 impl ExperimentalSpec {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(model) = self.turbo_model {
+            model.validate()?;
+        }
+        if let Some(config) = self.torsion {
+            config.validate()?;
+        }
+        if let Some(response) = self.mechanical_transfer {
+            response.validate()?;
+        }
+        if let Some(config) = self.fuel_transients {
+            config
+                .validate()
+                .map_err(|e| format!("Fuel transient model: {e:?}"))?;
+        }
+        if let Some(config) = self.predictive_combustion {
+            config
+                .validate()
+                .map_err(|e| format!("Predictive combustion model: {e:?}"))?;
+        }
         if self.primary_1d && self.wave_coupling {
             return Err("Primary 1D currently supports prescribed flow only: disable wave coupling; the finite-volume and valve ports do not yet share a thermodynamic reference".into());
         }

@@ -1,6 +1,9 @@
 /target/
 /.inspect-bdsp/
 /output/
+/artifacts/
+/out/
+/work/
 /outputs/physical-*/
 /dist/
 /*.zip

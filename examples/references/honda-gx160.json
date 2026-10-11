@@ -1,0 +1,235 @@
+{
+  "version": 1,
+  "provenance": {
+    "origin": "manufacturer_published",
+    "engine_id": "Honda GX160, current EU net ratings",
+    "source_uri": "https://www.honda-engines-eu.com/en/products/power-units/gx160",
+    "instrument_and_conditions": "Consulted 2026-10-11: production-engine net ratings, SAE J1349. No raw dynamometer uncertainty, throttle, temperatures, MAP, lambda or audio supplied. WOT=1 is a bench assumption. 3600-rpm torque derived as 3600 W / (3600 rpm * 2pi/60). Bore/stroke/compression/OHV/carburated single fixed. Cam=.15, exhaust=35 mm (model minimum), generic manifolds/valves/walls/friction, muffler, inertia, idle=1400/redline=4000 are estimates. No compression fitting to published ratings."
+  },
+  "engine": {
+    "design": {
+      "layout": "inline",
+      "cylinders": 1,
+      "bank_angle": 0.0,
+      "pins": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "banks": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "cam_revolutions": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "firing_order": [
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "order_len": 1,
+      "bank_gain_db": 0.0,
+      "bank_delay_ms": 0.0
+    },
+    "build": {
+      "bore_mm": 68.0,
+      "stroke_mm": 45.0,
+      "block": "aluminium",
+      "head": "pushrod",
+      "valves": 2,
+      "crank": "cast",
+      "compression": 9.0,
+      "cam": 0.15,
+      "vvt": false,
+      "aspiration": "natural",
+      "boost_bar": 0.8,
+      "blow_off": "recirculating",
+      "fuel": "carburettor",
+      "throttle": "single",
+      "headers": "cast_manifold",
+      "crossover": "none",
+      "exhaust_mm": 35.0,
+      "catalyst": "none",
+      "muffler": "baffled"
+    },
+    "idle_rpm": 1400.0,
+    "redline_rpm": 4000.0,
+    "experimental": {
+      "level": 0.06,
+      "rpm_rise_db": 4.0,
+      "load_rise_db": 6.0,
+      "body": 0.55,
+      "sharpness": 0.4,
+      "brightness": 0.0,
+      "rasp": 0.35,
+      "tonal": 0.8,
+      "flow": 0.3,
+      "crackle": 0.25,
+      "variation": 0.08,
+      "tone_db": [
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "noise_db": [
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "cam": 0.3,
+      "idle_cov": 0.07,
+      "direct_injection": false,
+      "afterfire": 0.0,
+      "knock": 0.0,
+      "wave_coupling": false,
+      "native_rate_acoustics": false,
+      "primary_1d": false,
+      "coupled_level_db": 0.0,
+      "vvt_overlap_safe": false,
+      "intake_wave_coupling": false,
+      "fuel_transients": null,
+      "predictive_combustion": null,
+      "turbo_model": null,
+      "torsion": null,
+      "mechanical_transfer": null
+    },
+    "inertia": 0.22,
+    "sound": {
+      "exhaust_bass_db": 0.0,
+      "exhaust_body_db": 0.0,
+      "exhaust_body_hz": 250.0,
+      "exhaust_body_q": 1.0,
+      "exhaust_rasp_db": 0.0,
+      "exhaust_low_cut_hz": 20.0,
+      "exhaust_high_cut_hz": 20000.0,
+      "exhaust_drive": 0.0,
+      "bass_db": 0.0,
+      "presence_db": 0.0,
+      "treble_db": 0.0,
+      "brightness_hz": 20000.0,
+      "drive": 0.0,
+      "flow_texture": 0.0,
+      "rpm_brightness_db": 0.0,
+      "load_brightness_db": 0.0,
+      "intake_length_m": 0.38,
+      "intake_resonance": 0.0,
+      "intake_air_noise": 0.008,
+      "mechanical_pitch_hz": 2400.0,
+      "mechanical_resonance": 2.0,
+      "cycle_variation": 1.0,
+      "combustion_duration": 1.0,
+      "ignition_retard_deg": 0.0,
+      "primary_length_scale": 1.0,
+      "tail_length_m": 1.4,
+      "exhaust_decay_ms": 120.0,
+      "muffler_volume_scale": 1.0,
+      "muffler_absorption": 0.4
+    }
+  },
+  "acceptance": {
+    "declared_before_fitting": "Before first GX160 run: exploratory 10% of the 10.3 Nm peak = 1.03 Nm absolute at both points. Engineering target, not Honda uncertainty. Comparison-only, no identification performed.",
+    "absolute": {
+      "torque_nm": 1.03,
+      "map_pa": null,
+      "lambda": null
+    }
+  },
+  "points": [
+    {
+      "id": "gx160-net-2500",
+      "split": "identification",
+      "rpm": 2500.0,
+      "throttle": 1.0,
+      "settle_s": 2.0,
+      "average_s": 2.0,
+      "observed": {
+        "torque_nm": 10.3,
+        "map_pa": null,
+        "lambda": null
+      }
+    },
+    {
+      "id": "gx160-net-3600",
+      "split": "validation",
+      "rpm": 3600.0,
+      "throttle": 1.0,
+      "settle_s": 2.0,
+      "average_s": 2.0,
+      "observed": {
+        "torque_nm": 9.549296585513721,
+        "map_pa": null,
+        "lambda": null
+      }
+    }
+  ]
+}
