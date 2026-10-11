@@ -21,3 +21,7 @@ La compilation release 0.12.0 termine avec code zéro en 3 min 21 s. Un lancemen
 `target/release/bess.exe` et la copie livrée `D:\Desktop\BESS.exe` ont le même SHA-256 : **003C8CA32BE817038C3D59514C37FAAB0AAFBE0CB0111137FCF5239360978648**.
 
 L'ancien exécutable bureau est conservé et vérifié dans `output/release-0.12.0/desktop-before.exe`, SHA-256 **38836CF5DD87D4F60DD2876A6837A03D8AAB3EBD1ED8DDA9415C90F8340AB9BF**. Le reçu `output/release-0.12.0/verification.json` conserve les codes de retour, hashes et preuves; la vérification des références distantes complète ce reçu après publication. Aucun mod n'est réinstallé dans cette opération.
+
+## Publication des sources
+
+Le commit **`2e54a4087ea262c3f6108d773b7f8e32aa0fd96a`**, `Release BESS 0.12.0 with optional simulation models and qualification benches`, publie les 56 fichiers de la livraison sur `origin/main`. `git ls-remote origin refs/heads/main` confirme exactement ce SHA après le push. Le compte rendu et l'index sont ensuite enregistrés dans un commit documentaire; le tag annoté de livraison **`v0.12.0`** identifie cet état final. Le reçu local conserve la vérification finale distincte de `main`, de l'objet tag et de son commit cible.
