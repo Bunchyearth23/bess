@@ -65,6 +65,21 @@ fn old_project_missing_new_options_keeps_legacy_defaults() {
 }
 
 #[test]
+fn liquid_delivery_defaults_and_explicit_cylinder_roundtrip() {
+    use bess::physical::fuel_transient::FuelDelivery;
+    let mut value = serde_json::to_value(FuelTransientConfig::default()).unwrap();
+    value.as_object_mut().unwrap().remove("delivery");
+    let mut restored: FuelTransientConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.delivery, FuelDelivery::Admission);
+    restored.delivery = FuelDelivery::Cylinder;
+    restored.injection_start_deg = 550.;
+    restored.validate().unwrap();
+    let parsed: FuelTransientConfig =
+        serde_json::from_str(&serde_json::to_string(&restored).unwrap()).unwrap();
+    assert_eq!(parsed, restored);
+}
+
+#[test]
 fn enhanced_shared_definition_project_roundtrips_and_baseline_is_preserved() {
     let scratch = enhanced();
     let definition = EngineDefinition::from_scratch(&scratch);

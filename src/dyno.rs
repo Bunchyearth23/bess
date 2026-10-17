@@ -151,6 +151,11 @@ fn sweep_at_rate_with(
     );
     let mut curve = Curve::default();
     let boosted = scratch.build.aspiration != Aspiration::Natural;
+    // Film/charge inventories can drift while adjacent single-cycle torque
+    // means accidentally agree. Warm each point before testing convergence.
+    let fuel_settle_s = scratch.experimental.fuel_transients.map_or(0., |c| {
+        (4. * c.film_time_constant_s.max(c.droplet_time_constant_s)).min(MAX_SETTLE_S)
+    });
     let close = |a: f64, b: f64, floor: f64, tolerance: f64| {
         (a - b).abs() <= tolerance * a.abs().max(floor)
     };
@@ -171,7 +176,10 @@ fn sweep_at_rate_with(
         let (torque, map_kpa) = loop {
             let next = window(&mut engine, rpm, span, rate)?;
             elapsed += span * cycle;
-            let done = close(next.0, last.0, 10., TOLERANCE)
+            let done = elapsed >= fuel_settle_s
+                && close(next.0, last.0, 10., TOLERANCE)
+                && (scratch.experimental.fuel_transients.is_none()
+                    || close(next.1, last.1, 1., TOLERANCE))
                 && close(next.2, last.2, 1000., TURBO_TOLERANCE);
             let mean = ((last.0 + next.0) / 2., (last.1 + next.1) / 2.);
             last = next;

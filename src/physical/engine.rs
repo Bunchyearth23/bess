@@ -471,6 +471,20 @@ impl Engine {
     pub fn inertia(&self) -> f64 {
         f64::from(self.scratch.inertia)
     }
+
+    /// The clutch acts on the flywheel, whose inertia is distinct with torsion.
+    /// Cylinder phase and public combustion telemetry still follow the crank.
+    pub fn drive_shaft(&self) -> (f64, f64) {
+        self.scratch
+            .experimental
+            .torsion
+            .map_or((self.rpm, self.inertia()), |t| {
+                (
+                    self.crank.torsion_ledger().flywheel_rpm,
+                    self.inertia() * (1. - t.crank_inertia_fraction),
+                )
+            })
+    }
     pub fn state(&self) -> Sample {
         self.last
     }
@@ -1510,6 +1524,33 @@ fn crossed(from: f64, to: f64, event: f64) -> bool {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn liquid_fuel_idle_recovers_after_free_crank_release() {
+        on_large_stack(|| {
+            let mut scratch = Scratch::default();
+            scratch.experimental.fuel_transients = Some(Default::default());
+            let mut engine = Engine::new(&scratch, 8000).unwrap();
+            let mut sum = 0.;
+            for frame in 0..80000 {
+                let s = engine.next(Commands {
+                    imposed_rpm: (frame < 8000).then_some(1200.),
+                    throttle: 0.,
+                    ..Default::default()
+                });
+                assert!(!engine.failed());
+                if frame >= 64000 {
+                    sum += s.rpm;
+                }
+            }
+            assert!(
+                (sum / 16000. - f64::from(scratch.idle_rpm)).abs()
+                    < f64::from(scratch.idle_rpm) * 0.1,
+                "mean RPM {}",
+                sum / 16000.
+            );
+        });
+    }
 
     fn on_large_stack(f: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()

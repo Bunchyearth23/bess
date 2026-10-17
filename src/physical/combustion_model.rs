@@ -16,6 +16,11 @@ pub struct PredictiveCombustionConfig {
     pub pressure_exponent: f64,
     pub turbulence_gain: f64,
     pub dilution_penalty: f64,
+    /// Reduced-model calibration anchor, not a measured engine fit. The default
+    /// is a 60-degree Wiebe span at 1500 rpm on the historical 86 mm cylinder.
+    pub reference_burn_duration_s: f64,
+    pub reference_bore_m: f64,
+    pub reference_piston_speed_m_s: f64,
 }
 impl Default for PredictiveCombustionConfig {
     fn default() -> Self {
@@ -28,6 +33,9 @@ impl Default for PredictiveCombustionConfig {
             pressure_exponent: -0.15,
             turbulence_gain: 1.2,
             dilution_penalty: 2.5,
+            reference_burn_duration_s: 60. / (6. * 1500.),
+            reference_bore_m: 0.086,
+            reference_piston_speed_m_s: 4.3,
         }
     }
 }
@@ -41,6 +49,9 @@ impl PredictiveCombustionConfig {
             || !(-1.0..=1.).contains(&self.pressure_exponent)
             || !(0.0..=5.).contains(&self.turbulence_gain)
             || !(0.0..=10.).contains(&self.dilution_penalty)
+            || !(0.00005..=0.08).contains(&self.reference_burn_duration_s)
+            || !(0.01..=1.).contains(&self.reference_bore_m)
+            || !(0.1..=100.).contains(&self.reference_piston_speed_m_s)
         {
             return Err(ThermoError::InvalidCombustion);
         }
@@ -60,9 +71,19 @@ impl PredictiveCombustionConfig {
                 * estimated_turbulence
                 * (laminar / self.reference_flame_speed_m_s).sqrt();
         let variability = (0.08 * s.variation * s.innovation * (1. + 2. * dilution)).exp();
-        let duration_s = (0.7 * s.bore_m / speed.max(0.05) * variability).clamp(0.00005, 0.08);
+        // A geometric traversal time is not a complete Wiebe heat-release span.
+        // Anchor the latter explicitly, retaining state/geometry sensitivity.
+        // Keep nominal speed independent of the user's flame-speed/turbulence
+        // coefficients so editing those still changes actual burn timing.
+        let reference_speed = 0.65 + 1.2 * 0.5 * self.reference_piston_speed_m_s;
+        let speed_ratio = reference_speed / speed.max(0.05);
+        let duration_s = (self.reference_burn_duration_s * s.bore_m / self.reference_bore_m
+            * speed_ratio
+            * variability)
+            .clamp(0.00005, 0.08);
         let development_s = (self.reference_development_s
             * (self.reference_flame_speed_m_s / laminar.max(0.02)).sqrt()
+            * speed_ratio
             * variability)
             .clamp(0.00001, 0.02);
         // Low-energy diluted/very lean mixtures are less stable. The random
@@ -147,6 +168,42 @@ mod tests {
         );
         assert!(high_pressure.laminar_speed_m_s < base.laminar_speed_m_s);
         assert!(lean.duration_s > base.duration_s);
+    }
+
+    #[test]
+    fn explicit_reference_anchor_preserves_duration_and_legacy_json() {
+        let c = PredictiveCombustionConfig::default();
+        let p = c.predict(FlameState {
+            lambda: 0.95,
+            fresh_fraction: 1.,
+            ..state()
+        });
+        assert!((p.duration_s - c.reference_burn_duration_s).abs() < 1e-12);
+        assert!((p.development_s - c.reference_development_s).abs() < 1e-12);
+        let mut old = serde_json::to_value(c).unwrap();
+        for field in [
+            "reference_burn_duration_s",
+            "reference_bore_m",
+            "reference_piston_speed_m_s",
+        ] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(
+            serde_json::from_value::<PredictiveCombustionConfig>(old).unwrap(),
+            c
+        );
+        // At representative warm loads, avoid a >200-degree Wiebe span;
+        // this does not forbid slow/cold/lean mixtures from burning poorly.
+        for rpm in [850., 3000., 5500., 6900.] {
+            let p = c.predict(FlameState {
+                mean_piston_speed_m_s: 2. * 0.086 * rpm / 60.,
+                ..state()
+            });
+            let span = p.duration_s * rpm * 6.;
+            let ca50 = -35. + p.development_s * rpm * 6. + 0.516 * span;
+            assert!((30.0..100.).contains(&span), "{rpm}: {span}");
+            assert!((-10.0..40.).contains(&ca50), "{rpm}: {ca50}");
+        }
     }
 
     #[test]

@@ -95,6 +95,10 @@ impl AutomationVoice {
         self.engine.inertia()
     }
 
+    pub fn drive_shaft(&self) -> (f64, f64) {
+        self.engine.drive_shaft()
+    }
+
     pub fn rpm_range(&self) -> (f32, f32) {
         self.rpm_range
     }

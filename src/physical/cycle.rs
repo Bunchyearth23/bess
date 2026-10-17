@@ -214,6 +214,11 @@ pub struct CycleCylinder {
     intake_port_inflow: f64,
     fuel_transient_config: Option<FuelTransientConfig>,
     fuel_transient: FuelTransient,
+    /// Net inlet inventories since the preceding injection event. This causal
+    /// filling estimate meters the next pulse, independently of fuel cut.
+    fuel_meter_air_kg: f64,
+    fuel_meter_vapor_kg: f64,
+    fuel_meter_ready: bool,
     predictive_combustion: Option<PredictiveCombustionConfig>,
     /// Previous joint-solve inflow (kg/s), the next solve's starting point.
     port_inflow: f64,
@@ -292,6 +297,9 @@ impl CycleCylinder {
             intake_port_inflow: 0.,
             fuel_transient_config: None,
             fuel_transient: FuelTransient::default(),
+            fuel_meter_air_kg: 0.,
+            fuel_meter_vapor_kg: 0.,
+            fuel_meter_ready: false,
             predictive_combustion: None,
             port_inflow: 0.,
         })
@@ -424,6 +432,9 @@ impl CycleCylinder {
         self.intake_port = None;
         self.intake_port_inflow = 0.;
         self.fuel_transient = FuelTransient::default();
+        self.fuel_meter_air_kg = 0.;
+        self.fuel_meter_vapor_kg = 0.;
+        self.fuel_meter_ready = false;
     }
 
     fn uniform(&mut self) -> f64 {
@@ -636,14 +647,31 @@ impl CycleCylinder {
         let fuel_transfer = self
             .fuel_transient_config
             .map_or(FuelTransfer::default(), |c| {
-                // Speed-density estimate, not a measured injector calibration. The
-                // reservoir's already-carried fuel reduces the new pulse command.
+                // The first pulse has no filling history: bootstrap using speed
+                // density. Subsequent pulses use actual net admitted fresh air
+                // and already-carried vapor from the preceding injection cycle.
+                // A single instantaneous reservoir pressure cannot represent
+                // filling under valve restriction or pressure-wave feedback.
                 let dose_fraction = (input.intake_fresh_air_fraction * input.fuel_multiplier / AFR
                     - input.intake_fuel_fraction)
                     .max(0.);
-                let dose = self.geometry.displacement_m3() * input.intake.pressure_pa
+                let bootstrap = self.geometry.displacement_m3() * input.intake.pressure_pa
                     / (intake_mixture().gas_constant() * input.intake.temperature_k)
                     * dose_fraction;
+                let dose = if self.fuel_meter_ready {
+                    (self.fuel_meter_air_kg.max(0.) * input.fuel_multiplier / AFR
+                        - self.fuel_meter_vapor_kg.max(0.))
+                    .max(0.)
+                } else {
+                    bootstrap
+                };
+                if FuelTransient::injection_start(c, local0, local1).is_some() {
+                    self.fuel_meter_ready = true;
+                    self.fuel_meter_air_kg = 0.;
+                    self.fuel_meter_vapor_kg = 0.;
+                }
+                self.fuel_meter_air_kg += intake_fresh;
+                self.fuel_meter_vapor_kg += intake_fuel;
                 self.fuel_transient.step(
                     c,
                     FuelStep {
@@ -656,10 +684,20 @@ impl CycleCylinder {
                         wall_temperature_k: self.wall_temperature,
                         gas_temperature_k: temperature0,
                         intake_turnover: intake_in / mass0,
-                        available_evaporation_heat_j: (gas.internal_energy_j()
-                            - mass0 * gas.mixture().internal_energy(200.))
-                        .max(0.)
-                            * 0.05,
+                        // Admission delivery retains liquid until incoming air
+                        // can carry it into the cylinder. Releasing port fuel
+                        // during the exhaust stroke spuriously ejects it.
+                        // Evaporation/transport are lumped, not a port-vapor
+                        // solver; explicit cylinder delivery remains ungated.
+                        available_evaporation_heat_j: if intake_in > 0.
+                            || c.delivery == super::fuel_transient::FuelDelivery::Cylinder
+                        {
+                            (gas.internal_energy_j() - mass0 * gas.mixture().internal_energy(200.))
+                                .max(0.)
+                                * 0.05
+                        } else {
+                            0.
+                        },
                     },
                 )
             });
@@ -936,18 +974,31 @@ mod tests {
 
     #[test]
     fn fuel_transients_close_combined_liquid_gas_inventory_and_evaporation_energy() {
-        for temperature in [280., 450.] {
+        use super::super::fuel_transient::FuelDelivery;
+        // Keep the historical in-cylinder scenarios and their 0.75 s deadline.
+        // Admission cannot borrow hot compression gas for port evaporation:
+        // also qualify its slower cold delivery with the same heat/ledger gates.
+        for (delivery, temperature, frames) in [
+            (FuelDelivery::Cylinder, 280., 72000),
+            (FuelDelivery::Cylinder, 450., 72000),
+            (FuelDelivery::Admission, 280., 288000),
+            (FuelDelivery::Admission, 450., 288000),
+        ] {
             let mut cfg = config();
             cfg.wall_temperature_k = temperature;
             let mut cylinder = CycleCylinder::new(cfg, 0., 123).unwrap();
             cylinder
-                .set_fuel_transient(Some(FuelTransientConfig::default()))
+                .set_fuel_transient(Some(FuelTransientConfig {
+                    delivery,
+                    ..Default::default()
+                }))
                 .unwrap();
             cylinder
                 .set_predictive_combustion(Some(PredictiveCombustionConfig::default()))
                 .unwrap();
             let (mut fuel_balance, mut latent, mut heat, mut after_cut) = (0., 0., 0., 0.);
-            for frame in 1..=72000 {
+            let mut first_burn = None;
+            for frame in 1..=frames {
                 let time = f64::from(frame) / 96000.;
                 let cut = (0.4..0.55).contains(&time);
                 let out = cylinder
@@ -968,6 +1019,12 @@ mod tests {
                 assert!((fuel_balance - inventory).abs() < 1e-12);
                 assert!(out.fuel_transfer.mass_residual_kg().abs() < 1e-18);
                 assert!(out.fuel_transfer.energy_residual_j().abs() < 1e-11);
+                if delivery == FuelDelivery::Admission && out.intake_mass_kg <= 0. {
+                    assert_eq!(
+                        out.gas_fuel_added_kg, 0.,
+                        "port fuel needs incoming intake gas"
+                    );
+                }
                 assert!(out.ledger.residual_j().abs() < 1e-8);
                 assert!(
                     (out.ledger.mass_in_kg - out.ledger.mass_out_kg - out.intake_mass_kg
@@ -985,6 +1042,9 @@ mod tests {
                 );
                 latent += out.fuel_transfer.latent_heat_j;
                 heat += out.heat_j;
+                if out.heat_j > 0. && first_burn.is_none() {
+                    first_burn = Some(time);
+                }
                 if cut {
                     assert_eq!(out.injected_fuel_kg, 0.);
                     assert!(
@@ -994,7 +1054,13 @@ mod tests {
                     after_cut += out.gas_fuel_added_kg;
                 }
             }
-            assert!(latent > 0. && after_cut > 0. && heat > 10.);
+            println!(
+                "{delivery:?}: initial T={temperature}, first burn={first_burn:?}, latent={latent}, after_cut={after_cut}, heat={heat}"
+            );
+            assert!(
+                latent > 0. && after_cut > 0. && heat > 10.,
+                "{delivery:?}: temperature={temperature}, latent={latent}, after_cut={after_cut}, heat={heat}"
+            );
             assert!(
                 cylinder.set_fuel_transient(None).is_err(),
                 "cannot discard live film"
@@ -1002,6 +1068,70 @@ mod tests {
             cylinder.reset();
             assert_eq!(cylinder.fuel_transient.liquid_mass_kg(), 0.);
         }
+    }
+
+    #[test]
+    fn liquid_pulse_tracks_measured_restricted_filling() {
+        let mut cfg = config();
+        cfg.intake_diameter_m = 0.012;
+        let mut cylinder = CycleCylinder::new(cfg, 0., 123).unwrap();
+        cylinder
+            .set_fuel_transient(Some(FuelTransientConfig::default()))
+            .unwrap();
+        let mut air = 0.;
+        let mut fuel = 0.;
+        // 50 cycles at 3000 rpm; integrate the last 25 complete cycles.
+        for frame in 1..=192000 {
+            let out = cylinder
+                .step(CycleInput {
+                    angle_rad: f64::from(frame) / 96000. * 3000. * TAU / 60.,
+                    rpm: 3000.,
+                    variation: 0.,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(out.fuel_transfer.mass_residual_kg().abs() < 1e-15);
+            assert!(out.ledger.residual_j().abs() < 1e-8);
+            if frame > 96000 {
+                air += out.intake_fresh_air_kg;
+                fuel += out.injected_fuel_kg;
+            }
+        }
+        let ratio = fuel * AFR / air;
+        assert!(
+            air > 0. && (0.95..1.05).contains(&ratio),
+            "air={air}, fuel={fuel}, ratio={ratio}"
+        );
+    }
+
+    #[test]
+    fn explicit_cylinder_delivery_can_vaporize_with_closed_intake() {
+        let mut cylinder = CycleCylinder::new(config(), 0., 123).unwrap();
+        cylinder
+            .set_fuel_transient(Some(FuelTransientConfig {
+                delivery: super::super::fuel_transient::FuelDelivery::Cylinder,
+                injection_start_deg: 550.,
+                injection_duration_deg: 30.,
+                ..Default::default()
+            }))
+            .unwrap();
+        let (mut closed_vapor, mut heat) = (0., 0.);
+        for frame in 1..=38400 {
+            let out = cylinder
+                .step(CycleInput {
+                    angle_rad: f64::from(frame) / 96000. * 1500. * TAU / 60.,
+                    variation: 0.,
+                    ..Default::default()
+                })
+                .unwrap();
+            if out.intake_mass_kg == 0. {
+                closed_vapor += out.gas_fuel_added_kg;
+            }
+            heat += out.heat_j;
+            assert!(out.fuel_transfer.mass_residual_kg().abs() < 1e-18);
+            assert!(out.fuel_transfer.energy_residual_j().abs() < 1e-11);
+        }
+        assert!(closed_vapor > 0. && heat > 0.);
     }
 
     #[test]

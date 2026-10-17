@@ -1,13 +1,24 @@
 //! Opt-in reduced admitted-charge liquid model. Constants are estimates, not
-//! injector/port measurements. The film belongs to the cylinder control volume;
-//! this is not a spatial runner film or a spray/chemical-kinetics solver.
+//! injector/port measurements. Liquid is retained in the cylinder's combined
+//! inventory. Admission delivery lumps evaporation and port transport while
+//! cylinder delivery permits evaporation with closed valves. No spatial film
+//! or separate port-vapor reservoir is solved.
 use super::thermo::{Mixture, ThermoError};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FuelDelivery {
+    #[default]
+    Admission,
+    Cylinder,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FuelTransientConfig {
+    /// Explicit delivery location, independent of fuel type and pulse timing.
+    pub delivery: FuelDelivery,
     /// Start in crank degrees after firing TDC. Default is indirect admission;
     /// a direct-injection experiment must explicitly choose e.g. 550 degrees.
     pub injection_start_deg: f64,
@@ -24,6 +35,7 @@ pub struct FuelTransientConfig {
 impl Default for FuelTransientConfig {
     fn default() -> Self {
         Self {
+            delivery: FuelDelivery::Admission,
             injection_start_deg: 330.,
             injection_duration_deg: 120.,
             deposited_fraction: 0.35,
@@ -128,6 +140,17 @@ pub struct FuelStep {
 }
 
 impl FuelTransient {
+    /// Detect a pulse by crossing its cycle index. Comparing the reconstructed
+    /// absolute angle to both endpoints can lose an event by one floating-point
+    /// ulp at an otherwise exact start angle. Share this decision with metering.
+    pub(crate) fn injection_start(c: FuelTransientConfig, local0: f64, local1: f64) -> Option<f64> {
+        let cycle = 2. * TAU;
+        let phase = c.injection_start_deg.to_radians();
+        let before = ((local0 - phase) / cycle).floor();
+        let after = ((local1 - phase) / cycle).floor();
+        (after > before).then(|| (after * cycle + phase).clamp(local0, local1))
+    }
+
     pub fn liquid_mass_kg(&self) -> f64 {
         self.film.mass + self.droplets.mass
     }
@@ -147,11 +170,8 @@ impl FuelTransient {
     pub fn step(&mut self, c: FuelTransientConfig, s: FuelStep) -> FuelTransfer {
         let old_mass = self.film.mass + self.droplets.mass;
         let old_energy = self.film.energy + self.droplets.energy;
-        let cycle = 2. * TAU;
-        let phase = c.injection_start_deg.to_radians();
         let width = c.injection_duration_deg.to_radians();
-        let event = ((s.local1 - phase) / cycle).floor() * cycle + phase;
-        if event > s.local0 && event <= s.local1 {
+        if let Some(event) = Self::injection_start(c, s.local0, s.local1) {
             self.pulse_start = event;
             self.pulse_mass = s.cycle_dose_kg;
         }
@@ -256,6 +276,44 @@ mod tests {
             }
         }
         [injected, vapor, tail, peak, liquid]
+    }
+
+    #[test]
+    fn every_cycle_delivers_its_pulse_at_aligned_and_fractional_rpms() {
+        let c = FuelTransientConfig::default();
+        let dose = 25e-6;
+        for rpm in [1500., 3000., 5500., 6900.] {
+            for rate in [48000, 96000, 192000] {
+                let mut model = FuelTransient::default();
+                let frames = (64. * 120. / rpm * f64::from(rate)).ceil() as u32;
+                let mut injected = 0.;
+                for frame in 1..=frames {
+                    let angle = |f: u32| f64::from(f) / f64::from(rate) * rpm * TAU / 60.;
+                    let out = model.step(
+                        c,
+                        FuelStep {
+                            local0: angle(frame - 1),
+                            local1: angle(frame),
+                            dt_s: 1. / f64::from(rate),
+                            cycle_dose_kg: dose,
+                            fuel_enabled: true,
+                            injection_temperature_k: 310.,
+                            wall_temperature_k: 450.,
+                            gas_temperature_k: 600.,
+                            intake_turnover: 0.,
+                            available_evaporation_heat_j: 1.,
+                        },
+                    );
+                    injected += out.injected_kg;
+                    assert!(out.mass_residual_kg().abs() < 1e-18);
+                }
+                assert!(
+                    (injected - 64. * dose).abs() < 1e-14,
+                    "{rpm} rpm/{rate} Hz: delivered {injected}, expected {}",
+                    64. * dose
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,6 +1,93 @@
 //! End-to-end editor state boundaries without opening an audio device.
 use super::*;
 
+#[test]
+fn dyno_plot_preserves_signed_curves_and_reference_scale() {
+    let curve = |torque_nm: Vec<f64>, power_kw: Vec<f64>| bess::dyno::Curve {
+        rpm: vec![1000., 2000., 3000.],
+        peak_torque: (torque_nm[1], 2000.),
+        peak_power: (power_kw[1], 2000.),
+        torque_nm,
+        power_kw,
+        ..Default::default()
+    };
+    let positive = curve(vec![10., 50., 30.], vec![1., 10., 5.]);
+    let mixed = curve(vec![-40., 50., -20.], vec![-4., 10., -2.]);
+    let negative = curve(vec![-400., -200., -300.], vec![-40., -20., -30.]);
+    for (current, reference) in [
+        (&positive, None),
+        (&mixed, None),
+        (&negative, None),
+        (&positive, Some(&negative)),
+    ] {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| dyno_plot(ui, current, reference, false));
+        });
+        // Inspect the actual solid curves submitted to egui, rather than
+        // only testing the bounds helper used by the drawing implementation.
+        let lines: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Path(path) if path.stroke.width == 1.8 && path.points.len() == 3 => {
+                    Some(path)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "solid torque and power curves are drawn");
+        let zero_row = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.color == Color32::GRAY && points[0].y == points[1].y =>
+                {
+                    Some(points[0].y)
+                }
+                _ => None,
+            })
+            .expect("visible zero baseline");
+        for (line, values) in lines.iter().zip([&current.torque_nm, &current.power_kw]) {
+            for (point, value) in line.points.iter().zip(values) {
+                assert_eq!(point.y > zero_row, *value < 0.);
+                assert_eq!(point.y < zero_row, *value > 0.);
+            }
+            assert_ne!(line.points[0].y, line.points[2].y);
+        }
+        if reference.is_some() {
+            let [torque, power] = dyno_plot_bounds(current, reference);
+            assert!(torque.0 < -400. && torque.1 > 50.);
+            assert!(power.0 < -40. && power.1 > 10.);
+        }
+    }
+}
+
+#[test]
+fn displaying_simulation_models_preserves_saved_coefficients() {
+    use bess::physical::{
+        combustion_model::PredictiveCombustionConfig, fuel_transient::FuelTransientConfig,
+    };
+    for flame in [false, true] {
+        let ctx = egui::Context::default();
+        let mut spec = bess::scratch::ExperimentalSpec {
+            fuel_transients: Some(FuelTransientConfig::default()),
+            predictive_combustion: flame.then(PredictiveCombustionConfig::default),
+            ..Default::default()
+        };
+        let before = serde_json::to_value(spec).unwrap();
+        // Repeated frames include egui's first-frame layout and slider rounding.
+        for _ in 0..10 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| simulation_model_controls(ui, &mut spec));
+            });
+            assert_eq!(serde_json::to_value(spec).unwrap(), before);
+        }
+    }
+}
+
 fn imported_app(ctx: &egui::Context) -> App {
     let bank = Arc::new(Bank::load(&test_support::automation_fixture(), None).unwrap());
     let model = bess::automation_model::AutomationModel::from_bank(&bank).unwrap();

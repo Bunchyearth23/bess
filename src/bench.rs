@@ -663,11 +663,11 @@ impl Bench {
         if playing {
             if self.physics_accumulator >= self.rate {
                 self.physics_accumulator -= self.rate;
-                let (sample, inertia) = self
+                let (shaft_rpm, inertia) = self
                     .physical
                     .as_ref()
-                    .map(|physical| (physical.state(), physical.inertia()))
-                    .or_else(|| self.engine.physical_state())
+                    .map(|physical| physical.drive_shaft())
+                    .or_else(|| self.engine.physical_drive_shaft())
                     .expect("physical branch");
                 self.physical_commands = match self.controls.mode {
                     Mode::Direct => PhysicalCommands {
@@ -701,7 +701,7 @@ impl Bench {
                             inertia: inertia as f32,
                             ..self.controls
                         };
-                        let (_, load_nm, throttle) = self.sim.step_physical(c, sample.rpm as f32);
+                        let (_, load_nm, throttle) = self.sim.step_physical(c, shaft_rpm as f32);
                         PhysicalCommands {
                             imposed_rpm: None,
                             throttle: throttle as f64,

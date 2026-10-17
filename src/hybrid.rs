@@ -355,6 +355,12 @@ impl Hybrid {
             .as_ref()
             .map(|voice| (voice.state(), voice.inertia()))
     }
+
+    pub(crate) fn physical_drive_shaft(&self) -> Option<(f64, f64)> {
+        self.physical_voice
+            .as_ref()
+            .map(|voice| voice.drive_shaft())
+    }
     pub(crate) fn physical_range(&self) -> Option<(f32, f32)> {
         self.physical_voice.as_ref().map(|voice| voice.rpm_range())
     }

@@ -1,6 +1,38 @@
 use bess::{dyno, engine_build::Aspiration, scratch::Scratch};
 
 #[test]
+fn optional_fuel_and_flame_keep_warm_full_load_functional() {
+    use bess::physical::{
+        combustion_model::PredictiveCombustionConfig, fuel_transient::FuelTransientConfig,
+    };
+    let base = dyno::sweep(&Scratch::default(), 7).unwrap();
+    for (fuel, flame, intake, torsion) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (true, true, false, false),
+        (true, true, true, true),
+    ] {
+        let mut spec = Scratch::default();
+        spec.experimental.fuel_transients = fuel.then(FuelTransientConfig::default);
+        spec.experimental.predictive_combustion = flame.then(PredictiveCombustionConfig::default);
+        spec.experimental.intake_wave_coupling = intake;
+        spec.experimental.torsion = torsion.then(Default::default);
+        let c = dyno::sweep(&spec, 7).unwrap();
+        // Functional regression only: not a measured-engine calibration gate.
+        assert!(
+            c.peak_power.0 > base.peak_power.0 * 0.6,
+            "{fuel}/{flame}/{intake}/{torsion}: {c:?}"
+        );
+        for i in 0..c.rpm.len() {
+            assert!(
+                c.torque_nm[i] > base.torque_nm[i] * 0.4,
+                "{fuel}/{flame}/{intake}/{torsion}: {c:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn default_two_litre_curve_is_plausible_and_deterministic() {
     let scratch = Scratch::default();
     let curve = dyno::sweep(&scratch, 13).unwrap();

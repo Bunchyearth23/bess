@@ -712,13 +712,6 @@ impl App {
                 "Lower values shorten exhaust reflections. Independent of Room and effective without a muffler. With finite-volume primaries, only the downstream exhaust is affected.",
             );
             ui.small("Shorter / drier: try 40 ms. Longer / more resonant: 120 ms is the original setting.");
-            ui.add_enabled_ui(!scratch.experimental.primary_1d || scratch.experimental.wave_coupling, |ui| {
-                ui.checkbox(&mut scratch.experimental.wave_coupling, "Experimental back pressure")
-                    .on_hover_text("Exhaust pressure waves affect cylinder filling and torque. Length-response calibration is still incomplete. Unavailable with finite-volume primaries.");
-            });
-            if scratch.experimental.wave_coupling {
-                ui.small("Back pressure is active: exhaust reflections and geometry can also change torque.");
-            }
             ui.add_enabled_ui(scratch.experimental.wave_coupling, |ui| {
                 slider_help(
                     ui,
@@ -784,30 +777,6 @@ impl App {
         section(ui, "Combustion and engine physics", |ui| {
             combustion_controls(ui, &mut scratch.sound);
             simulation_model_controls(ui, &mut scratch.experimental);
-            section(ui, "Advanced acoustics", |ui| {
-                ui.checkbox(&mut scratch.experimental.native_rate_acoustics, "Efficient listening rate")
-                    .on_hover_text("Keeps the gas calculation at its high rate and runs the acoustic chain at the output rate. Changing this option restarts audio.");
-                ui.add_enabled_ui(!scratch.experimental.wave_coupling || scratch.experimental.primary_1d, |ui| {
-                    ui.checkbox(&mut scratch.experimental.primary_1d, "Finite-volume primaries — offline WAV quality")
-                        .on_hover_text("Detailed gas-wave solver for WAV and BeamNG rendering. Much slower than real time. Live listening stops while enabled; disable it to listen again. Unavailable with experimental back pressure.");
-                });
-                ui.checkbox(&mut scratch.experimental.vvt_overlap_safe, "Reduce VVT overlap at low speed")
-                    .on_hover_text("Alternative timing schedule for low-speed full-load operation; compare the torque curve and sound before choosing it.");
-            });
-            percent_slider(
-                ui,
-                "Afterfire (lift-off pops)",
-                &mut scratch.experimental.afterfire,
-            )
-            .on_hover_text("Off by default: pop-and-bang style overrun, independent of the parts.");
-            percent_slider(
-                ui,
-                "Knock (end-gas detonation)",
-                &mut scratch.experimental.knock,
-            )
-            .on_hover_text(
-                "Off by default: fuel from RON 95 (0 %) to RON 85 (100 %); rings at high load or advanced spark, and the ECU retards the knocking cylinder.",
-            );
             slider(
                 ui,
                 "Idle target (rpm)",
@@ -1562,6 +1531,29 @@ fn wheel_adjust(
 /// Full-load torque (left axis) and power (right axis) from idle to redline,
 /// with peak marks and a hover readout. `reference` is drawn dashed under it
 /// (the previous or pinned curve). `dim` while a newer sweep runs.
+/// Both units share the zero row, including a pinned/previous negative curve.
+/// Positive-only sweeps keep the historical full-height scale.
+fn dyno_plot_bounds(
+    curve: &bess::dyno::Curve,
+    reference: Option<&bess::dyno::Curve>,
+) -> [(f64, f64); 2] {
+    let mut magnitude = [0_f64; 2];
+    let mut signed = false;
+    for curve in std::iter::once(curve).chain(reference) {
+        for (axis, values) in [&curve.torque_nm, &curve.power_kw].into_iter().enumerate() {
+            for &value in values {
+                magnitude[axis] = magnitude[axis].max(value.abs());
+                signed |= value < 0.;
+            }
+        }
+    }
+    std::array::from_fn(|axis| {
+        let quarter = [25., 10.][axis];
+        let top = (magnitude[axis] * 1.15 / (4. * quarter)).ceil().max(1.) * 4. * quarter;
+        (if signed { -top } else { 0. }, top)
+    })
+}
+
 fn dyno_plot(
     ui: &mut egui::Ui,
     curve: &bess::dyno::Curve,
@@ -1577,45 +1569,31 @@ fn dyno_plot(
         rect.max - egui::vec2(36., 16.),
     );
     let (low, high) = (curve.rpm[0], curve.rpm[curve.rpm.len() - 1]);
-    // Axis tops are whole multiples of four round quarter steps.
-    let top =
-        |peak: f64, quarter: f64| (peak * 1.15 / (4. * quarter)).ceil().max(1.) * 4. * quarter;
-    let (torque_top, power_top) = (
-        top(
-            curve
-                .peak_torque
-                .0
-                .max(reference.map_or(0., |r| r.peak_torque.0)),
-            25.,
-        ),
-        top(
-            curve
-                .peak_power
-                .0
-                .max(reference.map_or(0., |r| r.peak_power.0)),
-            10.,
-        ),
-    );
+    let [torque_bounds, power_bounds] = dyno_plot_bounds(curve, reference);
     let x = |rpm: f64| plot.left() + ((rpm - low) / (high - low)) as f32 * plot.width();
-    let y =
-        |value: f64, top: f64| plot.bottom() - (value / top).clamp(0., 1.) as f32 * plot.height();
+    let y = |value: f64, (bottom, top): (f64, f64)| {
+        plot.bottom() - ((value - bottom) / (top - bottom)) as f32 * plot.height()
+    };
     let grid = Color32::from_rgb(28, 38, 48);
     let font = egui::FontId::proportional(10.);
     for k in 0..=4 {
         let f = f64::from(k) / 4.;
-        let row = y(f * torque_top, torque_top);
-        painter.hline(plot.x_range(), row, egui::Stroke::new(1_f32, grid));
+        let torque = torque_bounds.0 + f * (torque_bounds.1 - torque_bounds.0);
+        let power = power_bounds.0 + f * (power_bounds.1 - power_bounds.0);
+        let row = y(torque, torque_bounds);
+        let color = if torque == 0. { Color32::GRAY } else { grid };
+        painter.hline(plot.x_range(), row, egui::Stroke::new(1_f32, color));
         painter.text(
             egui::pos2(plot.left() - 4., row),
             egui::Align2::RIGHT_CENTER,
-            format!("{:.0}", f * torque_top),
+            format!("{torque:.0}"),
             font.clone(),
             Color32::GRAY,
         );
         painter.text(
             egui::pos2(plot.right() + 4., row),
             egui::Align2::LEFT_CENTER,
-            format!("{:.0}", f * power_top),
+            format!("{power:.0}"),
             font.clone(),
             Color32::GRAY,
         );
@@ -1668,8 +1646,8 @@ fn dyno_plot(
     let ((torque, torque_rpm), (power, power_rpm)) = (curve.peak_torque, curve.peak_power);
     if let Some(reference) = reference {
         for (values, top, color) in [
-            (&reference.torque_nm, torque_top, torque_color),
-            (&reference.power_kw, power_top, power_color),
+            (&reference.torque_nm, torque_bounds, torque_color),
+            (&reference.power_kw, power_bounds, power_color),
         ] {
             let points: Vec<_> = reference
                 .rpm
@@ -1689,7 +1667,7 @@ fn dyno_plot(
     for (values, top, color, (peak, peak_rpm), label, vertical) in [
         (
             &curve.torque_nm,
-            torque_top,
+            torque_bounds,
             torque_color,
             curve.peak_torque,
             format!("{torque:.0} Nm @ {torque_rpm:.0}"),
@@ -1697,7 +1675,7 @@ fn dyno_plot(
         ),
         (
             &curve.power_kw,
-            power_top,
+            power_bounds,
             power_color,
             curve.peak_power,
             format!("{power:.0} kW ({:.0} hp) @ {power_rpm:.0}", power * 1.341),
@@ -1743,11 +1721,15 @@ fn dyno_plot(
             egui::Stroke::new(1_f32, Color32::GRAY),
         );
         painter.circle_filled(
-            egui::pos2(pointer.x, y(torque, torque_top)),
+            egui::pos2(pointer.x, y(torque, torque_bounds)),
             3.,
             torque_color,
         );
-        painter.circle_filled(egui::pos2(pointer.x, y(power, power_top)), 3., power_color);
+        painter.circle_filled(
+            egui::pos2(pointer.x, y(power, power_bounds)),
+            3.,
+            power_color,
+        );
         painter.text(
             egui::pos2(plot.center().x, plot.bottom() - 4.),
             egui::Align2::CENTER_BOTTOM,
@@ -3730,6 +3712,15 @@ fn import_model_text(path: &Path) -> Result<String, String> {
 /// The same saved options serve both imported and freely created engines.
 fn simulation_model_controls(ui: &mut egui::Ui, spec: &mut bess::scratch::ExperimentalSpec) {
     section(ui, "Simulation models", |ui| {
+        ui.add_enabled_ui(!spec.primary_1d || spec.wave_coupling, |ui| {
+            ui.checkbox(&mut spec.wave_coupling, "Experimental back pressure")
+                .on_hover_text("Exhaust pressure waves affect cylinder filling and torque. Length-response calibration is still incomplete. Unavailable with finite-volume primaries.");
+        });
+        if spec.wave_coupling {
+            ui.small(
+                "Back pressure is active: exhaust reflections and geometry can also change torque.",
+            );
+        }
         ui.checkbox(&mut spec.intake_wave_coupling, "Intake pressure feedback")
             .on_hover_text("Intake reflections act on valve flow and cylinder filling. Independent of exhaust back pressure; experimental and off by default.");
         let mut fuel = spec.fuel_transients.is_some();
@@ -3740,6 +3731,24 @@ fn simulation_model_controls(ui: &mut egui::Ui, spec: &mut bess::scratch::Experi
             spec.fuel_transients = fuel.then(Default::default);
         }
         if let Some(config) = &mut spec.fuel_transients {
+            use bess::physical::fuel_transient::FuelDelivery;
+            egui::ComboBox::from_label("Fuel delivery")
+                .selected_text(match config.delivery {
+                    FuelDelivery::Admission => "Through intake",
+                    FuelDelivery::Cylinder => "Into cylinder",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut config.delivery,
+                        FuelDelivery::Admission,
+                        "Through intake",
+                    );
+                    ui.selectable_value(
+                        &mut config.delivery,
+                        FuelDelivery::Cylinder,
+                        "Into cylinder",
+                    );
+                });
             simulation_slider(
                 ui,
                 "Injection start (crank degrees)",
@@ -3765,7 +3774,7 @@ fn simulation_model_controls(ui: &mut egui::Ui, spec: &mut bess::scratch::Experi
                 &mut config.film_time_constant_s,
                 0.001..=2.0,
             );
-            ui.small("Reduced admitted-charge model with estimated coefficients. Injection timing is explicit; fuel type is not inferred.");
+            ui.small("Estimated liquid model. Intake delivery retains liquid until air enters; cylinder delivery can evaporate with closed valves. Injection timing and delivery are explicit.");
         }
         let mut flame = spec.predictive_combustion.is_some();
         if ui
@@ -3901,6 +3910,18 @@ fn simulation_model_controls(ui: &mut egui::Ui, spec: &mut bess::scratch::Experi
             ui.small(response.source.text());
             ui.small("The mechanical layer gain still controls audibility. New projects keep its gain at zero.");
         }
+        ui.checkbox(&mut spec.vvt_overlap_safe, "Reduce VVT overlap at low speed")
+            .on_hover_text("Alternative timing schedule for low-speed full-load operation; compare the torque curve and sound before choosing it.");
+        percent_slider(ui, "Afterfire (lift-off pops)", &mut spec.afterfire)
+            .on_hover_text("Off by default: pop-and-bang style overrun, independent of the parts.");
+        percent_slider(ui, "Knock (end-gas detonation)", &mut spec.knock)
+            .on_hover_text("Off by default: fuel from RON 95 (0 %) to RON 85 (100 %); rings at high load or advanced spark, and the ECU retards the knocking cylinder.");
+        ui.checkbox(&mut spec.native_rate_acoustics, "Efficient listening rate")
+            .on_hover_text("Keeps the gas calculation at its high rate and runs the acoustic chain at the output rate. Changing this option restarts audio.");
+        ui.add_enabled_ui(!spec.wave_coupling || spec.primary_1d, |ui| {
+            ui.checkbox(&mut spec.primary_1d, "Finite-volume primaries — offline WAV quality")
+                .on_hover_text("Detailed gas-wave solver for WAV and BeamNG rendering. Much slower than real time. Live listening stops while enabled; disable it to listen again. Unavailable with experimental back pressure.");
+        });
         ui.small("These options are saved with the engine and reach WAV/BeamNG loops. Measured calibration and listening reception remain separate.");
     });
 }
